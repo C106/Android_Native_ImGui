@@ -23,8 +23,13 @@ struct VulkanApp {
     std::vector<VkImage> swapchainImages;
     std::vector<VkImageView> swapchainImageViews;
     std::vector<FrameData> frames;
-    uint32_t imageCount = 0;
-    uint32_t minImageCount = 0;
+    uint32_t imageCount = 5;
+    uint32_t minImageCount = 2;
+    std::vector<VkFramebuffer> swapchainFramebuffers;
+    std::vector<VkFence> imagesInFlight;
+
+    
+    size_t currentFrame = 0;
 
     bool init(ANativeWindow* window);
     void cleanup();

@@ -18,9 +18,9 @@ bool VulkanApp::init(ANativeWindow* window) {
                             .build();
     if (!inst_ret) return false;
     auto vkb_inst = inst_ret.value();
-    std::cout<<"isntance"<<inst_ret.value()<<std::endl;
-    instance = vkb_inst.instance;   
     
+    instance = vkb_inst.instance;   
+        
     // 创建 Android 表面
     VkAndroidSurfaceCreateInfoKHR surface_info = {};
     surface_info.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR;
@@ -29,11 +29,11 @@ bool VulkanApp::init(ANativeWindow* window) {
     // 2. 选择 PhysicalDevice
     vkb::PhysicalDeviceSelector selector{ vkb_inst };
     selector.add_required_extension(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
-    auto phys_ret = selector.set_surface(surface) // 先不传 surface
+    auto phys_ret = selector.set_surface(surface) 
                             .select();
     if (!phys_ret) return false;
     auto phys = phys_ret.value();
-    std::cout<<"PhysicalDevice"<<&phys_ret<<std::endl;
+    
     physicalDevice = phys.physical_device;
 
     // 3. 创建 Device
@@ -62,7 +62,8 @@ bool VulkanApp::init(ANativeWindow* window) {
     swapchainImageViews = vkb_swap.get_image_views().value();
     gSwapchainExtent = vkb_swap.extent;
     imageCount = (uint32_t)swapchainImages.size();
-
+    imagesInFlight.resize(swapchainImages.size(), VK_NULL_HANDLE);
+    
     // 5. RenderPass
     VkAttachmentDescription color_attachment{};
     color_attachment.format = vkb_swap.image_format;
@@ -89,7 +90,7 @@ bool VulkanApp::init(ANativeWindow* window) {
     check_vk(vkCreateRenderPass(device, &rp_info, nullptr, &renderPass), "vkCreateRenderPass");
 
     // 6. Framebuffers + per-frame data
-    frames.resize(imageCount);
+    frames.resize(2);
 
     for (uint32_t i = 0; i < imageCount; i++) {
         // Framebuffer
