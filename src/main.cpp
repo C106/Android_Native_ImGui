@@ -39,8 +39,9 @@ int main() {
         process_input_event(touch_fd);
 
         gImGui.beginFrame(gWindow, w, h);
-
-        // 示例窗口
+        
+        
+        
         ImGui::Begin("My First Tool", &my_tool_active, ImGuiWindowFlags_MenuBar);
         float my_color[4];
         if (ImGui::BeginMenuBar())
@@ -54,7 +55,7 @@ int main() {
             }
             ImGui::EndMenuBar();
         }
-
+        
         // Edit a color stored as 4 floats
         ImGui::ColorEdit4("Color", my_color);
 
@@ -72,7 +73,8 @@ int main() {
         ImGui::EndChild();
         ImGui::End();
         
-        gImGui.endFrame(gApp);
+        gImGui.endFrame();
+        gImGui.frame_render(gApp);
         //gFrameIndex = (gFrameIndex + 1) % MAX_FRAMES_IN_FLIGHT;
         
     }
