@@ -14,6 +14,7 @@ LOCAL_MODULE := hp.sh
 
 LOCAL_CPPFLAGS += -fexceptions
 
+LOCAL_C_INCLUDES := $(LOCAL_PATH)/Vulkan-Headers/include
 LOCAL_C_INCLUDES += $(LOCAL_PATH)/include
 LOCAL_C_INCLUDES += $(LOCAL_PATH)/imgui/backends
 LOCAL_C_INCLUDES += $(LOCAL_PATH)/imgui
@@ -31,8 +32,8 @@ FILE_LIST += $(wildcard $(LOCAL_PATH)/imgui/imgui.cpp)
 FILE_LIST += $(wildcard $(LOCAL_PATH)/imgui/imgui_draw.cpp)
 FILE_LIST += $(wildcard $(LOCAL_PATH)/imgui/imgui_tables.cpp)
 FILE_LIST += $(wildcard $(LOCAL_PATH)/imgui/imgui_widgets.cpp)
-FILE_LIST += $(wildcard $(LOCAL_PATH)/imgui//backends/imgui_impl_android.cpp)
-FILE_LIST += $(wildcard $(LOCAL_PATH)/imgui//backends/imgui_impl_vulkan.cpp)
+FILE_LIST += $(wildcard $(LOCAL_PATH)/imgui/backends/imgui_impl_android.cpp)
+FILE_LIST += $(wildcard $(LOCAL_PATH)/imgui/backends/imgui_impl_vulkan.cpp)
 FILE_LIST += $(wildcard $(LOCAL_PATH)/vk-bootstrap/src/VkBootstrap.cpp)
 FILE_LIST += $(wildcard $(LOCAL_PATH)/src/*.c*)
 

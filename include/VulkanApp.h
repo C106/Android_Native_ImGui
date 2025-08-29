@@ -1,5 +1,6 @@
 // VulkanApp.h
 #pragma once
+#include <vulkan/vulkan.h>
 #include <android/native_window.h>
 #include "vk-bootstrap/VkBootstrap.h"
 struct FrameData {

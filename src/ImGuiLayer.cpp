@@ -34,12 +34,12 @@ void ImGuiLayer::init(ANativeWindow* new_window, VulkanApp& app) {
     init_info.ImageCount = app.imageCount;
     init_info.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
     init_info.CheckVkResultFn = nullptr; // 可选：添加错误检查回调
-    
+    init_info.RenderPass = app.renderPass;
     __android_log_print(ANDROID_LOG_INFO, "ImGuiLayer", 
                         "Device: %p, RenderPass: %p, DescriptorPool: %p", 
                         app.device, app.renderPass, app.descriptorPool);
     
-    if (!ImGui_ImplVulkan_Init(&init_info, app.renderPass)) {
+    if (!ImGui_ImplVulkan_Init(&init_info)) {
         __android_log_print(ANDROID_LOG_ERROR, "ImGuiLayer", "Failed to initialize ImGui Vulkan backend");
         return;
     }
