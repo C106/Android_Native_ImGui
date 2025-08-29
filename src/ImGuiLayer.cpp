@@ -1,6 +1,7 @@
 // ImGuiLayer.cpp
 #include "ImGuiLayer.h"
 #include "Utils.h"
+#include "misc/freetype/imgui_freetype.h"
 VkExtent2D gSwapchainExtent;
 
 
@@ -47,24 +48,52 @@ void ImGuiLayer::init(ANativeWindow* new_window, VulkanApp& app) {
     __android_log_print(ANDROID_LOG_INFO, "ImGuiLayer", "Vulkan ImGui backend initialized");
     
     // 修复：正确上传字体纹理
-    //uploadFonts(app);
+    uploadFonts(app);
     
     __android_log_print(ANDROID_LOG_INFO, "ImGuiLayer", "ImGui initialization complete");
 }
 
 void ImGuiLayer::uploadFonts(VulkanApp& app) {
     
-    ImGuiIO& fio = ImGui::GetIO();
-    
+    ImGuiIO& io = ImGui::GetIO();
 
-    ImFont* font = fio.Fonts->AddFontFromFileTTF(
-        "/system/fonts/SourceSansPro-Regular.ttf", // 字体路径
-        32.0f,                            // 字体大小（像素）
+    // 主字体
+    ImFont* font = io.Fonts->AddFontFromFileTTF(
+        "/system/fonts/NotoSansCJK-Regular.ttc",
+        32.0f,
         nullptr,
-        fio.Fonts->GetGlyphRangesDefault()
+        io.Fonts->GetGlyphRangesChineseFull()
     );
-    fio.FontDefault = font;
     
+    // Emoji 字体（彩色）
+    ImFontConfig config;
+    config.MergeMode = true;
+    config.FontLoaderFlags |= ImGuiFreeTypeLoaderFlags_LoadColor;
+    printf("FreeType flags: %d\n", config.FontLoaderFlags);
+    config.GlyphMinAdvanceX = 32.0f; // 使用彩色加载
+    static const ImWchar emoji_ranges[] = { 
+    0x1F300, 0x1F5FF, // 杂项符号和象形文字
+    0x1F600, 0x1F64F, // 表情符号
+    0x1F680, 0x1F6FF, // 交通和地图符号
+    0x1F700, 0x1F77F, // 炼金术符号
+    0x1F780, 0x1F7FF, // 几何图形扩展
+    0x1F800, 0x1F8FF, // 补充箭头-C
+    0x1F900, 0x1F9FF, // 补充符号和象形文字
+    0x1FA00, 0x1FA6F, // 扩展-A
+    0x1FA70, 0x1FAFF, // 符号和象形文字扩展-A
+    0x2600, 0x26FF,   // 杂项符号
+    0x2700, 0x27BF,   // 装饰符号
+    0 
+    };
+    ImFont* emoji_font = io.Fonts->AddFontFromFileTTF(
+        "/system/fonts/NotoColorEmoji.ttf",
+        32.0f,
+        &config,
+        emoji_ranges
+    );
+
+    io.FontDefault = font;
+    io.Fonts->Build();
     __android_log_print(ANDROID_LOG_INFO, "ImGuiLayer", "Font upload completed");
 }
 
@@ -92,7 +121,7 @@ void ImGuiLayer::endFrame() {
 void ImGuiLayer::frame_render(VulkanApp& app) {
     uint32_t frameIndex = app.currentFrame % app.maxFramesInFlight;
     
-    __android_log_print(ANDROID_LOG_DEBUG, "ImGuiLayer", "Frame %d (index %d) start", app.currentFrame, frameIndex);
+    __android_log_print(ANDROID_LOG_DEBUG, "ImGuiLayer", "Frame %zu (index %d) start", app.currentFrame, frameIndex);
     
     // -------------------------
     // 1) 等待当前帧的 fence（新的同步方式）
@@ -211,7 +240,7 @@ void ImGuiLayer::frame_render(VulkanApp& app) {
     // -------------------------
     app.currentFrame++;
     
-    __android_log_print(ANDROID_LOG_DEBUG, "ImGuiLayer", "Frame %d completed", app.currentFrame - 1);
+    __android_log_print(ANDROID_LOG_DEBUG, "ImGuiLayer", "Frame %zu completed", app.currentFrame - 1);
 }
 
 void ImGuiLayer::testRender(VulkanApp& app) {
