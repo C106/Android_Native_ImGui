@@ -23,6 +23,8 @@ void Draw_Menu(bool& MenuFlag){
         for (int n = 0; n < 100; n++)
             samples[n] = sinf(n * 0.2f + ImGui::GetTime() * 1.5f);
         ImGui::PlotLines("Samples", samples, 100);
+        ImGuiIO& io = ImGui::GetIO();
+        ImGui::Text("屏幕坐标: (%.1f, %.1f)", io.MousePos.x, io.MousePos.y);
         ImGui::Text(u8"こんにちは！テスト👻 %d", 123);
         // Display contents in a scrolling region
         ImGui::TextColored(ImVec4(1,1,0,1), u8"哈基米👻");

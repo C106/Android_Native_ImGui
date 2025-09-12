@@ -1,5 +1,14 @@
 #include "hook_touch_event.h"
 #include "imgui.h"
+#include "ANativeWindowCreator.h"
+extern android::ANativeWindowCreator::DisplayInfo displayInfo;
+int orientation= 0;
+void update_info(){
+    displayInfo = android::ANativeWindowCreator::GetDisplayInfo();
+    orientation = displayInfo.orientation;
+    printf("orientation %d\n",displayInfo.orientation);
+}
+
 int find_touch_device() {
     DIR* dir = opendir("/dev/input");
     if (!dir) {
@@ -60,7 +69,14 @@ void process_input_event(int fd) {
             pressed = (ev.value > 0);
         } else if (ev.type == EV_SYN) {
             ImGuiIO& io = ImGui::GetIO();
-            io.MousePos = ImVec2((float)x, (float)y);
+            if(orientation==0)
+                io.MousePos = ImVec2((float)x, (float)y);
+            else if(orientation==1)
+                io.MousePos = ImVec2((float)y, displayInfo.height-(float)x);
+            else if(orientation==2)
+                io.MousePos = ImVec2(displayInfo.width-(float)y, displayInfo.height-(float)x);
+            else
+                io.MousePos = ImVec2(displayInfo.width-(float)y, (float)x);
             io.MouseDown[0] = pressed;
         }
     }

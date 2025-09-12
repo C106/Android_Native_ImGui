@@ -11,6 +11,7 @@ static bool gRunning = false;
 android::ANativeWindowCreator::DisplayInfo displayInfo;
 int secure_flag = 0;
 
+
 int main() {
     displayInfo = android::ANativeWindowCreator::GetDisplayInfo();
     int native_window_screen_x = (displayInfo.height > displayInfo.width ? displayInfo.height : displayInfo.width);
@@ -34,12 +35,11 @@ int main() {
     }
     bool my_tool_active=1;
     while (my_tool_active) {
-        int w = native_window_screen_x;
-        int h = native_window_screen_y;
+        update_info();   
 
         process_input_event(touch_fd);
 
-        gImGui.beginFrame(gWindow, w, h);
+        gImGui.beginFrame(gWindow, displayInfo.width, displayInfo.height);
         
         
         Draw_Menu(my_tool_active);
@@ -47,7 +47,7 @@ int main() {
         
         gImGui.endFrame();
         gImGui.frame_render(gApp);
-        //gFrameIndex = (gFrameIndex + 1) % MAX_FRAMES_IN_FLIGHT;
+        gApp.handleWindowResize(gWindow);
         
     }
 

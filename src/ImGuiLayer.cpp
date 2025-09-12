@@ -11,9 +11,6 @@ void ImGuiLayer::init(ANativeWindow* new_window, VulkanApp& app) {
     ImGui::CreateContext();
     ImGui::StyleColorsDark();
     window = new_window;
-    ImGuiIO& io = ImGui::GetIO();
-    // 修复：设置合理的 DPI 缩放，10.0f 太大了
-    io.DisplayFramebufferScale = ImVec2(2.0f, 2.0f); // 适合高 DPI Android 设备
     
     // Android 平台初始化
     if (!ImGui_ImplAndroid_Init(window)) {

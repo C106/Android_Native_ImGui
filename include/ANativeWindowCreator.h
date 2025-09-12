@@ -541,7 +541,7 @@ namespace android
                     displayInfo->layerStackSpaceRect.width = realDisplayInfo.w;
                     displayInfo->layerStackSpaceRect.height = realDisplayInfo.h;
                     displayInfo->orientation = static_cast<ui::Rotation>(realDisplayInfo.orientation);
-
+                    
                     return true;
                 }
             }
