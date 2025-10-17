@@ -100,6 +100,7 @@ bool VulkanApp::init(ANativeWindow* window) {
                                      .add_fallback_present_mode(VK_PRESENT_MODE_MAILBOX_KHR)
                                      .add_fallback_present_mode(VK_PRESENT_MODE_IMMEDIATE_KHR)
                                      .set_desired_extent(width, height)
+                                     .set_pre_transform_flags(VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
                                      .set_image_usage_flags(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
                                      .build();
     if (!swap_ret) {
@@ -538,4 +539,5 @@ bool VulkanApp::handleWindowResize(ANativeWindow* window) {
     }
     
     return rebuildSwapchain(window);
+
 }
