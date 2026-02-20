@@ -1,0 +1,123 @@
+// Generated with ImRAD 0.8
+// visit https://github.com/tpecholt/imrad
+
+#include "l.h"
+
+L l;
+
+
+void L::Draw(GLFWwindow* window)
+{
+    /// @style Dark
+    /// @unit px
+    /// @begin TopWindow
+    auto* ioUserData = (ImRad::IOUserData*)ImGui::GetIO().UserData;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 1);
+    ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, 1);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
+    glfwSetWindowTitle(window, "title");
+    ImGui::SetNextWindowPos({ 0, 0 });
+    int tmpWidth, tmpHeight;
+    glfwGetWindowSize(window, &tmpWidth, &tmpHeight);
+    ImGui::SetNextWindowSize({ (float)tmpWidth, (float)tmpHeight });
+    bool tmpOpen;
+    if (ImGui::Begin("###L", &tmpOpen, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings))
+    {
+        if (ImGui::IsWindowAppearing())
+        {
+            glfwSetWindowSize(window, 640, 480);
+            glfwSetWindowAttrib(window, GLFW_RESIZABLE, false);
+            glfwSetWindowAttrib(window, GLFW_DECORATED, false);
+        }
+        /// @separator
+
+        // TODO: Add Draw calls of dependent popup windows here
+
+        /// @begin Image
+        ImGui::SetCursorScreenPos({ 14, 23 }); //overlayPos
+        if (!value1)
+            value1 = ImRad::LoadTextureFromFile(""C:\Users\Aminuo\aimware.png"");
+        ImGui::Image(value1.id, { 88, 76 }, { 0, 0 }, { 1, 1 }); //StretchPolicy::Scale
+        /// @end Image
+
+        /// @begin TabBar
+        ImGui::SetCursorScreenPos({ 110, 74 }); //overlayPos
+        if (ImGui::BeginTabBar("tabBar1", ImGuiTabBarFlags_None))
+        {
+            int _nTabs = std::max(1, ImGui::GetCurrentTabBar()->ActiveTabs);
+            float _tabWidth = (ImGui::GetContentRegionAvail().x - (_nTabs - 1) * ImGui::GetStyle().ItemInnerSpacing.x) / _nTabs - 1;
+            for (tabNum = 0; tabNum < 4; ++tabNum)
+            {
+                /// @separator
+
+                /// @begin TabItem
+                ImGui::SetNextItemWidth(_tabWidth);
+                if (ImGui::BeginTabItem("Camera", nullptr, currentTab == tabNum ? ImGuiTabItemFlags_SetSelected : 0))
+                {
+                    /// @separator
+
+                    /// @separator
+                    ImGui::EndTabItem();
+                }
+                if (ImRad::IsItemContextMenuClicked())
+                    ImRad::OpenWindowPopup("ContextMenu1");
+                if (ImGui::IsItemActivated())
+                    ShowCameraMenu();
+                /// @end TabItem
+
+                /// @begin TabItem
+                ImGui::SetNextItemWidth(_tabWidth);
+                if (ImGui::BeginTabItem("Obj View", nullptr, currentTab == tabNum ? ImGuiTabItemFlags_SetSelected : 0))
+                {
+                    /// @separator
+
+                    /// @separator
+                    ImGui::EndTabItem();
+                }
+                if (ImGui::IsItemActivated())
+                    ShowObjMenu();
+                /// @end TabItem
+
+                /// @begin TabItem
+                ImGui::SetNextItemWidth(_tabWidth);
+                if (ImGui::BeginTabItem("Config", nullptr, currentTab == tabNum ? ImGuiTabItemFlags_SetSelected : 0))
+                {
+                    /// @separator
+
+                    /// @separator
+                    ImGui::EndTabItem();
+                }
+                if (ImGui::IsItemActivated())
+                    ShowConfigMenu();
+                /// @end TabItem
+
+                /// @separator
+            }
+            ImGui::EndTabBar();
+        }
+        /// @end TabBar
+
+        /// @separator
+        ImGui::End();
+    }
+    ImGui::PopStyleVar();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleVar();
+    /// @end TopWindow
+}
+
+void L::a()
+{
+}
+
+void L::ShowCameraMenu()
+{
+}
+
+void L::ShowObjMenu()
+{
+}
+
+void L::ShowConfigMenu()
+{
+}

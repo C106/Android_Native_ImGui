@@ -168,6 +168,15 @@ namespace android
 
                 static std::unordered_map<size_t, std::unordered_map<void **, const char *>> patchesTable = {
                     {
+                        16,
+                        {
+                            { reinterpret_cast<void**>(&LayerMetadata__Constructor),
+                            "_ZN7android3gui13LayerMetadataC2Ev" },
+                            { reinterpret_cast<void**>(&SurfaceComposerClient__CreateSurface),
+                            "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjiiRKNS_2spINS_7IBinderEEENS_3gui13LayerMetadataEPj" },
+                        },
+                    },
+                    {
                         15,
                         {
                             { reinterpret_cast<void**>(&LayerMetadata__Constructor),
@@ -574,11 +583,11 @@ namespace android
 
             if (!surfaceComposerClient.GetDisplayInfo(&displayInfo))
                 return {};
-            
-            DisplayInfo local_displayInfo{0};   
-            int32_t local_orientation = static_cast<int32_t>(displayInfo.orientation);  
+
+            DisplayInfo local_displayInfo{0};
+            int32_t local_orientation = static_cast<int32_t>(displayInfo.orientation);
             int32_t local_abs_x = (displayInfo.layerStackSpaceRect.width > displayInfo.layerStackSpaceRect.height ? displayInfo.layerStackSpaceRect.width : displayInfo.layerStackSpaceRect.height);
-            int32_t local_abs_y = (displayInfo.layerStackSpaceRect.width < displayInfo.layerStackSpaceRect.height ? displayInfo.layerStackSpaceRect.width : displayInfo.layerStackSpaceRect.height);          
+            int32_t local_abs_y = (displayInfo.layerStackSpaceRect.width < displayInfo.layerStackSpaceRect.height ? displayInfo.layerStackSpaceRect.width : displayInfo.layerStackSpaceRect.height);
             if (local_orientation == 1 || local_orientation == 3) {
                 local_displayInfo.width = local_abs_x;
                 local_displayInfo.height = local_abs_y;
@@ -616,13 +625,12 @@ namespace android
 
         static void Destroy(ANativeWindow *nativeWindow)
         {
-            //if (!m_cachedSurfaceControl.contains(nativeWindow))
             auto it = m_cachedSurfaceControl.find(nativeWindow);
-            if (it != m_cachedSurfaceControl.end())
+            if (it == m_cachedSurfaceControl.end())
                 return;
 
-            m_cachedSurfaceControl[nativeWindow].DestroySurface(reinterpret_cast<detail::Surface *>(nativeWindow));
-            m_cachedSurfaceControl.erase(nativeWindow);
+            it->second.DestroySurface(reinterpret_cast<detail::Surface *>(nativeWindow));
+            m_cachedSurfaceControl.erase(it);
         }
 
     private:

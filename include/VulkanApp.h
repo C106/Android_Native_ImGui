@@ -29,18 +29,20 @@ struct VulkanApp {
     std::vector<VkFramebuffer> swapchainFramebuffers;
     std::vector<VkFence> imagesInFlight;
 
+    bool initialized = false;
+
     bool rebuildSwapchain(ANativeWindow* window);
     void cleanupSwapchainResources();
     void cleanupFrameData();
     bool createFramebuffers();
     bool createFrameData();
     bool handleWindowResize(ANativeWindow* window);
-    
+
     std::vector<VkSemaphore> imageAvailableSemaphores;
     std::vector<VkSemaphore> renderFinishedSemaphores;
     std::vector<VkFence> inFlightFences;
     uint32_t maxFramesInFlight = 2; // 限制并行帧数
-    
+
     bool swapchainRebuildRequired = false;
 
     size_t currentFrame = 0;
