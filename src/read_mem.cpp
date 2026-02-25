@@ -1,0 +1,211 @@
+#include "read_mem.h"
+#include <android/log.h>
+#include <thread>
+#include <chrono>
+#include <unordered_map>
+#include <vector>
+
+#ifdef NDEBUG
+#define LOGI(...) ((void)0)
+#define LOGE(...) ((void)0)
+#else
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "read_mem", __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "read_mem", __VA_ARGS__)
+#endif
+
+extern std::atomic<bool> IsToolActive;
+extern Paradise_hook_driver* Paradise_hook;
+
+// 双缓冲实例
+FrameSynchronizer<ReadFrameData> gFrameSync;
+
+// 读取线程内部状态
+static std::thread gReadThread;
+static std::atomic<bool> gReadThreadRunning{false};
+static uint64_t sLibUE4 = 0; // 读取线程用的 libUE4 副本
+
+// ═══════════════════════════════════════════
+//  名称缓存
+// ═══════════════════════════════════════════
+static std::unordered_map<int32_t, std::string> nameCache;
+
+std::string GetNameByIndex(int32_t index, uint64_t libUE4) {
+    auto it = nameCache.find(index);
+    if (it != nameCache.end()) return it->second;
+
+    constexpr int ElementsPerChunk = 16384;
+    int chunkIdx  = index / ElementsPerChunk;
+    int withinIdx = index % ElementsPerChunk;
+
+    uint64_t chunksArr = Paradise_hook->read<uint64_t>(libUE4 + offset.Gname);
+    uint64_t chunk     = Paradise_hook->read<uint64_t>(chunksArr + chunkIdx * 8);
+    uint64_t entryAddr = Paradise_hook->read<uint64_t>(chunk + withinIdx * 8);
+
+    if (entryAddr == 0) return "";
+
+    char buf[257] = {};
+    Paradise_hook->read(entryAddr + 0x0C, buf, 256);
+
+    std::string name(buf);
+    nameCache[index] = name;
+    return name;
+}
+
+std::string GetObjectName(uint64_t object, uint64_t libUE4) {
+    int32_t nameIndex = Paradise_hook->read<int32_t>(object + 0x18);
+    return GetNameByIndex(nameIndex, libUE4);
+}
+
+Vec3 GetActorLocation(uint64_t Actor) {
+    uint64_t RootComp = Paradise_hook->read<uint64_t>(Actor + offset.RootComponent);
+    if (RootComp == 0) return {0, 0, 0};
+    return Paradise_hook->read<Vec3>(RootComp + offset.ComponentToWorld + 0x10);
+}
+
+void hexdump(uint64_t addr, size_t size) {
+    std::vector<uint8_t> buf(size);
+    Paradise_hook->read(addr, buf.data(), size);
+
+    for (size_t i = 0; i < size; i += 16) {
+        printf("%012lx: ", addr + i);
+        for (size_t j = 0; j < 16; j++) {
+            if (i + j < size)
+                printf("%02x ", buf[i + j]);
+            else
+                printf("   ");
+            if (j == 7) printf(" ");
+        }
+        printf(" |");
+        for (size_t j = 0; j < 16 && (i + j) < size; j++) {
+            uint8_t c = buf[i + j];
+            printf("%c", (c >= 0x20 && c <= 0x7e) ? c : '.');
+        }
+        printf("|\n");
+    }
+}
+
+void DumpObjects(uint64_t libUE4, int count) {
+    uint64_t chunk0 = Paradise_hook->read<uint64_t>(libUE4 + offset.GUObject);
+    int numElements = Paradise_hook->read<int32_t>(libUE4 + offset.GUObject + 0x10);
+
+    if (count > numElements) count = numElements;
+
+    for (int i = 0; i < count; i++) {
+        uint64_t object = Paradise_hook->read<uint64_t>(chunk0 + i * 0x18);
+        if (object == 0) continue;
+
+        int32_t nameIndex = Paradise_hook->read<int32_t>(object + 0x18);
+        int32_t nameNumber = Paradise_hook->read<int32_t>(object + 0x1C);
+
+        std::string name = GetNameByIndex(nameIndex, libUE4);
+        if (nameNumber > 0) {
+            name += "_" + std::to_string(nameNumber - 1);
+        }
+
+        uint64_t classPtr = Paradise_hook->read<uint64_t>(object + 0x10);
+        std::string className;
+        if (classPtr != 0) {
+            int32_t classNameIdx = Paradise_hook->read<int32_t>(classPtr + 0x18);
+            className = GetNameByIndex(classNameIdx, libUE4);
+        }
+
+        uint64_t outerPtr = Paradise_hook->read<uint64_t>(object + 0x28);
+        std::string outerName;
+        if (outerPtr != 0) {
+            int32_t outerNameIdx = Paradise_hook->read<int32_t>(outerPtr + 0x18);
+            outerName = GetNameByIndex(outerNameIdx, libUE4);
+        }
+
+        printf("[%d] %s (%s) Outer:%s\n", i, name.c_str(), className.c_str(), outerName.c_str());
+    }
+}
+
+// ═══════════════════════════════════════════
+//  Driver 初始化（UI 线程调用一次）
+// ═══════════════════════════════════════════
+void InitDriver(const char* packageName, uint64_t& libUE4Out) {
+    int pid = Paradise_hook->get_pid(packageName);
+    Paradise_hook->initialize(pid);
+    if (pid > 0) {
+        libUE4Out = Paradise_hook->get_module_base("libUE4.so");
+        sLibUE4 = libUE4Out;
+        address.Matrix = Paradise_hook->read<uint64_t>(
+            Paradise_hook->read<uint64_t>(libUE4Out + offset.CanvasMap) + 0x20) + 0x270;
+
+        uint64_t level = Paradise_hook->read<uint64_t>(
+            Paradise_hook->read<uint64_t>(libUE4Out + offset.Gworld) + 0xB0);
+        LOGI("PersistentLevel = 0x%lX", level);
+    }
+    // release: 保证 sLibUE4/address 写入对读取线程可见
+    driver_stat.store(pid, std::memory_order_release);
+}
+
+// ═══════════════════════════════════════════
+//  读取线程
+// ═══════════════════════════════════════════
+static void readThreadFunc() {
+    std::vector<uint64_t> cachedActorAddrs;
+    auto lastScanTime = std::chrono::steady_clock::now();
+    constexpr auto kScanInterval = std::chrono::milliseconds(500);
+
+    while (gReadThreadRunning.load(std::memory_order_relaxed)) {
+        if (driver_stat.load(std::memory_order_acquire) <= 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+
+        ReadFrameData frame;
+
+        frame.uworld = Paradise_hook->read<uint64_t>(sLibUE4 + offset.Gworld);
+        if (frame.uworld == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+        frame.persistentLevel = Paradise_hook->read<uint64_t>(frame.uworld + offset.PersistentLevel);
+        uint64_t TArray = Paradise_hook->read<uint64_t>(frame.persistentLevel + offset.TArray);
+        frame.actorCount = Paradise_hook->read<int>(frame.persistentLevel + offset.TArray + 0x8);
+        if (frame.actorCount <= 0) frame.actorCount = 0;
+
+        // 定期重新扫描 actor 列表
+        auto now = std::chrono::steady_clock::now();
+        if (now - lastScanTime >= kScanInterval) {
+            lastScanTime = now;
+            cachedActorAddrs.clear();
+            cachedActorAddrs.reserve(frame.actorCount);
+            for (int i = 0; i < frame.actorCount; i++) {
+                uint64_t addr = Paradise_hook->read<uint64_t>(TArray + 8 * i);
+                if (addr <= 0x10000000 || addr == 0 || addr % 4 != 0 || addr >= 0x10000000000)
+                    continue;
+                std::string name = GetObjectName(addr, sLibUE4);
+                if (strncmp(name.c_str(), "BP_", 3))
+                    continue;
+                cachedActorAddrs.push_back(addr);
+            }
+        }
+
+        // 每帧只读位置
+        frame.actors.reserve(cachedActorAddrs.size());
+        for (uint64_t addr : cachedActorAddrs) {
+            ActorRenderData rd;
+            rd.worldPos = GetActorLocation(addr);
+            frame.actors.push_back(rd);
+        }
+
+        frame.valid = true;
+        gFrameSync.submit(frame);
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(8));
+    }
+}
+
+void StartReadThread() {
+    if (gReadThreadRunning.load()) return;
+    gReadThreadRunning.store(true);
+    gReadThread = std::thread(readThreadFunc);
+}
+
+void StopReadThread() {
+    gReadThreadRunning.store(false);
+    if (gReadThread.joinable())
+        gReadThread.join();
+}

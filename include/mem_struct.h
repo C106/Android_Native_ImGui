@@ -1,0 +1,360 @@
+#pragma once
+struct Vec2
+{
+    float x;
+    float y;
+    Vec2()
+    {
+        this->x = 0;
+        this->y = 0;
+    }
+    Vec2(float x, float y)
+    {
+        this->x = x;
+        this->y = y;
+    }
+    Vec2 operator+(float v) const
+    {
+        return Vec2(x + v, y + v);
+    }
+    Vec2 operator-(float v) const
+    {
+        return Vec2(x - v, y - v);
+    }
+    Vec2 operator*(float v) const
+    {
+        return Vec2(x * v, y * v);
+    }
+    Vec2 operator/(float v) const
+    {
+        return Vec2(x / v, y / v);
+    }
+    Vec2 &operator+=(float v)
+    {
+        x += v;
+        y += v;
+        return *this;
+    }
+    Vec2 &operator-=(float v)
+    {
+        x -= v;
+        y -= v;
+        return *this;
+    }
+    Vec2 &operator*=(float v)
+    {
+        x *= v;
+        y *= v;
+        return *this;
+    }
+    Vec2 &operator/=(float v)
+    {
+        x /= v;
+        y /= v;
+        return *this;
+    }
+    Vec2 operator+(const Vec2 &v) const
+    {
+        return Vec2(x + v.x, y + v.y);
+    }
+    Vec2 operator-(const Vec2 &v) const
+    {
+        return Vec2(x - v.x, y - v.y);
+    }
+    Vec2 operator*(const Vec2 &v) const
+    {
+        return Vec2(x * v.x, y * v.y);
+    }
+    Vec2 operator/(const Vec2 &v) const
+    {
+        return Vec2(x / v.x, y / v.y);
+    }
+    Vec2 &operator+=(const Vec2 &v)
+    {
+        x += v.x;
+        y += v.y;
+        return *this;
+    }
+    Vec2 &operator-=(const Vec2 &v)
+    {
+        x -= v.x;
+        y -= v.y;
+        return *this;
+    }
+    Vec2 &operator*=(const Vec2 &v)
+    {
+        x *= v.x;
+        y *= v.y;
+        return *this;
+    }
+    Vec2 &operator/=(const Vec2 &v)
+    {
+        x /= v.x;
+        y /= v.y;
+        return *this;
+    }
+};
+
+struct Vec3
+{
+    float X;
+    float Y;
+    float Z;
+
+    Vec3()
+    {
+        X = Y = Z = 0.0f;
+    }
+
+    Vec3(float _x, float _y, float _z)
+    {
+        X = _x;
+        Y = _y;
+        Z = _z;
+    }
+
+    Vec3 operator+(const Vec3 &v) const
+    {
+        return {X + v.X, Y + v.Y, Z + v.Z};
+    }
+
+    Vec3 operator-(const Vec3 &v) const
+    {
+        return {X - v.X, Y - v.Y, Z - v.Z};
+    }
+
+    bool operator==(const Vec3 &v)
+    {
+        return X == v.X && Y == v.Y && Z == v.Z;
+    }
+
+    bool operator!=(const Vec3 &v)
+    {
+        return !(X == v.X && Y == v.Y && Z == v.Z);
+    }
+
+    static Vec3 Zero()
+    {
+        return {0.0f, 0.0f, 0.0f};
+    }
+
+    static float Dot(Vec3 lhs, Vec3 rhs)
+    {
+        return (((lhs.X * rhs.X) + (lhs.Y * rhs.Y)) + (lhs.Z * rhs.Z));
+    }
+
+    static float Distance(Vec3 a, Vec3 b)
+    {
+        Vec3 vector = Vec3(a.X - b.X, a.Y - b.Y, a.Z - b.Z);
+        return sqrt(((vector.X * vector.X) + (vector.Y * vector.Y)) + (vector.Z * vector.Z));
+    }
+};
+
+
+
+class FRotator
+{
+public:
+    FRotator() :Pitch(0.f), Yaw(0.f), Roll(0.f) {
+
+    }
+    FRotator(float _Pitch, float _Yaw, float _Roll) : Pitch(_Pitch), Yaw(_Yaw), Roll(_Roll)
+    {
+
+    }
+    ~FRotator()
+    {
+
+    }
+    float Pitch;
+    float Yaw;
+    float Roll;
+    inline FRotator Clamp()
+    {
+
+        if (Pitch > 180)
+        {
+            Pitch -= 360;
+        }
+        else
+        {
+            if (Pitch < -180)
+            {
+                Pitch += 360;
+            }
+        }
+        if (Yaw > 180)
+        {
+            Yaw -= 360;
+        }
+        else {
+            if (Yaw < -180)
+            {
+                Yaw += 360;
+            }
+        }
+        if (Pitch > 89)
+        {
+            Pitch = 89;
+        }
+        if (Pitch < -89)
+        {
+            Pitch = -89;
+        }
+        while (Yaw < 180)
+        {
+            Yaw += 360;
+        }
+        while (Yaw > 180)
+        {
+            Yaw -= 360;
+        }
+        Roll = 0;
+        return FRotator(Pitch, Yaw, Roll);
+    }
+    inline float Length()
+    {
+        return sqrtf(Pitch * Pitch + Yaw * Yaw + Roll * Roll);
+    }
+    FRotator operator+(FRotator v) {
+        return FRotator(Pitch + v.Pitch, Yaw + v.Yaw, Roll + v.Roll);
+    }
+    FRotator operator-(FRotator v) {
+        return FRotator(Pitch - v.Pitch, Yaw - v.Yaw, Roll - v.Roll);
+    }
+};
+
+
+struct FMatrix {
+    float M[4][4];
+};
+
+struct D2DVector {
+    float X;
+    float Y;
+    D2DVector() {
+        this->X = 0;
+        this->Y = 0;
+    }
+    D2DVector(float x, float y) {
+        this->X = x;
+        this->Y = y;
+    }
+};
+
+struct D3DVector {
+    float X;
+    float Y;
+    float Z;
+    D3DVector() {
+        this->X = 0;
+        this->Y = 0;
+        this->Z = 0;
+    }
+    D3DVector(float x, float y, float z) {
+        this->X = x;
+        this->Y = y;
+        this->Z = z;
+    }
+};
+
+struct D4DVector {
+    float X;
+    float Y;
+    float Z;
+    float W;
+    D4DVector() {
+        this->X = 0;
+        this->Y = 0;
+        this->Z = 0;
+        this->W = 0;
+    }
+    D4DVector(float x, float y, float z, float w) {
+        this->X = x;
+        this->Y = y;
+        this->Z = z;
+        this->W = w;
+    }
+};
+struct FTransform {
+    D4DVector Rotation;
+    D3DVector Translation;
+    float chunk;
+    D3DVector Scale3D;
+};
+
+inline FMatrix BuildViewMatrix(Vec3 Location, FRotator Rotation) {
+    float RadPitch = Rotation.Pitch * (M_PI / 180.0f);
+    float RadYaw   = Rotation.Yaw   * (M_PI / 180.0f);
+    float RadRoll  = Rotation.Roll  * (M_PI / 180.0f);
+
+    float SP = sinf(RadPitch), CP = cosf(RadPitch);
+    float SY = sinf(RadYaw),   CY = cosf(RadYaw);
+    float SR = sinf(RadRoll),  CR = cosf(RadRoll);
+
+    Vec3 Forward = { CP * CY,                CP * SY,                SP       };
+    Vec3 Right   = { SR*SP*CY - CR*SY,       SR*SP*SY + CR*CY,      -SR * CP  };
+    Vec3 Up = { -(CR*SP*CY + SR*SY),  -(CR*SP*SY - SR*CY),  CR * CP };
+    FMatrix View = {};
+    View.M[0][0] = Right.X;   View.M[0][1] = Up.X;   View.M[0][2] = Forward.X;  View.M[0][3] = 0;
+    View.M[1][0] = Right.Y;   View.M[1][1] = Up.Y;   View.M[1][2] = Forward.Y;  View.M[1][3] = 0;
+    View.M[2][0] = Right.Z;   View.M[2][1] = Up.Z;   View.M[2][2] = Forward.Z;  View.M[2][3] = 0;
+    View.M[3][0] = -Right.Dot(Right,Location);
+    View.M[3][1] = -Up.Dot(Up,Location);
+    View.M[3][2] = -Forward.Dot(Forward,Location);
+    View.M[3][3] = 1.0f;
+    return View;
+}
+
+inline FMatrix BuildProjectionMatrix(float FOVDegrees, float AspectRatio) {
+    float T = tanf(FOVDegrees * (M_PI / 360.0f));  // 水平半角
+
+    FMatrix Proj = {};
+    Proj.M[0][0] = 1.0f / T;             // 水平
+    Proj.M[1][1] = 1.0f / T * AspectRatio;   // 垂直
+    Proj.M[2][2] = 0.0f;
+    Proj.M[2][3] = 1.0f;
+    Proj.M[3][2] = 0.01f;
+    return Proj;
+}
+
+inline FMatrix MatrixMultiply(const FMatrix& A, const FMatrix& B) {
+    FMatrix R = {};
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++)
+            for (int k = 0; k < 4; k++)
+                R.M[i][j] += A.M[i][k] * B.M[k][j];
+    return R;
+}
+
+inline bool WorldToScreen(Vec3 World, const FMatrix& VP, float SW, float SH, Vec2& Out) {
+    float W = World.X * VP.M[0][3] + World.Y * VP.M[1][3] + World.Z * VP.M[2][3] + VP.M[3][3];
+    if (W < 0.001f) return false;
+    float X = World.X * VP.M[0][0] + World.Y * VP.M[1][0] + World.Z * VP.M[2][0] + VP.M[3][0];
+    float Y = World.X * VP.M[0][1] + World.Y * VP.M[1][1] + World.Z * VP.M[2][1] + VP.M[3][1];
+    Out.x = (SW / 2.0f) + (X / W) * (SW / 2.0f);
+    Out.y = (SH / 2.0f) - (Y / W) * (SH / 2.0f);
+    return true;
+}
+struct Offsets{
+    uintptr_t Gworld = 0x14988578;
+    uintptr_t Gname = 0x146F9F30;
+    uintptr_t GUObject = 0x14706480;
+    uintptr_t PersistentLevel = 0xB0;
+    uintptr_t TArray = 0xB0;
+    uintptr_t NetDriver = 0xb8;
+    uintptr_t ServerConnection = 0x88;
+    uintptr_t PlayerController = 0x30;
+    uintptr_t PlayerCameraManager = 0x658;
+    uintptr_t CameraCache = 0x640;
+    uintptr_t POV = 0x10;
+    uintptr_t RootComponent = 0x268;
+    uintptr_t ComponentToWorld = 0x1F0;
+    uintptr_t CanvasMap = 0x14954368;
+};
+struct Addresses{
+    uintptr_t Uworld,libUE4;
+    uintptr_t Gname;
+    uintptr_t Matrix;
+    uintptr_t ProjectionMat,Ulevel,localplay,oneself,Arrayaddr,Objaddr; 
+};

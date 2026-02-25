@@ -1,3 +1,4 @@
+#pragma once
 #include "ImGuiLayer.h"
 
 // 帧率控制（通过 UI 滑动条调节）

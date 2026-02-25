@@ -3,11 +3,13 @@
 #include "ImGuiLayer.h"
 #include "ANativeWindowCreator.h"
 #include "draw_menu.h"
+#include "read_mem.h"
 #include <chrono>
 #include <atomic>
 #include <thread>
 #include "Gyro.h"
 #include "volume_control.h"
+#include "driver.h"
 #ifdef NDEBUG
 #define LOGD(...) ((void)0)
 #define LOGE(...) ((void)0)
@@ -15,8 +17,7 @@
 #define LOGD(...) do { printf(__VA_ARGS__); fflush(stdout); } while(0)
 #define LOGE(...) do { printf(__VA_ARGS__); fflush(stdout); } while(0)
 #endif
-
-static VulkanApp gApp;
+VulkanApp gApp; 
 static ImGuiLayer gImGui;
 static ANativeWindow* gWindow = nullptr;
 static bool gRunning = false;
@@ -24,6 +25,7 @@ std::atomic<bool> IsToolActive,IsMenuOpen;
 static bool gNeedReinitialize = false;  // 屏幕旋转后需要重新初始化
 android::ANativeWindowCreator::DisplayInfo displayInfo;
 int secure_flag = 0;
+Paradise_hook_driver *Paradise_hook = nullptr;
 Gyro* Gyro_Controller;
 // 帧率控制参数
 int gTargetFPS = 60;
@@ -118,7 +120,6 @@ int main() {
         LOGE("Vulkan Failed\n");
         return -1;
     }
-
     gImGui.init(gWindow, gApp);
     ImGui_InitTextureLoader(&gApp);
     LOGD("ImGui init OK\n");
@@ -140,6 +141,8 @@ int main() {
     int lastOrientation = displayInfo.orientation;
     auto last_time = std::chrono::high_resolution_clock::now();
 
+    Paradise_hook = new Paradise_hook_driver;
+    StartReadThread();
     // ── 主循环 ──
     while (IsToolActive == 1) {
 
@@ -170,11 +173,14 @@ int main() {
         // 2. 帧率控制
         auto frame_start = std::chrono::high_resolution_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(frame_start - last_time);
-        if (elapsed.count() < get_frame_time_us()) {
-            std::this_thread::sleep_for(
-                std::chrono::microseconds(get_frame_time_us() - elapsed.count()));
+        int target_us = get_frame_time_us();
+        if (elapsed.count() < target_us) {
+            int sleep_us = target_us - (int)elapsed.count();
+            // 留 1ms 余量给系统调度，剩余部分 sleep
+            if (sleep_us > 1000)
+                std::this_thread::sleep_for(std::chrono::microseconds(sleep_us - 1000));
         }
-        last_time = frame_start;
+        last_time = std::chrono::high_resolution_clock::now();
 
         update_info();
         refresh_touch_device_range();
@@ -209,6 +215,7 @@ int main() {
     }
 
     // ── 清理 ──
+    StopReadThread();
     gImGui.shutdown(gApp);
     ImGui_TextureLoaderShutdown(gApp);
     gApp.cleanup();

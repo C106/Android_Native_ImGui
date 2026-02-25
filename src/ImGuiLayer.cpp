@@ -541,6 +541,7 @@ void ImGui_ProcessPendingTextureLoads() {
         imageInfo.extent = {(uint32_t)width, (uint32_t)height, 1};
         imageInfo.mipLevels = 1;
         imageInfo.arrayLayers = 1;
+        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
         imageInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -558,7 +559,7 @@ void ImGui_ProcessPendingTextureLoads() {
             continue;
         }
 
-        // 分配内存
+        // 分配内存（优先 DEVICE_LOCAL，失败则回退到任意可用内存）
         VkMemoryRequirements memReq;
         vkGetImageMemoryRequirements(app.device, texData->image, &memReq);
 
@@ -570,13 +571,27 @@ void ImGui_ProcessPendingTextureLoads() {
 
         err = vkAllocateMemory(app.device, &allocInfo, nullptr, &texData->memory);
         if (err != VK_SUCCESS) {
-            LOGE("ImGui_ProcessPendingTextureLoads: vkAllocateMemory failed: %d", err);
-            vkDestroyImage(app.device, texData->image, nullptr);
-            delete texData;
-            *request.out_texture = (ImTextureID)0;
-            request.completed = true;
-            request.success = false;
-            continue;
+            // 回退：不要求 DEVICE_LOCAL，接受任意兼容内存类型
+            LOGI("ImGui_ProcessPendingTextureLoads: DEVICE_LOCAL alloc failed (%d), trying fallback", err);
+            VkPhysicalDeviceMemoryProperties memProps;
+            vkGetPhysicalDeviceMemoryProperties(app.physicalDevice, &memProps);
+            bool fallbackOk = false;
+            for (uint32_t i = 0; i < memProps.memoryTypeCount; i++) {
+                if (memReq.memoryTypeBits & (1 << i)) {
+                    allocInfo.memoryTypeIndex = i;
+                    err = vkAllocateMemory(app.device, &allocInfo, nullptr, &texData->memory);
+                    if (err == VK_SUCCESS) { fallbackOk = true; break; }
+                }
+            }
+            if (!fallbackOk) {
+                LOGE("ImGui_ProcessPendingTextureLoads: vkAllocateMemory failed (all types): %d", err);
+                vkDestroyImage(app.device, texData->image, nullptr);
+                delete texData;
+                *request.out_texture = (ImTextureID)0;
+                request.completed = true;
+                request.success = false;
+                continue;
+            }
         }
 
         vkBindImageMemory(app.device, texData->image, texData->memory, 0);
@@ -649,9 +664,15 @@ void ImGui_ProcessPendingTextureLoads() {
         stagingAllocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         stagingAllocInfo.allocationSize = stagingMemReq.size;
         stagingAllocInfo.memoryTypeIndex = findMemoryType(app.physicalDevice, stagingMemReq.memoryTypeBits,
-                                                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+                                                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
         err = vkAllocateMemory(app.device, &stagingAllocInfo, nullptr, &stagingMemory);
+        if (err != VK_SUCCESS) {
+            // 回退：只要求 HOST_VISIBLE
+            stagingAllocInfo.memoryTypeIndex = findMemoryType(app.physicalDevice, stagingMemReq.memoryTypeBits,
+                                                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+            err = vkAllocateMemory(app.device, &stagingAllocInfo, nullptr, &stagingMemory);
+        }
         if (err != VK_SUCCESS) {
             LOGE("ImGui_ProcessPendingTextureLoads: staging vkAllocateMemory failed: %d", err);
             vkDestroyBuffer(app.device, stagingBuffer, nullptr);
