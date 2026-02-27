@@ -3,6 +3,7 @@
 #include "ImGuiLayer.h"
 #include "ANativeWindowCreator.h"
 #include "draw_menu.h"
+#include "draw_objects.h"
 #include "read_mem.h"
 #include <chrono>
 #include <atomic>
@@ -139,6 +140,7 @@ int main() {
     IsToolActive.store(1);
     IsMenuOpen.store(1);
     int lastOrientation = displayInfo.orientation;
+    int frameCounter = 0;
     auto last_time = std::chrono::high_resolution_clock::now();
 
     Paradise_hook = new Paradise_hook_driver;
@@ -182,25 +184,30 @@ int main() {
         }
         last_time = std::chrono::high_resolution_clock::now();
 
-        update_info();
-        refresh_touch_device_range();
         process_input_event(touch_fd);
 
-        // 3. 检测屏幕旋转（本帧不渲染，下帧执行 reinit）
-        android::ANativeWindowCreator::DisplayInfo currentDisplayInfo =
-            android::ANativeWindowCreator::GetDisplayInfo();
-        if (currentDisplayInfo.orientation != lastOrientation) {
-            LOGD("Orientation changed: %d -> %d, scheduling reinit\n",
-                 lastOrientation, currentDisplayInfo.orientation);
-            lastOrientation = currentDisplayInfo.orientation;
-            displayInfo = currentDisplayInfo;
-            gNeedReinitialize = true;
-            continue;
+        // 3. 每 30 帧检测一次屏幕旋转（约 0.5 秒），降低 Binder IPC 开销
+        if (++frameCounter >= 30) {
+            frameCounter = 0;
+            update_info();
+            refresh_touch_device_range();
+
+            android::ANativeWindowCreator::DisplayInfo currentDisplayInfo =
+                android::ANativeWindowCreator::GetDisplayInfo();
+            if (currentDisplayInfo.orientation != lastOrientation) {
+                LOGD("Orientation changed: %d -> %d, scheduling reinit\n",
+                     lastOrientation, currentDisplayInfo.orientation);
+                lastOrientation = currentDisplayInfo.orientation;
+                displayInfo = currentDisplayInfo;
+                gNeedReinitialize = true;
+                continue;
+            }
         }
 
         // 4. 渲染
         ImGui_ProcessPendingTextureLoads();
         gImGui.beginFrame(gWindow, displayInfo.width, displayInfo.height);
+        DrawObjects();
         if (IsMenuOpen == 1)
             Draw_Menu();
 

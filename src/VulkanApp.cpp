@@ -105,10 +105,9 @@ bool VulkanApp::init(ANativeWindow* window) {
                                      // 使用更通用的格式选择
                                      .add_fallback_format({ VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR })
                                      .add_fallback_format({ VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR })
-                                     // 使用更兼容的呈现模式
+                                     // MAILBOX: 非阻塞 present，只保留最新帧，避免与 VSync 竞争
+                                     .set_desired_present_mode(VK_PRESENT_MODE_MAILBOX_KHR)
                                      .add_fallback_present_mode(VK_PRESENT_MODE_FIFO_KHR)
-                                     .add_fallback_present_mode(VK_PRESENT_MODE_MAILBOX_KHR)
-                                     .add_fallback_present_mode(VK_PRESENT_MODE_IMMEDIATE_KHR)
                                      .set_desired_extent(width, height)
                                      .set_pre_transform_flags(VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
                                      .set_image_usage_flags(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
@@ -399,9 +398,8 @@ bool VulkanApp::rebuildSwapchain(ANativeWindow* window) {
     auto swap_ret = swapchain_builder.set_old_swapchain(swapchain) // 重用旧 swapchain
                                      .add_fallback_format({ VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR })
                                      .add_fallback_format({ VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR })
+                                     .set_desired_present_mode(VK_PRESENT_MODE_MAILBOX_KHR)
                                      .add_fallback_present_mode(VK_PRESENT_MODE_FIFO_KHR)
-                                     .add_fallback_present_mode(VK_PRESENT_MODE_MAILBOX_KHR)
-                                     .add_fallback_present_mode(VK_PRESENT_MODE_IMMEDIATE_KHR)
                                      .set_desired_extent(width, height)
                                      .set_pre_transform_flags(VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
                                      .set_image_usage_flags(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)

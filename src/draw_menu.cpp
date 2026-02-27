@@ -1,4 +1,5 @@
 #include "draw_menu.h"
+#include "draw_objects.h"
 #include <logo.h>
 #include "ImGuiLayer.h"
 #include <android/log.h>
@@ -35,9 +36,6 @@ Addresses address;
 // UI 线程持有的 libUE4（仅 mem 按钮初始化时写入）
 static uint64_t libUE4 = 0;
 
-// 渲染线程持有的当前帧
-static ReadFrameData gRenderFrame;
-
 void Draw_Menu_ResetTextures() {
     gLogoTexture = (ImTextureID)0;
     gLogoWidth = 0;
@@ -45,7 +43,7 @@ void Draw_Menu_ResetTextures() {
 }
 
 void Draw_Menu() {
-    Gyro_Controller->update(gyro_x, gyro_y);
+    //Gyro_Controller->update(gyro_x, gyro_y);
     ImGuiIO& io = ImGui::GetIO();
 
     float windowWidth = 700.0f;
@@ -68,7 +66,7 @@ void Draw_Menu() {
         return;
     }
 
-    // Logo
+    // Logo claude --resume e3e0af5f-8444-48d7-b85e-60527b933e42
     ImGui::SetCursorPos(ImVec2(20, 30));
     if (!gLogoTexture && aimware_png_len > 0) {
         ImGui_RequestTextureLoad(aimware_png, aimware_png_len, &gLogoTexture, &gLogoWidth, &gLogoHeight);
@@ -139,6 +137,8 @@ void DrawObjViewTab() {
     ImGui::Text("Object View");
     ImGui::Separator();
 
+    ImGui::Checkbox("Show Objects", &gShowObjects);
+
     static float samples[100];
     float time = ImGui::GetTime();
     for (int n = 0; n < 100; n++) {
@@ -157,6 +157,7 @@ void DrawObjViewTab() {
 void DrawConfigTab() {
     ImGui::Text("Configuration");
     ImGui::Separator();
+    ImGui::Checkbox("显示所有类名", &gShowAllClassNames);
     ImGui::SliderInt("Target FPS", &gTargetFPS, 1, 144);
     ImGui::SameLine();
     ImGui::Text("%d FPS", gTargetFPS);
@@ -164,32 +165,27 @@ void DrawConfigTab() {
 
     // "mem" 按钮：初始化 driver
     if (ImGui::Button("mem", ImVec2(100, 50))) {
-        InitDriver("com.mycompany.EngineTest", libUE4);
+        InitDriver("com.tencent.tmgp.pubgmhd", libUE4);
+
     }
 
     if (driver_stat.load(std::memory_order_relaxed) <= 0) {
         ImGui::Text("未初始化");
     } else {
-        gFrameSync.fetch(gRenderFrame);
-
-        if (gRenderFrame.valid) {
-            ImGui::Text("%lX Uworld", gRenderFrame.uworld);
-            ImGui::Text("%lX Ulevel", gRenderFrame.persistentLevel);
-            ImGui::Text("%d count", gRenderFrame.actorCount);
-
-            // VP 矩阵渲染帧实时读取
-            FMatrix VPMat;
-            Paradise_hook->read(address.Matrix, &VPMat, sizeof(FMatrix));
-
-            float AspectRatio = io.DisplaySize.x / io.DisplaySize.y;
-            ImDrawList* draw_list = ImGui::GetBackgroundDrawList();
-            Vec2 screenPos;
-            for (const auto& actor : gRenderFrame.actors) {
-                if (WorldToScreen(actor.worldPos, VPMat, io.DisplaySize.x, io.DisplaySize.y, screenPos)) {
-                    draw_list->AddCircleFilled(
-                        ImVec2(screenPos.x, screenPos.y), 3.0f, IM_COL32(255, 0, 0, 255));
-                }
-            }
+        if (ImGui::Button("Dump TArray", ImVec2(100, 50))) {
+            DumpTArray();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Dump Bones", ImVec2(100, 50))) {
+            DumpBones();
+        }
+        ImGui::Text("骨骼数: %d", gBoneCount);
+        ReadFrameData info;
+        gFrameSync.peek(info);
+        if (info.valid) {
+            ImGui::Text("%lX Uworld", info.uworld);
+            ImGui::Text("%lX Ulevel", info.persistentLevel);
+            ImGui::Text("%d count", info.actorCount);
         } else {
             ImGui::Text("等待数据...");
         }

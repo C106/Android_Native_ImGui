@@ -1,4 +1,5 @@
 #include <linux/input.h>
+#include <poll.h>
 extern std::atomic<bool> IsMenuOpen;
 int getData() {
     DIR *dir = opendir("/dev/input/");
@@ -8,6 +9,7 @@ int getData() {
         if (strstr(ptr->d_name, "event"))
             count++;
     }
+    closedir(dir);
     return count ? count : -1;
 }
 
@@ -19,34 +21,34 @@ int volume() {
         return -1;
     }
 
-    int *fdArray = (int *)malloc(EventCount * sizeof(int));
+    struct pollfd *pfds = (struct pollfd *)malloc(EventCount * sizeof(struct pollfd));
 
     for (int i = 0; i < EventCount; i++) {
         char temp[128];
         sprintf(temp, "/dev/input/event%d", i);
-        fdArray[i] = open(temp, O_RDWR | O_NONBLOCK);
+        pfds[i].fd = open(temp, O_RDONLY | O_NONBLOCK);
+        pfds[i].events = POLLIN;
     }
-
 
     input_event ev;
-    int count = 0; // 记录按下音量键的次数
 
     while (1) {
+        int ret = poll(pfds, EventCount, -1); // 阻塞等待事件
+        if (ret <= 0) continue;
+
         for (int i = 0; i < EventCount; i++) {
-            memset(&ev, 0, sizeof(ev));
-            read(fdArray[i], &ev, sizeof(ev));
-            if (ev.type == EV_KEY && (ev.code == KEY_VOLUMEUP || ev.code == KEY_VOLUMEDOWN)) {
-          
-                if (ev.code == 115&&ev.value==1) {
-                    IsMenuOpen.store(true,std::memory_order_relaxed);
-                } else if (ev.code == 114&&ev.value==1) {
-                    IsMenuOpen.store(false,std::memory_order_relaxed);
+            if (!(pfds[i].revents & POLLIN)) continue;
+
+            while (read(pfds[i].fd, &ev, sizeof(ev)) == sizeof(ev)) {
+                if (ev.type == EV_KEY && ev.value == 1) {
+                    if (ev.code == KEY_VOLUMEUP) {
+                        IsMenuOpen.store(true, std::memory_order_relaxed);
+                    } else if (ev.code == KEY_VOLUMEDOWN) {
+                        IsMenuOpen.store(false, std::memory_order_relaxed);
+                    }
                 }
             }
-            usleep(1000);
         }
-        usleep(500);
     }
-       usleep(1500);
     return 0;
 }

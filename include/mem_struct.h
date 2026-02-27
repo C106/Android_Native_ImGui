@@ -278,9 +278,10 @@ struct D4DVector {
 };
 struct FTransform {
     D4DVector Rotation;
-    D3DVector Translation;
+    Vec3 Translation;
     float chunk;
-    D3DVector Scale3D;
+    Vec3 Scale3D;
+    float chunk1;
 };
 
 inline FMatrix BuildViewMatrix(Vec3 Location, FRotator Rotation) {
@@ -336,12 +337,46 @@ inline bool WorldToScreen(Vec3 World, const FMatrix& VP, float SW, float SH, Vec
     Out.y = (SH / 2.0f) - (Y / W) * (SH / 2.0f);
     return true;
 }
+
+inline Vec3 QuatRotateVector(const D4DVector& q, const Vec3& v)
+{
+    float tx = 2.0f * (q.Y * v.Z - q.Z * v.Y);
+    float ty = 2.0f * (q.Z * v.X - q.X * v.Z);
+    float tz = 2.0f * (q.X * v.Y - q.Y * v.X);
+
+    return Vec3{
+        v.X + q.W * tx + (q.Y * tz - q.Z * ty),
+        v.Y + q.W * ty + (q.Z * tx - q.X * tz),
+        v.Z + q.W * tz + (q.X * ty - q.Y * tx)
+    };
+}
+
+inline Vec3 TransformPosition(const FTransform& T, const Vec3& LocalPos)
+{
+    // 1. Scale
+    Vec3 Scaled = {
+        LocalPos.X * T.Scale3D.X,
+        LocalPos.Y * T.Scale3D.Y,
+        LocalPos.Z * T.Scale3D.Z
+    };
+
+    // 2. Rotate
+    Vec3 Rotated = QuatRotateVector(T.Rotation, Scaled);
+
+    // 3. Translate
+    return Vec3{
+        Rotated.X + T.Translation.X,
+        Rotated.Y + T.Translation.Y,
+        Rotated.Z + T.Translation.Z
+    };
+}
+
 struct Offsets{
     uintptr_t Gworld = 0x14988578;
     uintptr_t Gname = 0x146F9F30;
     uintptr_t GUObject = 0x14706480;
     uintptr_t PersistentLevel = 0xB0;
-    uintptr_t TArray = 0xB0;
+    uintptr_t TArray = 0xA0;
     uintptr_t NetDriver = 0xb8;
     uintptr_t ServerConnection = 0x88;
     uintptr_t PlayerController = 0x30;
@@ -351,6 +386,10 @@ struct Offsets{
     uintptr_t RootComponent = 0x268;
     uintptr_t ComponentToWorld = 0x1F0;
     uintptr_t CanvasMap = 0x14954368;
+    uintptr_t SkeletalMeshComponent = 0x650;
+    uintptr_t ComponentSpaceTransforms = 0xbb8;
+    uintptr_t SkeletalMesh = 0x7f0;        // USkinnedMeshComponent -> USkeletalMesh* //claude --resume 0aac9131-07d7-4ae1-97c8-ec2cfe469950
+    uintptr_t RefBoneInfo = 0x238;          // USkeletalMesh -> FReferenceSkeleton.RawRefBoneInfo TArray ? ? ? F9 ? ? ? D3 ? ? ? 90 ? ? ? F9 ? ? ? F9 ? ? ? 11
 };
 struct Addresses{
     uintptr_t Uworld,libUE4;

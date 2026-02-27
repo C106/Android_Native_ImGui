@@ -13,6 +13,7 @@ struct ReadFrameData {
     uint64_t persistentLevel = 0;
     int actorCount = 0;
     std::vector<ActorRenderData> actors; // 已过滤的 actor
+    FMatrix vpMatrix;      // 与 actor 位置同时采样的 VP 矩阵
     bool valid = false;
 };
 
@@ -41,5 +42,11 @@ public:
         std::swap(out, sharedBuffer);
         hasNewFrame = false;
         return true;
+    }
+
+    // 只读拷贝当前缓冲（不消费）
+    void peek(T& out) {
+        std::lock_guard<std::mutex> lock(mtx);
+        out = sharedBuffer;
     }
 };

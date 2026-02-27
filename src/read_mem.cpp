@@ -4,6 +4,7 @@
 #include <chrono>
 #include <unordered_map>
 #include <vector>
+#include <memory>
 
 #ifdef NDEBUG
 #define LOGI(...) ((void)0)
@@ -43,8 +44,8 @@ std::string GetNameByIndex(int32_t index, uint64_t libUE4) {
 
     if (entryAddr == 0) return "";
 
-    char buf[257] = {};
-    Paradise_hook->read(entryAddr + 0x0C, buf, 256);
+    char buf[65] = {};
+    Paradise_hook->read(entryAddr + 0x0C, buf, 64);
 
     std::string name(buf);
     nameCache[index] = name;
@@ -140,14 +141,82 @@ void InitDriver(const char* packageName, uint64_t& libUE4Out) {
     driver_stat.store(pid, std::memory_order_release);
 }
 
+void DumpTArray(){
+    for (uint64_t off = 0x0; off <= 0x250; off += 0x8) {
+        uint64_t level = Paradise_hook->read<uint64_t>(
+            Paradise_hook->read<uint64_t>(sLibUE4 + offset.Gworld) + 0xB0);
+        uint64_t ptr = Paradise_hook->read<uint64_t>(level + off);
+        int32_t count = Paradise_hook->read<int32_t>(level + off + 0x8);
+        int32_t max   = Paradise_hook->read<int32_t>(level + off + 0xC);
+
+        if (ptr > 0x10000ULL && ptr < 0x800000000000ULL
+                    && count > 5 && count <= max && max < 100000) {
+            printf("ULevel+0x%03llX -> Data=0x%llX  Count=%d  Max=%d\n", off, ptr, count, max);
+            // 验证前3个元素
+            for (int i = 0; i < 150 && i < count; i++) {
+                uint64_t actor = Paradise_hook->read<uint64_t>(ptr + i * 8);
+                if (actor) {
+                    std::string name = GetObjectName(actor,sLibUE4);
+                    if(name.length()<9){
+                        continue;
+                    }
+                    printf("    [%d] 0x%llX -> %s\n", i, actor, name.c_str());
+                }
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════
+//  Dump Bones
+// ═══════════════════════════════════════════
+void DumpBones() {
+    auto actors = GetCachedActors();
+    if (!actors) return;
+
+    for (const auto& ca : *actors) {
+        if (strncmp(ca.className.c_str(), "BP_TrainPlayerPawn_C", 5) != 0) continue;
+
+        uint64_t skelMeshComp = Paradise_hook->read<uint64_t>(ca.actorAddr + offset.SkeletalMeshComponent);
+        if (skelMeshComp == 0) { printf("SkeletalMeshComponent is null\n"); continue; }
+
+        int boneCount = Paradise_hook->read<int>(skelMeshComp + offset.ComponentSpaceTransforms + 0x8);
+
+        uint64_t skelMesh = Paradise_hook->read<uint64_t>(skelMeshComp + offset.SkeletalMesh);
+        if (skelMesh == 0) { printf("SkeletalMesh is null\n"); continue; }
+
+        // FReferenceSkeleton.RawRefBoneInfo at SkeletalMesh+0x238
+        // FMeshBoneInfo: FName(8) + ParentIndex(4) + padding(4) = 0x10 stride
+        uint64_t boneInfoPtr = Paradise_hook->read<uint64_t>(skelMesh + offset.RefBoneInfo);
+        int boneInfoCount = Paradise_hook->read<int>(skelMesh + offset.RefBoneInfo + 0x8);
+
+        printf("=== %s (0x%llX) BoneCount=%d ===\n",
+               ca.className.c_str(), (unsigned long long)ca.actorAddr, boneInfoCount);
+
+        constexpr int kBoneInfoStride = 0x10;
+        int count = (boneInfoCount > 0 && boneInfoCount < 300) ? boneInfoCount : boneCount;
+        for (int i = 0; i < count; i++) {
+            int32_t nameIndex = Paradise_hook->read<int32_t>(boneInfoPtr + i * kBoneInfoStride);
+            int32_t parentIdx = Paradise_hook->read<int32_t>(boneInfoPtr + i * kBoneInfoStride + 0x08);
+            std::string boneName = GetNameByIndex(nameIndex, sLibUE4);
+            printf("  [CST:%d] %s (parent=%d)\n", i, boneName.c_str(), parentIdx);
+        }
+    }
+}
+
 // ═══════════════════════════════════════════
 //  读取线程
 // ═══════════════════════════════════════════
-static void readThreadFunc() {
-    std::vector<uint64_t> cachedActorAddrs;
-    auto lastScanTime = std::chrono::steady_clock::now();
-    constexpr auto kScanInterval = std::chrono::milliseconds(500);
+static std::mutex gActorListMtx;
+static std::shared_ptr<std::vector<CachedActor>> gSharedActors =
+    std::make_shared<std::vector<CachedActor>>();
 
+std::shared_ptr<std::vector<CachedActor>> GetCachedActors() {
+    std::lock_guard<std::mutex> lock(gActorListMtx);
+    return gSharedActors;
+}
+
+static void readThreadFunc() {
     while (gReadThreadRunning.load(std::memory_order_relaxed)) {
         if (driver_stat.load(std::memory_order_acquire) <= 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -158,7 +227,7 @@ static void readThreadFunc() {
 
         frame.uworld = Paradise_hook->read<uint64_t>(sLibUE4 + offset.Gworld);
         if (frame.uworld == 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
             continue;
         }
         frame.persistentLevel = Paradise_hook->read<uint64_t>(frame.uworld + offset.PersistentLevel);
@@ -166,35 +235,42 @@ static void readThreadFunc() {
         frame.actorCount = Paradise_hook->read<int>(frame.persistentLevel + offset.TArray + 0x8);
         if (frame.actorCount <= 0) frame.actorCount = 0;
 
-        // 定期重新扫描 actor 列表
-        auto now = std::chrono::steady_clock::now();
-        if (now - lastScanTime >= kScanInterval) {
-            lastScanTime = now;
-            cachedActorAddrs.clear();
-            cachedActorAddrs.reserve(frame.actorCount);
-            for (int i = 0; i < frame.actorCount; i++) {
-                uint64_t addr = Paradise_hook->read<uint64_t>(TArray + 8 * i);
-                if (addr <= 0x10000000 || addr == 0 || addr % 4 != 0 || addr >= 0x10000000000)
-                    continue;
-                std::string name = GetObjectName(addr, sLibUE4);
-                if (strncmp(name.c_str(), "BP_", 3))
-                    continue;
-                cachedActorAddrs.push_back(addr);
+        // 扫描 actor 列表，缓存地址 + RootComponent 指针
+        std::vector<CachedActor> newActors;
+        newActors.reserve(frame.actorCount);
+
+        std::vector<uint64_t> ptrBuf(frame.actorCount);
+        Paradise_hook->read(TArray, ptrBuf.data(), frame.actorCount * sizeof(uint64_t));
+
+        for (int i = 0; i < frame.actorCount; i++) {
+            uint64_t addr = ptrBuf[i];
+            if (addr <= 0x10000000 || addr == 0 || addr % 4 != 0 || addr >= 0x10000000000)
+                continue;
+            uint64_t rootComp = Paradise_hook->read<uint64_t>(addr + offset.RootComponent);
+
+            // 读取 actor 类名（2 次 ioctl，nameCache 自动缓存重复类名）
+            std::string className;
+            uint64_t classPtr = Paradise_hook->read<uint64_t>(addr + 0x10);
+            if (classPtr != 0) {
+                int32_t classNameIdx = Paradise_hook->read<int32_t>(classPtr + 0x18);
+                className = GetNameByIndex(classNameIdx, sLibUE4);
             }
+
+            newActors.push_back({addr, rootComp, std::move(className)});
         }
 
-        // 每帧只读位置
-        frame.actors.reserve(cachedActorAddrs.size());
-        for (uint64_t addr : cachedActorAddrs) {
-            ActorRenderData rd;
-            rd.worldPos = GetActorLocation(addr);
-            frame.actors.push_back(rd);
+        {
+            auto newList = std::make_shared<std::vector<CachedActor>>(std::move(newActors));
+            std::lock_guard<std::mutex> lock(gActorListMtx);
+            gSharedActors = newList;
         }
 
+        // 提交基本信息供 UI 显示
         frame.valid = true;
         gFrameSync.submit(frame);
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(8));
+        // 扫描间隔 500ms
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 }
 

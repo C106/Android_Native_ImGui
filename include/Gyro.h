@@ -42,6 +42,7 @@ public:
         return fd > 0;
     }
     void update(float x,float y){
+        if (fd < 0) return;
         float temp[2];
         temp[0] = x;
         temp[1] = y;
