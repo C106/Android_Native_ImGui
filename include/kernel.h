@@ -1,8 +1,6 @@
 #ifndef KERNEL_H
 #define KERNEL_H
-#pragma once
 
-// 头文件内容
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -20,7 +18,6 @@
 #include <linux/types.h>
 #include <asm/ptrace.h>
 #include <errno.h>
-
 
 
 #define OP_CMD_READ 601
@@ -216,142 +213,5 @@ int add_breakpoint(uintptr_t addr, int type, int len) {
     
 };
 
-static c_driver *driver = new c_driver();
-
-/*--------------------------------------------------------------------------------------------------------*/
-
-typedef char PACKAGENAME;
-pid_t pid;
-
-float Kernel_v()
-{
-    const char* command = "uname -r | sed 's/\\.[^.]*$//g'";
-    FILE* file = popen(command, "r");
-    if (file == NULL) {
-        return 0.0f;
-    }
-    static char result[512];
-    if (fgets(result, sizeof(result), file) == NULL) {
-        pclose(file);
-        return 0.0f;
-    }
-    pclose(file);
-    result[strlen(result)-1] = '\0';
-    return atof(result);
-}
-
-char *GetVersion(char* PackageName)
-{
-    char command[256];
-    sprintf(command, "dumpsys package %s|grep versionName|sed 's/=/\\n/g'|tail -n 1", PackageName);
-    FILE* file = popen(command, "r");
-    if (file == NULL) {
-        return NULL;
-    }
-    static char result[512];
-    if (fgets(result, sizeof(result), file) == NULL) {
-        pclose(file);
-        return NULL;
-    }
-    pclose(file);
-    result[strlen(result)-1] = '\0';
-    return result;
-}
-
-uint64_t GetTime()
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC,&ts);
-    return (ts.tv_sec*1000 + ts.tv_nsec/(1000*1000));
-}
-
-int getPID(char* PackageName)
-{
-    FILE* fp;
-    char cmd[0x100] = "pidof ";
-    strcat(cmd, PackageName);
-    fp = popen(cmd,"r");
-    if (!fp) return -1;
-    
-    fscanf(fp,"%d", &pid);
-    pclose(fp);
-    if (pid > 0)
-    {
-        driver->initialize(pid);
-    }
-    return pid;
-}
-
-long GetModuleBaseAddr_Maps(char* module_name)
-{
-    long addr = 0;
-    char filename[64];
-    char line[1024];
-    if (pid < 0)
-        snprintf(filename, sizeof(filename), "/proc/self/maps");
-    else
-        snprintf(filename, sizeof(filename), "/proc/%d/maps", pid);
-
-    FILE *fp = fopen(filename, "r");
-    if (fp != NULL)
-    {
-        while (fgets(line, sizeof(line), fp))
-        {
-            if (strstr(line, module_name))
-            {
-                sscanf(line,"%lx-%*lx",&addr);
-                break;
-            }
-        }
-        fclose(fp);
-    }
-    return addr;
-}
-
-
-long GetModuleBaseAddr(char* module_name, int index = 0) {
-    long base = driver->get_module_base(module_name, index);
-    if (base == 0 && index == 0) {
-        return GetModuleBaseAddr_Maps(module_name);
-    }
-    return base;
-}
-
-long ReadValue(long addr)
-{
-    long he=0;
-    if (addr < 0xFFFFFFFF){
-        driver->read(addr, &he, 4);
-    }else{
-        driver->read(addr, &he, 8);
-    }
-    return he;
-}
-
-long ReadDword(long addr)
-{
-    long he=0;
-    driver->read(addr, &he, 4);
-    return he;
-}
-
-float ReadFloat(long addr)
-{
-    float he=0;
-    driver->read(addr, &he, 4);
-    return he;
-}
-
-int WriteDword(long int addr, int value)
-{
-    driver->write(addr, &value, 4);
-    return 0;
-}
-
-int WriteFloat(long int addr, float value)
-{
-    driver->write(addr, &value, 4);
-    return 0;
-}
 
 #endif

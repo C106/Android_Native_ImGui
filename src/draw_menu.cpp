@@ -5,6 +5,7 @@
 #include <android/log.h>
 #include "Gyro.h"
 #include "read_mem.h"
+#include "driver_manager.h"
 
 #ifdef NDEBUG
 #define LOGI(...) ((void)0)
@@ -18,7 +19,6 @@
 extern std::atomic<bool> IsToolActive;
 extern Gyro* Gyro_Controller;
 extern VulkanApp gApp;
-extern Paradise_hook_driver* Paradise_hook;
 
 // Logo 纹理
 static ImTextureID gLogoTexture = (ImTextureID)0;
@@ -157,11 +157,53 @@ void DrawObjViewTab() {
 void DrawConfigTab() {
     ImGui::Text("Configuration");
     ImGui::Separator();
+
     ImGui::Checkbox("显示所有类名", &gShowAllClassNames);
-    ImGui::SliderInt("Target FPS", &gTargetFPS, 1, 144);
+
+    // 骨骼读取模式切换
+    ImGui::Separator();
+    ImGui::Text("骨骼读取模式:");
+    if (ImGui::Checkbox("批量读取（优化）", &gUseBatchBoneRead)) {
+        // 切换时自动更新
+    }
     ImGui::SameLine();
-    ImGui::Text("%d FPS", gTargetFPS);
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::Text("批量读取: 1次ioctl读取整个骨骼数组（推荐）");
+        ImGui::Text("逐个读取: 每个骨骼1次ioctl（调试用）");
+        ImGui::EndTooltip();
+    }
+
+    ImGui::Separator();
+    ImGui::SliderInt("Target FPS", &gTargetFPS, 0, 144);
+    ImGui::SameLine();
+    if (gTargetFPS == 0) {
+        ImGui::Text("无限制 (最低延迟)");
+    } else {
+        ImGui::Text("%d FPS", gTargetFPS);
+    }
+    ImGui::TextDisabled("提示: 设为 0 可获得最低延迟，但会增加 CPU 占用");
+
     ImGuiIO& io = ImGui::GetIO();
+
+    // 驱动选择
+    ImGui::Separator();
+    ImGui::Text("驱动选择:");
+    int driverType = (int)Paradise_hook->getType();
+    if (ImGui::RadioButton("RT Hook", &driverType, DRIVER_RT_HOOK)) {
+        StopReadThread();
+        driver_stat.store(0, std::memory_order_release);
+        Paradise_hook->switchDriver(DRIVER_RT_HOOK);
+    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Paradise Hook", &driverType, DRIVER_PARADISE)) {
+        StopReadThread();
+        driver_stat.store(0, std::memory_order_release);
+        Paradise_hook->switchDriver(DRIVER_PARADISE);
+    }
+
+    ImGui::Separator();
 
     // "mem" 按钮：初始化 driver
     if (ImGui::Button("mem", ImVec2(100, 50))) {

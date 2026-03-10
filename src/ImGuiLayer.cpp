@@ -189,14 +189,17 @@ void ImGuiLayer::frame_render(VulkanApp& app) {
     }
 
     // -------------------------
-    // 2) 获取下一张 swapchain image
+    // 2) 获取下一张 swapchain image（使用 0 超时避免阻塞）
     // -------------------------
     uint32_t imageIndex = UINT32_MAX;
-    r = vkAcquireNextImageKHR(app.device, app.swapchain, UINT64_MAX,
+    r = vkAcquireNextImageKHR(app.device, app.swapchain, 0,  // 0 超时：非阻塞
                               app.imageAvailableSemaphores[frameIndex], VK_NULL_HANDLE, &imageIndex);
 
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) {
         app.swapchainRebuildRequired = true;
+        return;
+    } else if (r == VK_NOT_READY || r == VK_TIMEOUT) {
+        // 图像暂时不可用，跳过本帧（避免阻塞）
         return;
     } else if (r != VK_SUCCESS) {
         LOGE( "Acquire image failed: %d", r);

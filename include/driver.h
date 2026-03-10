@@ -70,7 +70,6 @@ struct paradise_memory_fast_cmd
     uintptr_t dst_va;
     size_t size;
     uintptr_t phy_addr;
-    int prot;
 };
 
 struct paradise_gyro_config_cmd
@@ -99,8 +98,6 @@ class Paradise_hook_driver
 private:
     pid_t pid;
     int fd;
-
-    std::mutex driver_lock;
 
     int scan_driver_fd()
     {
@@ -271,15 +268,12 @@ public:
             return false;
         }
 
-        std::lock_guard<std::mutex> lock(this->driver_lock);
-
         struct paradise_memory_fast_cmd cmd = {};
 
         cmd.pid = this->pid;
         cmd.src_va = addr;
         cmd.dst_va = (uintptr_t)buffer;
         cmd.size = size;
-        cmd.prot = 0;
 
         return ioctl(fd, PARADISE_IOCTL_READ_MEMORY_FAST, &cmd) == 0;
     }
@@ -305,15 +299,12 @@ public:
             return false;
         }
 
-        std::lock_guard<std::mutex> lock(this->driver_lock);
-
         struct paradise_memory_fast_cmd cmd = {};
 
         cmd.pid = this->pid;
         cmd.src_va = addr;
         cmd.dst_va = (uintptr_t)buffer;
         cmd.size = size;
-        cmd.prot = 0;
 
         return ioctl(fd, PARADISE_IOCTL_WRITE_MEMORY_FAST, &cmd) == 0;
     }
@@ -335,8 +326,6 @@ public:
         {
             return false;
         }
-
-        std::lock_guard<std::mutex> lock(this->driver_lock);
 
         struct paradise_memory_cmd cmd = {};
 
@@ -368,8 +357,6 @@ public:
         {
             return false;
         }
-
-        std::lock_guard<std::mutex> lock(this->driver_lock);
 
         struct paradise_memory_cmd cmd = {};
 

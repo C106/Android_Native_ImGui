@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <vector>
 #include <memory>
+#include <string>
 
 #ifdef NDEBUG
 #define LOGI(...) ((void)0)
@@ -15,7 +16,6 @@
 #endif
 
 extern std::atomic<bool> IsToolActive;
-extern Paradise_hook_driver* Paradise_hook;
 
 // 双缓冲实例
 FrameSynchronizer<ReadFrameData> gFrameSync;
@@ -29,6 +29,24 @@ static uint64_t sLibUE4 = 0; // 读取线程用的 libUE4 副本
 //  名称缓存
 // ═══════════════════════════════════════════
 static std::unordered_map<int32_t, std::string> nameCache;
+
+// 骨骼名 → 自定义ID 映射表
+static const std::unordered_map<std::string, int> gBoneNameToID = {
+    {"head",              BONE_HEAD},
+    {"neck_01",           BONE_NECK},
+    {"spine_03",          BONE_CHEST},
+    {"pelvis",            BONE_PELVIS},
+    {"upperarm_l",        BONE_L_SHOULDER},
+    {"upperarm_r",        BONE_R_SHOULDER},
+    {"lowerarm_l",        BONE_L_ELBOW},
+    {"lowerarm_r",        BONE_R_ELBOW},
+    {"hand_l",            BONE_L_HAND},
+    {"hand_r",            BONE_R_HAND},
+    {"calf_l",            BONE_L_KNEE},
+    {"calf_r",            BONE_R_KNEE},
+    {"foot_l",            BONE_L_FOOT},
+    {"foot_r",            BONE_R_FOOT},
+};
 
 std::string GetNameByIndex(int32_t index, uint64_t libUE4) {
     auto it = nameCache.find(index);
@@ -126,16 +144,55 @@ void DumpObjects(uint64_t libUE4, int count) {
 // ═══════════════════════════════════════════
 void InitDriver(const char* packageName, uint64_t& libUE4Out) {
     int pid = Paradise_hook->get_pid(packageName);
-    Paradise_hook->initialize(pid);
     if (pid > 0) {
+        printf("[+] pid = %d\n", pid);
         libUE4Out = Paradise_hook->get_module_base("libUE4.so");
         sLibUE4 = libUE4Out;
+        if(libUE4Out){
+            printf("libUE4: %lx\n",libUE4Out);
+        }
+
         address.Matrix = Paradise_hook->read<uint64_t>(
             Paradise_hook->read<uint64_t>(libUE4Out + offset.CanvasMap) + 0x20) + 0x270;
 
-        uint64_t level = Paradise_hook->read<uint64_t>(
-            Paradise_hook->read<uint64_t>(libUE4Out + offset.Gworld) + 0xB0);
-        LOGI("PersistentLevel = 0x%lX", level);
+        // 读取 Gworld
+        uint64_t gworld = Paradise_hook->read<uint64_t>(libUE4Out + offset.Gworld);
+
+        // 获取本地玩家 actor（从 Gworld 获取 NetDriver）
+        if (gworld != 0) {
+            uint64_t netDriver = Paradise_hook->read<uint64_t>(gworld + offset.NetDriver);
+
+            if (netDriver != 0) {
+                // 尝试 ServerConnection（客户端）
+                uint64_t serverConnection = Paradise_hook->read<uint64_t>(netDriver + offset.ServerConnection);
+
+                uint64_t connection = 0;
+                if (serverConnection != 0) {
+                    connection = serverConnection;
+                } else {
+                    // 回退到 ClientConnections[0]（服务器/单机）
+                    uint64_t clientConnectionsArray = netDriver + 0x90;
+                    uint64_t clientConnectionsData = Paradise_hook->read<uint64_t>(clientConnectionsArray);
+                    int clientConnectionsCount = Paradise_hook->read<int>(clientConnectionsArray + 0x8);
+
+                    if (clientConnectionsData != 0 && clientConnectionsCount > 0) {
+                        connection = Paradise_hook->read<uint64_t>(clientConnectionsData);
+                    }
+                }
+
+                if (connection != 0) {
+                    // NetConnection 继承自 Player，直接获取 PlayerController
+                    uint64_t playerController = Paradise_hook->read<uint64_t>(connection + offset.PlayerController);
+
+                    if (playerController != 0) {
+                        address.LocalPlayerActor = Paradise_hook->read<uint64_t>(playerController + offset.AcknowledgedPawn);
+                    }
+                }
+            }
+        }
+
+        // 启动读取线程
+        StartReadThread();
     }
     // release: 保证 sLibUE4/address 写入对读取线程可见
     driver_stat.store(pid, std::memory_order_release);
@@ -181,6 +238,7 @@ void DumpBones() {
         if (skelMeshComp == 0) { printf("SkeletalMeshComponent is null\n"); continue; }
 
         int boneCount = Paradise_hook->read<int>(skelMeshComp + offset.ComponentSpaceTransforms + 0x8);
+        if (boneCount != 66) continue;
 
         uint64_t skelMesh = Paradise_hook->read<uint64_t>(skelMeshComp + offset.SkeletalMesh);
         if (skelMesh == 0) { printf("SkeletalMesh is null\n"); continue; }
@@ -193,13 +251,42 @@ void DumpBones() {
         printf("=== %s (0x%llX) BoneCount=%d ===\n",
                ca.className.c_str(), (unsigned long long)ca.actorAddr, boneInfoCount);
 
+        // 读取 ComponentToWorld 用于诊断
+        FTransform meshTransform = Paradise_hook->read<FTransform>(skelMeshComp + offset.ComponentToWorld);
+        float mq2 = meshTransform.Rotation.X * meshTransform.Rotation.X
+                  + meshTransform.Rotation.Y * meshTransform.Rotation.Y
+                  + meshTransform.Rotation.Z * meshTransform.Rotation.Z
+                  + meshTransform.Rotation.W * meshTransform.Rotation.W;
+        const char* mtag = (mq2 < 0.9f || mq2 > 1.1f) ? " *** BAD" : "";
+        printf("  ComponentToWorld: Rot(%.3f,%.3f,%.3f,%.3f)|%.3f%s Pos(%.1f,%.1f,%.1f) Scl(%.2f,%.2f,%.2f)\n",
+               meshTransform.Rotation.X, meshTransform.Rotation.Y, meshTransform.Rotation.Z, meshTransform.Rotation.W, mq2, mtag,
+               meshTransform.Translation.X, meshTransform.Translation.Y, meshTransform.Translation.Z,
+               meshTransform.Scale3D.X, meshTransform.Scale3D.Y, meshTransform.Scale3D.Z);
+
         constexpr int kBoneInfoStride = 0x10;
         int count = (boneInfoCount > 0 && boneInfoCount < 300) ? boneInfoCount : boneCount;
+
+        // 读取骨骼 transform 数据用于诊断
+        uint64_t boneDataPtr = Paradise_hook->read<uint64_t>(skelMeshComp + offset.ComponentSpaceTransforms);
         for (int i = 0; i < count; i++) {
             int32_t nameIndex = Paradise_hook->read<int32_t>(boneInfoPtr + i * kBoneInfoStride);
             int32_t parentIdx = Paradise_hook->read<int32_t>(boneInfoPtr + i * kBoneInfoStride + 0x08);
             std::string boneName = GetNameByIndex(nameIndex, sLibUE4);
-            printf("  [CST:%d] %s (parent=%d)\n", i, boneName.c_str(), parentIdx);
+
+            // 按当前 48 字节 stride 读取
+            FTransform bone;
+            Paradise_hook->read(boneDataPtr + i * sizeof(FTransform), &bone, sizeof(FTransform));
+            float quatLen2 = bone.Rotation.X * bone.Rotation.X
+                           + bone.Rotation.Y * bone.Rotation.Y
+                           + bone.Rotation.Z * bone.Rotation.Z
+                           + bone.Rotation.W * bone.Rotation.W;
+            const char* tag = (quatLen2 < 0.9f || quatLen2 > 1.1f) ? " *** BAD QUAT" : "";
+            printf("  [%d] %s (parent=%d) Rot(%.3f,%.3f,%.3f,%.3f)|%.3f "
+                   "Pos(%.1f,%.1f,%.1f) Scl(%.2f,%.2f,%.2f)%s\n",
+                   i, boneName.c_str(), parentIdx,
+                   bone.Rotation.X, bone.Rotation.Y, bone.Rotation.Z, bone.Rotation.W, quatLen2,
+                   bone.Translation.X, bone.Translation.Y, bone.Translation.Z,
+                   bone.Scale3D.X, bone.Scale3D.Y, bone.Scale3D.Z, tag);
         }
     }
 }
@@ -217,6 +304,9 @@ std::shared_ptr<std::vector<CachedActor>> GetCachedActors() {
 }
 
 static void readThreadFunc() {
+    // 保存上一次扫描的 actor 列表，用于保留已构建的骨骼映射
+    static std::unordered_map<uint64_t, CachedActor> previousActors;
+
     while (gReadThreadRunning.load(std::memory_order_relaxed)) {
         if (driver_stat.load(std::memory_order_acquire) <= 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -256,7 +346,51 @@ static void readThreadFunc() {
                 className = GetNameByIndex(classNameIdx, sLibUE4);
             }
 
-            newActors.push_back({addr, rootComp, std::move(className)});
+            CachedActor ca(addr, rootComp, std::move(className));
+
+            // 检查是否已有该 actor 的骨骼映射（从上次扫描中恢复）
+            auto prevIt = previousActors.find(addr);
+            if (prevIt != previousActors.end() && prevIt->second.boneMapBuilt && prevIt->second.className == className) {
+                // 复用已构建的骨骼映射
+                std::copy(std::begin(prevIt->second.boneMap), std::end(prevIt->second.boneMap), std::begin(ca.boneMap));
+                ca.boneMapBuilt = true;
+            } else {
+                // 只为尚未构建骨骼映射的 actor 构建
+                uint64_t skelMeshComp = Paradise_hook->read<uint64_t>(addr + offset.SkeletalMeshComponent);
+                if (skelMeshComp != 0) {
+                    uint64_t skelMesh = Paradise_hook->read<uint64_t>(skelMeshComp + offset.SkeletalMesh);
+                    if (skelMesh != 0) {
+                        // 读取 RefBoneInfo
+                        uint64_t boneInfoPtr = Paradise_hook->read<uint64_t>(skelMesh + offset.RefBoneInfo);
+                        int boneInfoCount = Paradise_hook->read<int>(skelMesh + offset.RefBoneInfo + 0x8);
+
+                        if (boneInfoCount > 0 && boneInfoCount < 300) {
+                            constexpr int kBoneInfoStride = 0x10;
+                            for (int j = 0; j < boneInfoCount; j++) {
+                                int32_t nameIndex = Paradise_hook->read<int32_t>(boneInfoPtr + j * kBoneInfoStride);
+                                std::string boneName = GetNameByIndex(nameIndex, sLibUE4);
+
+                                // 查找是否在映射表中
+                                auto it = gBoneNameToID.find(boneName);
+                                if (it != gBoneNameToID.end()) {
+                                    ca.boneMap[it->second] = j;  // 记录该骨骼在 CST 数组中的索引
+                                }
+                            }
+                            ca.boneMapBuilt = true;  // 标记为已构建
+                        }
+                    }
+                }
+            }
+
+            newActors.push_back(std::move(ca));
+        }
+
+        // 更新 previousActors 映射（保留骨骼映射供下次扫描使用）
+        previousActors.clear();
+        for (const auto& actor : newActors) {
+            if (actor.boneMapBuilt) {
+                previousActors[actor.actorAddr] = actor;
+            }
         }
 
         {
@@ -269,8 +403,8 @@ static void readThreadFunc() {
         frame.valid = true;
         gFrameSync.submit(frame);
 
-        // 扫描间隔 500ms
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        // 扫描间隔 1000ms（1秒）- 骨骼映射已缓存，无需频繁扫描
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
 }
 

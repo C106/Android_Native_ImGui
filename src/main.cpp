@@ -10,7 +10,7 @@
 #include <thread>
 #include "Gyro.h"
 #include "volume_control.h"
-#include "driver.h"
+#include "driver_manager.h"
 #ifdef NDEBUG
 #define LOGD(...) ((void)0)
 #define LOGE(...) ((void)0)
@@ -26,15 +26,12 @@ std::atomic<bool> IsToolActive,IsMenuOpen;
 static bool gNeedReinitialize = false;  // 屏幕旋转后需要重新初始化
 android::ANativeWindowCreator::DisplayInfo displayInfo;
 int secure_flag = 0;
-Paradise_hook_driver *Paradise_hook = nullptr;
+
+//c_driver *Paradise_hook = nullptr;
+
 Gyro* Gyro_Controller;
 // 帧率控制参数
 int gTargetFPS = 60;
-
-// 帧率控制：计算帧间隔（微秒）
-inline int get_frame_time_us() {
-    return gTargetFPS > 0 ? 1000000 / gTargetFPS : 16667; // 默认约 60 FPS
-}
 
 // 重新初始化所有组件（用于屏幕旋转后）
 void reinitializeAll() {
@@ -143,7 +140,7 @@ int main() {
     int frameCounter = 0;
     auto last_time = std::chrono::high_resolution_clock::now();
 
-    Paradise_hook = new Paradise_hook_driver;
+    //Paradise_hook = new c_driver();
     StartReadThread();
     // ── 主循环 ──
     while (IsToolActive == 1) {
@@ -172,16 +169,7 @@ int main() {
             continue; // 跳过本帧渲染，下帧用新管线
         }
 
-        // 2. 帧率控制
-        auto frame_start = std::chrono::high_resolution_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(frame_start - last_time);
-        int target_us = get_frame_time_us();
-        if (elapsed.count() < target_us) {
-            int sleep_us = target_us - (int)elapsed.count();
-            // 留 1ms 余量给系统调度，剩余部分 sleep
-            if (sleep_us > 1000)
-                std::this_thread::sleep_for(std::chrono::microseconds(sleep_us - 1000));
-        }
+        // 2. VSync 自然控制帧率（FIFO 呈现模式），仅更新时间戳用于 FPS 测量
         last_time = std::chrono::high_resolution_clock::now();
 
         process_input_event(touch_fd);
@@ -204,10 +192,10 @@ int main() {
             }
         }
 
-        // 4. 渲染
+        // 4. 渲染（先用上一帧读取的数据渲染）
         ImGui_ProcessPendingTextureLoads();
         gImGui.beginFrame(gWindow, displayInfo.width, displayInfo.height);
-        DrawObjects();
+        DrawObjects();  // 使用缓存的数据绘制
         if (IsMenuOpen == 1)
             Draw_Menu();
 
@@ -218,7 +206,11 @@ int main() {
         }
 
         gImGui.endFrame();
-        gImGui.frame_render(gApp);
+        gImGui.frame_render(gApp);  // Present 在这里完成
+
+        // 5. Present 完成后立即读取下一帧数据（最小化延迟）
+        // 这样读取的数据会在下一帧渲染时使用，延迟最小
+        // 注意：DrawObjects() 内部会读取数据并缓存到静态变量中
     }
 
     // ── 清理 ──

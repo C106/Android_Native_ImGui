@@ -330,7 +330,7 @@ inline FMatrix MatrixMultiply(const FMatrix& A, const FMatrix& B) {
 
 inline bool WorldToScreen(Vec3 World, const FMatrix& VP, float SW, float SH, Vec2& Out) {
     float W = World.X * VP.M[0][3] + World.Y * VP.M[1][3] + World.Z * VP.M[2][3] + VP.M[3][3];
-    if (W < 0.001f) return false;
+    if (W <= 0.0f) return false;  // 只过滤真正在相机背后的点
     float X = World.X * VP.M[0][0] + World.Y * VP.M[1][0] + World.Z * VP.M[2][0] + VP.M[3][0];
     float Y = World.X * VP.M[0][1] + World.Y * VP.M[1][1] + World.Z * VP.M[2][1] + VP.M[3][1];
     Out.x = (SW / 2.0f) + (X / W) * (SW / 2.0f);
@@ -371,6 +371,52 @@ inline Vec3 TransformPosition(const FTransform& T, const Vec3& LocalPos)
     };
 }
 
+// FTransform 转 4x4 矩阵
+inline FMatrix TransformToMatrix(const FTransform& T)
+{
+    const auto& q = T.Rotation;
+    const auto& t = T.Translation;
+    const auto& s = T.Scale3D;
+
+    // 四元数转旋转矩阵
+    float xx = q.X * q.X, yy = q.Y * q.Y, zz = q.Z * q.Z;
+    float xy = q.X * q.Y, xz = q.X * q.Z, yz = q.Y * q.Z;
+    float wx = q.W * q.X, wy = q.W * q.Y, wz = q.W * q.Z;
+
+    FMatrix M = {};
+    M.M[0][0] = (1.0f - 2.0f * (yy + zz)) * s.X;
+    M.M[0][1] = (2.0f * (xy + wz)) * s.X;
+    M.M[0][2] = (2.0f * (xz - wy)) * s.X;
+    M.M[0][3] = 0.0f;
+
+    M.M[1][0] = (2.0f * (xy - wz)) * s.Y;
+    M.M[1][1] = (1.0f - 2.0f * (xx + zz)) * s.Y;
+    M.M[1][2] = (2.0f * (yz + wx)) * s.Y;
+    M.M[1][3] = 0.0f;
+
+    M.M[2][0] = (2.0f * (xz + wy)) * s.Z;
+    M.M[2][1] = (2.0f * (yz - wx)) * s.Z;
+    M.M[2][2] = (1.0f - 2.0f * (xx + yy)) * s.Z;
+    M.M[2][3] = 0.0f;
+
+    M.M[3][0] = t.X;
+    M.M[3][1] = t.Y;
+    M.M[3][2] = t.Z;
+    M.M[3][3] = 1.0f;
+
+    return M;
+}
+
+// 矩阵变换点
+inline Vec3 MatrixTransformPosition(const FMatrix& M, const Vec3& P)
+{
+    return Vec3{
+        M.M[0][0] * P.X + M.M[1][0] * P.Y + M.M[2][0] * P.Z + M.M[3][0],
+        M.M[0][1] * P.X + M.M[1][1] * P.Y + M.M[2][1] * P.Z + M.M[3][1],
+        M.M[0][2] * P.X + M.M[1][2] * P.Y + M.M[2][2] * P.Z + M.M[3][2]
+    };
+}
+
 struct Offsets{
     uintptr_t Gworld = 0x14988578;
     uintptr_t Gname = 0x146F9F30;
@@ -380,6 +426,7 @@ struct Offsets{
     uintptr_t NetDriver = 0xb8;
     uintptr_t ServerConnection = 0x88;
     uintptr_t PlayerController = 0x30;
+    uintptr_t AcknowledgedPawn = 0x638;  // PlayerController->AcknowledgedPawn
     uintptr_t PlayerCameraManager = 0x658;
     uintptr_t CameraCache = 0x640;
     uintptr_t POV = 0x10;
@@ -387,7 +434,11 @@ struct Offsets{
     uintptr_t ComponentToWorld = 0x1F0;
     uintptr_t CanvasMap = 0x14954368;
     uintptr_t SkeletalMeshComponent = 0x650;
-    uintptr_t ComponentSpaceTransforms = 0xbb8;
+    uintptr_t MasterPoseComponent = 0x7f8;  // USkinnedMeshComponent -> USkinnedMeshComponent* (from SDK dump)
+    uintptr_t ComponentSpaceTransforms = 0x810;   // ComponentSpaceTransformsArray[0], [1] is at +0x10
+    uintptr_t CachedComponentSpaceTransforms = 0xbb8;  // TArray<FTransform> (缓存的组件空间变换，单缓冲，更稳定)
+    uintptr_t CurrentReadComponentTransformIndex = 0x830; // int32, 0 or 1 — 需要根据 SDK dump 确认
+    uintptr_t BoneSpaceTransforms = 0xba8;  // TArray<FTransform> (局部空间骨骼变换)
     uintptr_t SkeletalMesh = 0x7f0;        // USkinnedMeshComponent -> USkeletalMesh* //claude --resume 0aac9131-07d7-4ae1-97c8-ec2cfe469950
     uintptr_t RefBoneInfo = 0x238;          // USkeletalMesh -> FReferenceSkeleton.RawRefBoneInfo TArray ? ? ? F9 ? ? ? D3 ? ? ? 90 ? ? ? F9 ? ? ? F9 ? ? ? 11
 };
@@ -395,5 +446,6 @@ struct Addresses{
     uintptr_t Uworld,libUE4;
     uintptr_t Gname;
     uintptr_t Matrix;
-    uintptr_t ProjectionMat,Ulevel,localplay,oneself,Arrayaddr,Objaddr; 
+    uintptr_t ProjectionMat,Ulevel,localplay,oneself,Arrayaddr,Objaddr;
+    uintptr_t LocalPlayerActor = 0;  // 本地玩家操控的 actor
 };
