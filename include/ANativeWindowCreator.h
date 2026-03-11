@@ -6,10 +6,16 @@
 #include <dlfcn.h>
 #include <sys/system_properties.h>
 #include <cstddef>
+#include <cstdio>
+#include <cstring>
 #include <unordered_map>
 #include <string>
 #include <vector>
-
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <algorithm>
+#include <unistd.h>
 #include <sys/system_properties.h>
 #define ResolveMethod(ClassName, MethodName, Handle, MethodSignature)                                                                    \
     ClassName##__##MethodName = reinterpret_cast<decltype(ClassName##__##MethodName)>(symbolMethod.Find(Handle, MethodSignature));       \
@@ -22,6 +28,17 @@ namespace android
 {
     namespace detail
     {
+        // 全局变量用于 LayerStack 监控
+        static void* g_mirrorSurfaceControl = nullptr;
+        static void* g_originalSurfaceControl = nullptr;
+        static std::atomic<bool> g_monitorRunning{false};
+        static std::thread g_monitorThread;
+        static std::unordered_map<uint32_t, bool> g_processedLayerStacks;  // 已处理的 LayerStack
+
+        // 前向声明
+        void MonitorLayerStack();
+        void StartLayerStackMonitor();
+
         namespace ui
         {
             // A LayerStack identifies a Z-ordered group of layers. A layer can only be associated to a single
@@ -134,6 +151,11 @@ namespace android
             void (*SurfaceComposerClient__Destructor)(void *thiz) = nullptr;
             StrongPointer<void> (*SurfaceComposerClient__CreateSurface)(void *thiz, void *name, uint32_t w, uint32_t h, int32_t format, uint32_t flags, void *parentHandle, void *layerMetadata, uint32_t *outTransformHint) = nullptr;
             StrongPointer<void> (*SurfaceComposerClient__CreateSurface_and9)(void *thiz, void *name, uint32_t w, uint32_t h, int32_t format, uint32_t flags, void *parentHandle, int32_t windowType, int32_t ownerUid) = nullptr;
+            // mirrorSurface: 非静态成员函数，需要 this 指针
+            // Android 15-: sp<SurfaceControl> mirrorSurface(SurfaceControl*)
+            // Android 16+: sp<SurfaceControl> mirrorSurface(SurfaceControl*, SurfaceControl* parent)
+            StrongPointer<void> (*SurfaceComposerClient__MirrorSurface)(void *thiz, void *surfaceControl) = nullptr;
+            StrongPointer<void> (*SurfaceComposerClient__MirrorSurface_and16)(void *thiz, void *surfaceControl, void *parent) = nullptr;
             StrongPointer<void> (*SurfaceComposerClient__GetInternalDisplayToken)() = nullptr;
             StrongPointer<void> (*SurfaceComposerClient__GetBuiltInDisplay)(ui::DisplayType type) = nullptr;
             int32_t (*SurfaceComposerClient__GetDisplayState)(StrongPointer<void> &display, ui::DisplayState *displayState) = nullptr;
@@ -143,6 +165,8 @@ namespace android
 
             void (*SurfaceComposerClient__Transaction__Constructor)(void *thiz) = nullptr;
             void *(*SurfaceComposerClient__Transaction__SetLayer)(void *thiz, StrongPointer<void> &surfaceControl, int32_t z) = nullptr;
+            void *(*SurfaceComposerClient__Transaction__SetLayerStack)(void *thiz, StrongPointer<void> &surfaceControl, ui::LayerStack layerStack) = nullptr;
+            void *(*SurfaceComposerClient__Transaction__Reparent)(void *thiz, StrongPointer<void> &surfaceControl, StrongPointer<void> &newParent) = nullptr;
             void *(*SurfaceComposerClient__Transaction__SetTrustedOverlay)(void *thiz, StrongPointer<void> &surfaceControl, bool isTrustedOverlay) = nullptr;
             int32_t (*SurfaceComposerClient__Transaction__Apply)(void *thiz, bool synchronous, bool oneWay) = nullptr;
 
@@ -237,11 +261,43 @@ namespace android
                 ResolveMethod(String8, Destructor, libutils, "_ZN7android7String8D2Ev");
 
                 ResolveMethod(LayerMetadata, Constructor, libgui, "_ZN7android13LayerMetadataC2Ev");
+                // Android 13+ fallback: android::gui 命名空间
+                if (!LayerMetadata__Constructor) {
+                    LayerMetadata__Constructor = (void (*)(void *))symbolMethod.Find(libgui, "_ZN7android3gui13LayerMetadataC2Ev");
+                    if (LayerMetadata__Constructor) {
+                        __android_log_print(ANDROID_LOG_INFO, "ImGui", "[+] Loaded Android 13+ symbol: android::gui::LayerMetadata::Constructor");
+                    }
+                }
+
                 ResolveMethod(LayerMetadata, setInt32, libgui, "_ZN7android13LayerMetadata8setInt32Eji");
+                // Android 13+ fallback: android::gui 命名空间 (参数类型相同)
+                if (!LayerMetadata__setInt32) {
+                    LayerMetadata__setInt32 = (void (*)(void *, uint32_t, int32_t))symbolMethod.Find(libgui, "_ZN7android3gui13LayerMetadata8setInt32Eji");
+                    if (LayerMetadata__setInt32) {
+                        __android_log_print(ANDROID_LOG_INFO, "ImGui", "[+] Loaded Android 13+ symbol: android::gui::LayerMetadata::setInt32");
+                    }
+                }
 
 
                 ResolveMethod(SurfaceComposerClient, Constructor, libgui, "_ZN7android21SurfaceComposerClientC2Ev");
                 ResolveMethod(SurfaceComposerClient, CreateSurface, libgui, "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjijRKNS_2spINS_7IBinderEEENS_13LayerMetadataEPj");
+                ResolveMethod(SurfaceComposerClient, MirrorSurface, libgui, "_ZN7android21SurfaceComposerClient13mirrorSurfaceEPNS_14SurfaceControlE");
+                // Android 16+ fallback: mirrorSurface 增加了 parent 参数
+                if (!SurfaceComposerClient__MirrorSurface) {
+                    SurfaceComposerClient__MirrorSurface_and16 = reinterpret_cast<decltype(SurfaceComposerClient__MirrorSurface_and16)>(
+                        symbolMethod.Find(libgui, "_ZN7android21SurfaceComposerClient13mirrorSurfaceEPNS_14SurfaceControlES2_"));
+                    if (SurfaceComposerClient__MirrorSurface_and16) {
+                        __android_log_print(ANDROID_LOG_INFO, "ImGui", "[+] Loaded Android 16+ symbol: SurfaceComposerClient::MirrorSurface (with parent)");
+                    }
+                }
+                // Android 13+ fallback: android::gui::LayerMetadata
+                if (!SurfaceComposerClient__CreateSurface) {
+                    SurfaceComposerClient__CreateSurface = reinterpret_cast<decltype(SurfaceComposerClient__CreateSurface)>(
+                        symbolMethod.Find(libgui, "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjiiRKNS_2spINS_7IBinderEEENS_3gui13LayerMetadataEPj"));
+                    if (SurfaceComposerClient__CreateSurface) {
+                        __android_log_print(ANDROID_LOG_INFO, "ImGui", "[+] Loaded Android 13+ symbol: SurfaceComposerClient::CreateSurface (gui::LayerMetadata)");
+                    }
+                }
                 ResolveMethod(SurfaceComposerClient, GetInternalDisplayToken, libgui, "_ZN7android21SurfaceComposerClient23getInternalDisplayTokenEv");
                 ResolveMethod(SurfaceComposerClient, GetDisplayState, libgui, "_ZN7android21SurfaceComposerClient15getDisplayStateERKNS_2spINS_7IBinderEEEPNS_2ui12DisplayStateE");
                 ResolveMethod(SurfaceComposerClient, GetDisplayInfo, libgui, "_ZN7android21SurfaceComposerClient14getDisplayInfoERKNS_2spINS_7IBinderEEEPNS_11DisplayInfoE");
@@ -250,6 +306,8 @@ namespace android
 
                 ResolveMethod(SurfaceComposerClient__Transaction, Constructor, libgui, "_ZN7android21SurfaceComposerClient11TransactionC2Ev");
                 ResolveMethod(SurfaceComposerClient__Transaction, SetLayer, libgui, "_ZN7android21SurfaceComposerClient11Transaction8setLayerERKNS_2spINS_14SurfaceControlEEEi");
+                ResolveMethod(SurfaceComposerClient__Transaction, SetLayerStack, libgui, "_ZN7android21SurfaceComposerClient11Transaction13setLayerStackERKNS_2spINS_14SurfaceControlEEENS_2ui10LayerStackE");
+                ResolveMethod(SurfaceComposerClient__Transaction, Reparent, libgui, "_ZN7android21SurfaceComposerClient11Transaction8reparentERKNS_2spINS_14SurfaceControlEEES6_");
                 ResolveMethod(SurfaceComposerClient__Transaction, SetTrustedOverlay, libgui, "_ZN7android21SurfaceComposerClient11Transaction17setTrustedOverlayERKNS_2spINS_14SurfaceControlEEEb");
                 ResolveMethod(SurfaceComposerClient__Transaction, Apply, libgui, "_ZN7android21SurfaceComposerClient11Transaction5applyEbb");
 
@@ -327,9 +385,10 @@ namespace android
         struct SurfaceControl
         {
             void *data;
+            void *mirrorData;  // 镜像层，用于截图/录屏捕获
 
-            SurfaceControl() : data(nullptr) {}
-            SurfaceControl(void *data) : data(data) {}
+            SurfaceControl() : data(nullptr), mirrorData(nullptr) {}
+            SurfaceControl(void *data) : data(data), mirrorData(nullptr) {}
 
             int32_t Validate()
             {
@@ -362,6 +421,12 @@ namespace android
                 if (nullptr == data || nullptr == surface)
                     return;
 
+                // 清理镜像层
+                if (mirrorData != nullptr) {
+                    Functionals::GetInstance().RefBase__DecStrong(mirrorData, this);
+                    mirrorData = nullptr;
+                }
+
                 Functionals::GetInstance().RefBase__DecStrong(reinterpret_cast<Surface *>(reinterpret_cast<size_t>(surface) - sizeof(std::max_align_t) / 2), this);
                 DisConnect();
                 Functionals::GetInstance().RefBase__DecStrong(data, this);
@@ -380,6 +445,16 @@ namespace android
             void *SetLayer(StrongPointer<void> &surfaceControl, int32_t z)
             {
                 return Functionals::GetInstance().SurfaceComposerClient__Transaction__SetLayer(data, surfaceControl, z);
+            }
+
+            void *SetLayerStack(StrongPointer<void> &surfaceControl, ui::LayerStack layerStack)
+            {
+                return Functionals::GetInstance().SurfaceComposerClient__Transaction__SetLayerStack(data, surfaceControl, layerStack);
+            }
+
+            void *Reparent(StrongPointer<void> &surfaceControl, StrongPointer<void> &newParent)
+            {
+                return Functionals::GetInstance().SurfaceComposerClient__Transaction__Reparent(data, surfaceControl, newParent);
             }
 
             void *SetTrustedOverlay(StrongPointer<void> &surfaceControl, bool isTrustedOverlay)
@@ -407,21 +482,42 @@ namespace android
             }
 
             SurfaceControl CreateSurface(const char *name, int32_t width, int32_t height, bool skipScrenshot) {
-                void *parentHandle = nullptr;
+                void *parentHandle = nullptr;  // 默认 nullptr，让 Surface 进入标准层级
                 String8 windowName(name);
                 LayerMetadata layerMetadata;
-                if (skipScrenshot && (Functionals::GetInstance().systemVersion == 10 || Functionals::GetInstance().systemVersion == 11)) {
-                    layerMetadata.setInt32(2u, 441731);
+
+                // 【核心修复】Android 10+ 必须赋予合法的窗口身份
+                // 2u = METADATA_WINDOW_TYPE, 2038 = TYPE_APPLICATION_OVERLAY (悬浮窗)
+                // 只有拥有合法身份，Android 14 的截图服务才会将其纳入捕获范围
+                if (Functionals::GetInstance().systemVersion >= 10) {
+                    if (skipScrenshot) {
+                        layerMetadata.setInt32(2u, 441731);  // 防截屏自定义类型
+                    } else {
+                        layerMetadata.setInt32(2u, 2038);    // 允许截屏的标准悬浮窗类型
+                        layerMetadata.setInt32(1u, getuid());
+                    }
                 }
-                uint32_t flags = 0x20;
+
+                // 【核心修复】初始 Flags 必须为 0！高版本系统对未知 bit 极度敏感
+                uint32_t flags = 0x0;
+
+                // 明确指定安全位
                 if (skipScrenshot && Functionals::GetInstance().systemVersion >= 12) {
-                    flags |= (secure_flag >= 1 && secure_flag <= 2) ? ( flags * secure_flag) : 0;
+                    if (secure_flag == 1) {
+                        flags |= 0x80;  // eSecure: 直接黑屏/提示无法截图
+                    } else if (secure_flag == 2) {
+                        flags |= 0x40;  // eSkipScreenshot: 肉眼可见，截图/录屏中消失
+                    }
+                } else if (skipScrenshot) {
+                    flags |= 0x80;  // 低版本只支持 eSecure
                 }
-                if (!skipScrenshot && Functionals::GetInstance().systemVersion >= 12) {
-                    flags |= 0x80;
+
+                // Android 12+ 需要 fakeParent，否则 createSurface 会崩溃
+                if (12 <= Functionals::GetInstance().systemVersion) {
+                    static void *fakeParentHandleForBinder = nullptr;
+                    parentHandle = &fakeParentHandleForBinder;
                 }
-                // 0x80屏幕进行隐私模式禁止截图，但录屏隐藏绘图
-                                
+
                 /**************************************************************************
                 eFX_NODRAW：不绘制内容到 Surface 上。
                 eFX_DRAW_PBO：使用 PBO（Pixel Buffer Object）进行离屏渲染。
@@ -489,31 +585,96 @@ namespace android
                 eFX_FLIP_VERTICAL: 0x0E
                 eFX_FLIP_HORIZONTAL: 0x0F
                 ***********************************************************  ********/
-                               
-                
-                if (12 <= Functionals::GetInstance().systemVersion) {
-                    static void *fakeParentHandleForBinder = nullptr;
-                    parentHandle = &fakeParentHandleForBinder;
-                }
-                                
+
+
                 StrongPointer<void> result;
                 if (Functionals::GetInstance().systemVersion == 9) {
-                    int32_t windowType = -1;
+                    // Android 9: 使用 windowType 参数
+                    int32_t windowType = skipScrenshot ? 441731 : 2038;
                     int32_t ownerUid = -1;
-                    if (skipScrenshot) {
-                        windowType = 441731;                    
-                    } 
-                    result = Functionals::GetInstance().SurfaceComposerClient__CreateSurface_and9(data, windowName, width, height, 1, flags, parentHandle, windowType, ownerUid);                
+                    result = Functionals::GetInstance().SurfaceComposerClient__CreateSurface_and9(data, windowName, width, height, 1, flags, parentHandle, windowType, ownerUid);
                 } else if (Functionals::GetInstance().systemVersion >= 10) {
+                    // Android 10+: 使用 LayerMetadata (包含 2038 身份)
                     result = Functionals::GetInstance().SurfaceComposerClient__CreateSurface(data, windowName, width, height, 1, flags, parentHandle, layerMetadata, nullptr);
                 }
-                
-                if (12 <= Functionals::GetInstance().systemVersion) {
+
+                SurfaceControl sc{result.get()};
+
+                if (12 <= Functionals::GetInstance().systemVersion && result.get() != nullptr) {
                     static SurfaceComposerClientTransaction transaction;
-                    transaction.SetTrustedOverlay(result, true);
+
+                    // 【关键】将 Surface 设置到 LayerStack 0（主显示）
+                    // 这样 Surface 才会显示在屏幕上，而不是 Offscreen
+                    StrongPointer<void> surfaceSP;
+                    surfaceSP.pointer = result.get();
+
+                    ui::LayerStack mainLayerStack;
+                    mainLayerStack.id = 0;  // LayerStack 0 = 主显示
+
+                    transaction.SetLayerStack(surfaceSP, mainLayerStack);
+                    transaction.SetLayer(surfaceSP, INT32_MAX);  // 设置到��上层
+                    transaction.SetTrustedOverlay(surfaceSP, true);
                     transaction.Apply(false, true);
+
+                    __android_log_print(ANDROID_LOG_INFO, "ImGui", "[+] Surface set to LayerStack 0 (main display)");
                 }
-                return {result.get()};
+
+                // 【mirrorSurface】创建镜像层，让 Surface 进入系统合成链，从而可被截图/录屏捕获
+                if (!skipScrenshot && result.get() != nullptr &&
+                    (Functionals::GetInstance().SurfaceComposerClient__MirrorSurface ||
+                     Functionals::GetInstance().SurfaceComposerClient__MirrorSurface_and16)) {
+
+                    __android_log_print(ANDROID_LOG_INFO, "ImGui", "[*] mirrorSurface: this=%p, SurfaceControl=%p",
+                        data, result.get());
+
+                    int32_t valid = Functionals::GetInstance().SurfaceControl__Validate(result.get());
+                    __android_log_print(ANDROID_LOG_INFO, "ImGui", "[*] SurfaceControl validate result: %d", valid);
+
+                    if (valid != 0) {
+                        __android_log_print(ANDROID_LOG_WARN, "ImGui", "[-] SurfaceControl invalid, skipping mirror");
+                    } else {
+                        __android_log_print(ANDROID_LOG_INFO, "ImGui", "[*] Calling mirrorSurface (this=%p, sc=%p)...", data, result.get());
+
+                        // 调用 mirrorSurface（根据 Android 版本选择签名）
+                        StrongPointer<void> mirrorResult;
+                        if (Functionals::GetInstance().SurfaceComposerClient__MirrorSurface) {
+                            // Android 15-: mirrorSurface(SurfaceControl*)
+                            mirrorResult = Functionals::GetInstance().SurfaceComposerClient__MirrorSurface(data, result.get());
+                        } else if (Functionals::GetInstance().SurfaceComposerClient__MirrorSurface_and16) {
+                            // Android 16+: mirrorSurface(SurfaceControl*, SurfaceControl* parent)
+                            // parent 传 nullptr，让镜像层成为顶层
+                            mirrorResult = Functionals::GetInstance().SurfaceComposerClient__MirrorSurface_and16(data, result.get(), nullptr);
+                        }
+
+                        __android_log_print(ANDROID_LOG_INFO, "ImGui", "[*] mirrorSurface returned: %p", mirrorResult.get());
+
+                        if (mirrorResult.get() != nullptr) {
+                            sc.mirrorData = mirrorResult.get();
+
+                            // 保存原始层和镜像层指针
+                            detail::g_originalSurfaceControl = result.get();
+                            detail::g_mirrorSurfaceControl = mirrorResult.get();
+
+                            static void* mirrorRef = nullptr;
+                            Functionals::GetInstance().RefBase__IncStrong(mirrorResult.get(), &mirrorRef);
+
+                            StrongPointer<void> mirrorSP;
+                            mirrorSP.pointer = mirrorResult.get();
+                            SurfaceComposerClientTransaction mirrorTransaction;
+                            mirrorTransaction.SetLayer(mirrorSP, INT32_MAX - 1);
+                            mirrorTransaction.Apply(false, true);
+
+                            // 启动 LayerStack 监控线程
+                            detail::StartLayerStackMonitor();
+
+                            __android_log_print(ANDROID_LOG_INFO, "ImGui", "[+] Mirror surface created successfully");
+                        } else {
+                            __android_log_print(ANDROID_LOG_WARN, "ImGui", "[-] mirrorSurface returned null");
+                        }
+                    }
+                }
+
+                return sc;
             }
 
             bool GetDisplayInfo(ui::DisplayState *displayInfo)
@@ -567,6 +728,9 @@ namespace android
             int32_t width;
             int32_t height;
         };
+
+    private:
+        inline static std::unordered_map<ANativeWindow *, detail::SurfaceControl> m_cachedSurfaceControl;
 
     public:
         static detail::SurfaceComposerClient &GetComposerInstance()
@@ -629,13 +793,149 @@ namespace android
             if (it == m_cachedSurfaceControl.end())
                 return;
 
+            // 重置镜像状态，让监控线程重新处理所有 LayerStack
+            __android_log_print(ANDROID_LOG_INFO, "ImGui", "[*] Resetting mirror state (clearing processed LayerStacks)");
+            detail::g_processedLayerStacks.clear();
+
             it->second.DestroySurface(reinterpret_cast<detail::Surface *>(nativeWindow));
             m_cachedSurfaceControl.erase(it);
         }
-
-    private:
-        inline static std::unordered_map<ANativeWindow *, detail::SurfaceControl> m_cachedSurfaceControl;
     };
+
+    // LayerStack 监控函数实现
+    namespace detail
+    {
+        // 通过 dumpsys 获取所有 LayerStack ID
+        inline std::vector<uint32_t> GetAllLayerStacks()
+        {
+            std::vector<uint32_t> layerStacks;
+
+            // 执行 dumpsys SurfaceFlinger
+            FILE* pipe = popen("dumpsys SurfaceFlinger 2>/dev/null", "r");
+            if (!pipe) {
+                __android_log_print(ANDROID_LOG_ERROR, "ImGui", "[-] Failed to execute dumpsys");
+                return layerStacks;
+            }
+
+            char buffer[256];
+            while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+                // 查找 "LayerStack=" 行
+                if (strstr(buffer, "LayerStack=") != nullptr) {
+                    uint32_t layerStackId = 0;
+                    if (sscanf(buffer, "LayerStack=%u", &layerStackId) == 1) {
+                        // 去重
+                        if (std::find(layerStacks.begin(), layerStacks.end(), layerStackId) == layerStacks.end()) {
+                            layerStacks.push_back(layerStackId);
+                        }
+                    }
+                }
+            }
+
+            pclose(pipe);
+            return layerStacks;
+        }
+
+        inline void MonitorLayerStack()
+        {
+            // 使用堆分配的 SurfaceComposerClient，避免 Android 16 RefBase 栈指针检测
+            static SurfaceComposerClient* persistentClient = nullptr;
+            if (!persistentClient) {
+                persistentClient = new SurfaceComposerClient();
+            }
+
+            while (g_monitorRunning.load()) {
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+
+                if (!g_mirrorSurfaceControl || !g_originalSurfaceControl) {
+                    continue;
+                }
+
+                // 通过 dumpsys 获取所有 LayerStack
+                auto layerStacks = GetAllLayerStacks();
+
+                __android_log_print(ANDROID_LOG_DEBUG, "ImGui", "[*] Found %zu LayerStacks", layerStacks.size());
+
+                for (uint32_t layerStackId : layerStacks) {
+                    // 跳过主显示（LayerStack 0）和已处理的 LayerStack
+                    if (layerStackId == 0 || g_processedLayerStacks.count(layerStackId) > 0) {
+                        continue;
+                    }
+
+                    __android_log_print(ANDROID_LOG_INFO, "ImGui", "[*] Detected new LayerStack: %u", layerStackId);
+
+                    // 为新的 LayerStack 创建新的镜像层
+                    StrongPointer<void> newMirrorResult;
+                    if (Functionals::GetInstance().SurfaceComposerClient__MirrorSurface) {
+                        newMirrorResult = Functionals::GetInstance().SurfaceComposerClient__MirrorSurface(
+                            persistentClient->data, g_originalSurfaceControl);
+                    } else if (Functionals::GetInstance().SurfaceComposerClient__MirrorSurface_and16) {
+                        newMirrorResult = Functionals::GetInstance().SurfaceComposerClient__MirrorSurface_and16(
+                            persistentClient->data, g_originalSurfaceControl, nullptr);
+                    }
+
+                    if (newMirrorResult.get() == nullptr) {
+                        __android_log_print(ANDROID_LOG_ERROR, "ImGui", "[-] Failed to create mirror for LayerStack %u", layerStackId);
+                        continue;
+                    }
+
+                    __android_log_print(ANDROID_LOG_INFO, "ImGui", "[*] Created new mirror: %p for LayerStack %u",
+                        newMirrorResult.get(), layerStackId);
+
+                    // 保持引用
+                    Functionals::GetInstance().RefBase__IncStrong(newMirrorResult.get(), newMirrorResult.get());
+
+                    // 创建宿主层
+                    auto hostSurface = persistentClient->CreateSurface("MirrorHost", 1, 1, false);
+                    if (hostSurface.data == nullptr) {
+                        __android_log_print(ANDROID_LOG_ERROR, "ImGui", "[-] Failed to create host surface");
+                        continue;
+                    }
+
+                    StrongPointer<void> hostSP;
+                    hostSP.pointer = hostSurface.data;
+
+                    StrongPointer<void> newMirrorSP;
+                    newMirrorSP.pointer = newMirrorResult.get();
+
+                    ui::LayerStack targetLayerStack;
+                    targetLayerStack.id = layerStackId;
+
+                    // 设置宿主层到新的 LayerStack
+                    SurfaceComposerClientTransaction transaction;
+                    transaction.SetLayerStack(hostSP, targetLayerStack);
+                    transaction.SetLayer(hostSP, INT32_MAX - 2);
+
+                    // 将新镜像层 reparent 到宿主层下
+                    transaction.Reparent(newMirrorSP, hostSP);
+                    transaction.SetLayer(newMirrorSP, INT32_MAX - 1);
+                    transaction.Apply(false, true);
+
+                    __android_log_print(ANDROID_LOG_INFO, "ImGui", "[+] New mirror reparented to LayerStack %u", layerStackId);
+                    g_processedLayerStacks[layerStackId] = true;
+                }
+            }
+        }
+
+        inline void StartLayerStackMonitor()
+        {
+            if (g_monitorRunning.load()) {
+                return;
+            }
+
+            g_monitorRunning.store(true);
+            g_monitorThread = std::thread(MonitorLayerStack);
+            g_monitorThread.detach();
+            __android_log_print(ANDROID_LOG_INFO, "ImGui", "[+] LayerStack monitor started");
+        }
+
+        inline void ResetMirrorState()
+        {
+            __android_log_print(ANDROID_LOG_INFO, "ImGui", "[*] Resetting mirror state (clearing processed LayerStacks)");
+            g_processedLayerStacks.clear();
+            // 注意：不清空 g_mirrorSurfaceControl 和 g_originalSurfaceControl
+            // 因为它们会在新的 Create 调用中被更新
+        }
+    }
 }
 
 #undef ResolveMethod

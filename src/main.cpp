@@ -110,7 +110,7 @@ void reinitializeAll() {
 int main() {
     displayInfo = android::ANativeWindowCreator::GetDisplayInfo();
 
-    gWindow = android::ANativeWindowCreator::Create("a", displayInfo.width, displayInfo.height, false);
+    gWindow = android::ANativeWindowCreator::Create("ESK", displayInfo.width, displayInfo.height, false);
     LOGD("Native Surface: %dx%d\n", displayInfo.width, displayInfo.height);
     if(gApp.init(gWindow))
         LOGD("Vulkan init OK\n");
