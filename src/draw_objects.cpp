@@ -43,9 +43,6 @@ bool gShowAllClassNames = false;
 bool gUseBatchBoneRead = true;  // 默认使用批量读取（优化模式）
 int gBoneCount = 0;
 
-static std::shared_ptr<std::vector<CachedActor>> lastActorList;
-static std::vector<FTransform> cachedRootTranForms;
-
 void DrawObjects() {
     if (!gShowObjects) return;
     if (driver_stat.load(std::memory_order_relaxed) <= 0) return;
@@ -53,8 +50,7 @@ void DrawObjects() {
     auto actors = GetCachedActors();
     if (!actors || actors->empty()) return;
 
-
-    // VP 矩阵每帧即时读取（1 次 ioctl）
+    // VP 矩阵即时读取（渲染前最后一刻，零延迟）
     FMatrix VPMat;
     if (address.Matrix != 0) {
         Paradise_hook->read(address.Matrix, &VPMat, sizeof(FMatrix));
@@ -62,42 +58,12 @@ void DrawObjects() {
         return;
     }
 
-    int N = (int)actors->size();
-
-    // Round-robin actor 位置读取：每帧更新一半 actor（降低 ioctl 调用）
-    static int roundRobinOffset = 0;
-
-    if (actors != lastActorList) {
-        lastActorList = actors;
-        cachedRootTranForms.resize(N);
-        // 首次运行时初始化为零
-        for (int i = 0; i < N; i++) {
-            cachedRootTranForms[i] = {};
-        }
-    }
-
-    // 每帧更新一半 actor（round-robin 隔帧交替）
-    for (int i = roundRobinOffset; i < N; i += 2) {
-        const auto& ca = (*actors)[i];
-        if (ca.rootCompAddr == 0) {
-            cachedRootTranForms[i] = {};
-        } else {
-            cachedRootTranForms[i] = Paradise_hook->read<FTransform>(
-                ca.rootCompAddr + offset.ComponentToWorld);
-        }
-    }
-
-    // 每帧切换偏移量（0 -> 1 -> 0 -> 1...）
-    roundRobinOffset = 1 - roundRobinOffset;
-
     // 绘制有映射的 actor
     ImGuiIO& io = ImGui::GetIO();
     ImDrawList* draw_list = ImGui::GetBackgroundDrawList();
     Vec2 screenPos;
 
-    for (int i = 0; i < N; i++) {
-        const auto& ca = (*actors)[i];
-
+    for (const auto& ca : *actors) {
         // 跳过本地玩家 actor
         if (address.LocalPlayerActor != 0 && ca.actorAddr == address.LocalPlayerActor) {
             continue;
@@ -112,17 +78,9 @@ void DrawObjects() {
         } else {
             continue;
         }
-        char logcount[128];
-        sprintf(logcount, "%s", label);
 
-        // 检查是否有骨骼映射（读取线程已为该 actor 构建 boneMap）
-        bool hasBoneMap = false;
-        for (int j = 0; j < BONE_COUNT; j++) {
-            if (ca.boneMap[j] >= 0) {
-                hasBoneMap = true;
-                break;
-            }
-        }
+        // 检查是否有骨骼映射（使用 boneMapBuilt 标志）
+        bool hasBoneMap = ca.boneMapBuilt;
 
         if (hasBoneMap) {
             uint64_t SkeletalMeshComponent = Paradise_hook->read<uint64_t>(ca.actorAddr + offset.SkeletalMeshComponent);
@@ -138,6 +96,9 @@ void DrawObjects() {
                 if (BoneCount > 0 && BoneCount <= MAX_BONE_COUNT && BoneDataPtr != 0) {
                     FTransform meshTransform = Paradise_hook->read<FTransform>(
                         SkeletalMeshComponent + offset.ComponentToWorld);
+
+                    // 计算 mesh 变换矩阵（提到循环外，避免重复计算）
+                    FMatrix meshMatrix = TransformToMatrix(meshTransform);
 
                     // 提取关键骨骼（简化：只使用 translation，无验证）
                     Vec3 boneTranslations[BONE_COUNT];
@@ -182,7 +143,6 @@ void DrawObjects() {
 
                             // 骨骼世界坐标 = mesh transform + bone translation
                             Vec3 boneLocal = boneTranslations[boneID];
-                            FMatrix meshMatrix = TransformToMatrix(meshTransform);
                             Vec3 worldPos = {
                                 meshMatrix.M[0][0] * boneLocal.X + meshMatrix.M[1][0] * boneLocal.Y + meshMatrix.M[2][0] * boneLocal.Z + meshMatrix.M[3][0],
                                 meshMatrix.M[0][1] * boneLocal.X + meshMatrix.M[1][1] * boneLocal.Y + meshMatrix.M[2][1] * boneLocal.Z + meshMatrix.M[3][1],
@@ -209,16 +169,6 @@ void DrawObjects() {
                 }
             }
         }
-        
-        const Vec3& worldPos = cachedRootTranForms[i].Translation;
-        if (worldPos.X == 0 && worldPos.Y == 0 && worldPos.Z == 0) continue;
-        if (WorldToScreen(worldPos, VPMat, io.DisplaySize.x, io.DisplaySize.y, screenPos)) {
-            ImVec2 pos(screenPos.x, screenPos.y);
-            draw_list->AddCircleFilled(pos, 3.0f, IM_COL32(255, 0, 0, 255));
-            ImVec2 textSize = ImGui::CalcTextSize(label);
-            draw_list->AddText(
-                ImVec2(pos.x - textSize.x * 0.5f, pos.y - textSize.y - 2.0f),
-                IM_COL32(255, 255, 255, 255), label);
-        }
+
     }
 }

@@ -11,6 +11,7 @@
 #include "Gyro.h"
 #include "volume_control.h"
 #include "driver_manager.h"
+#include <sched.h>
 #ifdef NDEBUG
 #define LOGD(...) ((void)0)
 #define LOGE(...) ((void)0)
@@ -31,7 +32,68 @@ int secure_flag = 0;
 
 Gyro* Gyro_Controller;
 // 帧率控制参数
-int gTargetFPS = 60;
+int gTargetFPS = 120;
+
+// ═══════════════════════════════════════════
+//  CPU 核心亲和性：将进程绑定到小核心
+// ═══════════════════════════════════════════
+static cpu_set_t gLittleCoreMask;
+
+static void SetupCpuAffinity() {
+    // 读取每个 CPU 核心的最大频率，区分大小核
+    int numCpus = sysconf(_SC_NPROCESSORS_CONF);
+    if (numCpus <= 0) numCpus = 8;
+
+    std::vector<std::pair<int, long>> cpuFreqs;  // {cpu_id, max_freq}
+    for (int i = 0; i < numCpus; i++) {
+        char path[128];
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i);
+        FILE* f = fopen(path, "r");
+        long freq = 0;
+        if (f) {
+            fscanf(f, "%ld", &freq);
+            fclose(f);
+        }
+        cpuFreqs.push_back({i, freq});
+    }
+
+    // 找到最小的最大频率（即小核心的频率）
+    long minFreq = LONG_MAX;
+    for (const auto& p : cpuFreqs) {
+        if (p.second > 0 && p.second < minFreq)
+            minFreq = p.second;
+    }
+
+    // 构建小核心掩码：所有频率 == 最小频率的核心
+    CPU_ZERO(&gLittleCoreMask);
+    int littleCount = 0;
+    for (const auto& p : cpuFreqs) {
+        if (p.second == minFreq) {
+            CPU_SET(p.first, &gLittleCoreMask);
+            littleCount++;
+        }
+    }
+
+    if (littleCount == 0 || littleCount == numCpus) {
+        // 无法区分大小核，不设置亲和性
+        LOGD("CPU affinity: cannot distinguish big/LITTLE (%d/%d), skipping\n",
+             littleCount, numCpus);
+        return;
+    }
+
+    // 绑定当前进程到小核心（影响所有线程）
+    if (sched_setaffinity(0, sizeof(cpu_set_t), &gLittleCoreMask) == 0) {
+        LOGD("CPU affinity: bound process to %d LITTLE cores (freq=%ld KHz)\n",
+             littleCount, minFreq);
+        for (int i = 0; i < numCpus; i++) {
+            if (CPU_ISSET(i, &gLittleCoreMask))
+                LOGD("  LITTLE core: CPU %d\n", i);
+        }
+    } else {
+        LOGD("CPU affinity: sched_setaffinity failed: %s\n", strerror(errno));
+    }
+}
 
 // 重新初始化所有组件（用于屏幕旋转后）
 void reinitializeAll() {
@@ -108,6 +170,9 @@ void reinitializeAll() {
 
 
 int main() {
+    // 将所有线程绑定到小核心，让大核心给游戏引擎用
+    SetupCpuAffinity();
+
     displayInfo = android::ANativeWindowCreator::GetDisplayInfo();
 
     gWindow = android::ANativeWindowCreator::Create("ESK", displayInfo.width, displayInfo.height, false);
@@ -138,12 +203,13 @@ int main() {
     IsMenuOpen.store(1);
     int lastOrientation = displayInfo.orientation;
     int frameCounter = 0;
-    auto last_time = std::chrono::high_resolution_clock::now();
 
     //Paradise_hook = new c_driver();
     StartReadThread();
     // ── 主循环 ──
     while (IsToolActive == 1) {
+        // 0. 记录帧开始时间（用于帧率控制）
+        auto frameStartTime = std::chrono::steady_clock::now();
 
         // 1. 屏幕旋转重新初始化（在帧开始前处理，不破坏渲染流水线）
         if (gNeedReinitialize) {
@@ -169,9 +235,7 @@ int main() {
             continue; // 跳过本帧渲染，下帧用新管线
         }
 
-        // 2. VSync 自然控制帧率（FIFO 呈现模式），仅更新时间戳用于 FPS 测量
-        last_time = std::chrono::high_resolution_clock::now();
-
+        // 2. 处理输入事件
         process_input_event(touch_fd);
 
         // 3. 每 30 帧检测一次屏幕旋转（约 0.5 秒），降低 Binder IPC 开销
@@ -208,9 +272,17 @@ int main() {
         gImGui.endFrame();
         gImGui.frame_render(gApp);  // Present 在这里完成
 
-        // 5. Present 完成后立即读取下一帧数据（最小化延迟）
-        // 这样读取的数据会在下一帧渲染时使用，延迟最小
-        // 注意：DrawObjects() 内部会读取数据并缓存到静态变量中
+        // 5. 帧率控制（基于帧开始时间，精确控制）
+        if (gTargetFPS > 0) {
+            auto targetFrameTime = std::chrono::microseconds(1000000 / gTargetFPS);
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - frameStartTime);
+
+            if (elapsed < targetFrameTime) {
+                auto sleepTime = targetFrameTime - elapsed;
+                std::this_thread::sleep_for(sleepTime);
+            }
+        }
     }
 
     // ── 清理 ──

@@ -6,6 +6,7 @@
 #include "Gyro.h"
 #include "read_mem.h"
 #include "driver_manager.h"
+#include "ANativeWindowCreator.h"  // 用于 LayerStack 监控
 
 #ifdef NDEBUG
 #define LOGI(...) ((void)0)
@@ -98,7 +99,7 @@ void Draw_Menu() {
         bool objViewOpen = ImGui::BeginTabItem("    t   ", nullptr, 0);
         if (gIconFont) ImGui::PopFont();
         if (objViewOpen) {
-            ImGui::BeginChild("CameraScrollRegion", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
+            ImGui::BeginChild("ObjViewScrollRegion", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
             DrawObjViewTab();
             ImGui::EndChild();
             ImGui::EndTabItem();
@@ -109,7 +110,7 @@ void Draw_Menu() {
         bool configOpen = ImGui::BeginTabItem("    v   ", nullptr, 0);
         if (gIconFont) ImGui::PopFont();
         if (configOpen) {
-            ImGui::BeginChild("CameraScrollRegion", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
+            ImGui::BeginChild("ConfigScrollRegion", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
             DrawConfigTab();
             ImGui::EndChild();
             ImGui::EndTabItem();
@@ -138,19 +139,6 @@ void DrawObjViewTab() {
     ImGui::Separator();
 
     ImGui::Checkbox("Show Objects", &gShowObjects);
-
-    static float samples[100];
-    float time = ImGui::GetTime();
-    for (int n = 0; n < 100; n++) {
-        samples[n] = sinf(n * 0.2f + time * 1.5f);
-    }
-    ImGui::PlotLines("Wave", samples, 100);
-
-    static float colors[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-    ImGui::ColorEdit4("Color", colors);
-
-    ImGuiIO& io = ImGui::GetIO();
-    ImGui::Text("Screen: (%.1f, %.1f)", io.MousePos.x, io.MousePos.y);
 }
 
 // Config Tab — 纯绘制
@@ -235,5 +223,22 @@ void DrawConfigTab() {
 
     if (ImGui::Button("退出", ImVec2(100, 50))) {
         IsToolActive.store(false);
+    }
+
+    // 手动触发 LayerStack 检测和 mirror 创建（一次性扫描）
+    ImGui::Separator();
+    ImGui::Text("录屏支持:");
+    if (ImGui::Button("检测虚拟显示", ImVec2(150, 50))) {
+        android::ANativeWindowCreator::DetectAndCreateVirtualDisplayMirrors();
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::Text("开始录屏后点击此按钮");
+        ImGui::Text("会检测录屏创建的虚拟显示");
+        ImGui::Text("并自动创建镜像层以支持录屏捕获");
+        ImGui::Text("(一次性扫描，不会持续占用CPU)");
+        ImGui::EndTooltip();
     }
 }

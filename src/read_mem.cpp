@@ -199,9 +199,10 @@ void InitDriver(const char* packageName, uint64_t& libUE4Out) {
 }
 
 void DumpTArray(){
+    uint64_t Gworld = Paradise_hook->read<uint64_t>(sLibUE4 + offset.Gworld);
+    uint64_t level = Paradise_hook->read<uint64_t>(Gworld + 0xB0);
+
     for (uint64_t off = 0x0; off <= 0x250; off += 0x8) {
-        uint64_t level = Paradise_hook->read<uint64_t>(
-            Paradise_hook->read<uint64_t>(sLibUE4 + offset.Gworld) + 0xB0);
         uint64_t ptr = Paradise_hook->read<uint64_t>(level + off);
         int32_t count = Paradise_hook->read<int32_t>(level + off + 0x8);
         int32_t max   = Paradise_hook->read<int32_t>(level + off + 0xC);
@@ -232,7 +233,7 @@ void DumpBones() {
     if (!actors) return;
 
     for (const auto& ca : *actors) {
-        if (strncmp(ca.className.c_str(), "BP_TrainPlayerPawn_C", 5) != 0) continue;
+        if (ca.className != "BP_TrainPlayerPawn_C") continue;
 
         uint64_t skelMeshComp = Paradise_hook->read<uint64_t>(ca.actorAddr + offset.SkeletalMeshComponent);
         if (skelMeshComp == 0) { printf("SkeletalMeshComponent is null\n"); continue; }
