@@ -1,4 +1,7 @@
 #pragma once
+#include <cmath>
+#include <cstdint>
+
 struct Vec2
 {
     float x;
@@ -439,8 +442,11 @@ struct Offsets{
     uintptr_t CachedComponentSpaceTransforms = 0xbb8;  // TArray<FTransform> (缓存的组件空间变换，单缓冲，更稳定)
     uintptr_t CurrentReadComponentTransformIndex = 0x830; // int32, 0 or 1 — 需要根据 SDK dump 确认
     uintptr_t BoneSpaceTransforms = 0xba8;  // TArray<FTransform> (局部空间骨骼变换)
-    uintptr_t SkeletalMesh = 0x7f0;        // USkinnedMeshComponent -> USkeletalMesh* //claude --resume 0aac9131-07d7-4ae1-97c8-ec2cfe469950
-    uintptr_t RefBoneInfo = 0x238;          // USkeletalMesh -> FReferenceSkeleton.RawRefBoneInfo TArray ? ? ? F9 ? ? ? D3 ? ? ? 90 ? ? ? F9 ? ? ? F9 ? ? ? 11
+    uintptr_t SkeletalMesh = 0x7f0;        // USkinnedMeshComponent -> USkeletalMesh*
+    uintptr_t RefBoneInfo = 0x238;          // USkeletalMesh -> FReferenceSkeleton.RawRefBoneInfo
+    // UAECharacter (Character.Pawn.Actor.Object)
+    uintptr_t PlayerName = 0xae8;           // FString PlayerName
+    uintptr_t TeamID = 0xb68;              // int TeamID
 };
 struct Addresses{
     uintptr_t Uworld,libUE4;

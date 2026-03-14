@@ -34,10 +34,15 @@ Gyro* Gyro_Controller;
 // 帧率控制参数
 int gTargetFPS = 120;
 
+// FPS 统计
+static int gFrameCount = 0;
+static float gCurrentFPS = 0.0f;
+static auto gLastFPSUpdateTime = std::chrono::steady_clock::now();
+
 // ═══════════════════════════════════════════
 //  CPU 核心亲和性：将进程绑定到小核心
 // ═══════════════════════════════════════════
-static cpu_set_t gLittleCoreMask;
+static cpu_set_t gBigCoreMask;
 
 static void SetupCpuAffinity() {
     // 读取每个 CPU 核心的最大频率，区分大小核
@@ -58,37 +63,42 @@ static void SetupCpuAffinity() {
         cpuFreqs.push_back({i, freq});
     }
 
-    // 找到最小的最大频率（即小核心的频率）
+    // 找到最小和最大频率
     long minFreq = LONG_MAX;
+    long maxFreq = 0;
     for (const auto& p : cpuFreqs) {
-        if (p.second > 0 && p.second < minFreq)
-            minFreq = p.second;
-    }
-
-    // 构建小核心掩码：所有频率 == 最小频率的核心
-    CPU_ZERO(&gLittleCoreMask);
-    int littleCount = 0;
-    for (const auto& p : cpuFreqs) {
-        if (p.second == minFreq) {
-            CPU_SET(p.first, &gLittleCoreMask);
-            littleCount++;
+        if (p.second > 0) {
+            if (p.second < minFreq) minFreq = p.second;
+            if (p.second > maxFreq) maxFreq = p.second;
         }
     }
 
-    if (littleCount == 0 || littleCount == numCpus) {
+    // 构建中大核心掩码：所有频率 > 最小频率的核心（排除小核心）
+    CPU_ZERO(&gBigCoreMask);
+    int bigCount = 0;
+    for (const auto& p : cpuFreqs) {
+        if (p.second > minFreq) {
+            CPU_SET(p.first, &gBigCoreMask);
+            bigCount++;
+        }
+    }
+
+    if (bigCount == 0 || bigCount == numCpus) {
         // 无法区分大小核，不设置亲和性
         LOGD("CPU affinity: cannot distinguish big/LITTLE (%d/%d), skipping\n",
-             littleCount, numCpus);
+             bigCount, numCpus);
         return;
     }
 
-    // 绑定当前进程到小核心（影响所有线程）
-    if (sched_setaffinity(0, sizeof(cpu_set_t), &gLittleCoreMask) == 0) {
-        LOGD("CPU affinity: bound process to %d LITTLE cores (freq=%ld KHz)\n",
-             littleCount, minFreq);
+    // 绑定当前进程到中大核心（高性能核心）
+    if (sched_setaffinity(0, sizeof(cpu_set_t), &gBigCoreMask) == 0) {
+        LOGD("CPU affinity: bound process to %d big/medium cores (max_freq=%ld KHz)\n",
+             bigCount, maxFreq);
         for (int i = 0; i < numCpus; i++) {
-            if (CPU_ISSET(i, &gLittleCoreMask))
-                LOGD("  LITTLE core: CPU %d\n", i);
+            if (CPU_ISSET(i, &gBigCoreMask)) {
+                long freq = cpuFreqs[i].second;
+                LOGD("  Big/Medium core: CPU %d (freq=%ld KHz)\n", i, freq);
+            }
         }
     } else {
         LOGD("CPU affinity: sched_setaffinity failed: %s\n", strerror(errno));
@@ -168,9 +178,41 @@ void reinitializeAll() {
     LOGD("=== Reinit Complete ===\n");
 }
 
+// 在屏幕左下角显示 FPS
+static void DrawFPSCounter() {
+    ImGuiIO& io = ImGui::GetIO();
+
+    // 左下角位置（留出边距）
+    const float PADDING = 10.0f;
+    ImVec2 pos(PADDING, io.DisplaySize.y - PADDING);
+
+    // 设置窗口位置和大小
+    ImGui::SetNextWindowPos(pos, ImGuiCond_Always, ImVec2(0.0f, 1.0f));
+    ImGui::SetNextWindowBgAlpha(0.5f);  // 半透明背景
+
+    // 创建无边框、无标题栏的小窗口
+    ImGuiWindowFlags window_flags =
+        ImGuiWindowFlags_NoDecoration |
+        ImGuiWindowFlags_AlwaysAutoResize |
+        ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoFocusOnAppearing |
+        ImGuiWindowFlags_NoNav |
+        ImGuiWindowFlags_NoMove;
+
+    if (ImGui::Begin("##FPSCounter", nullptr, window_flags)) {
+        // 显示 FPS（绿色文字）
+        ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "FPS: %.1f", gCurrentFPS);
+
+        // 显示目标 FPS（灰色小字）
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "(Target: %d)", gTargetFPS);
+    }
+    ImGui::End();
+}
+
 
 int main() {
-    // 将所有线程绑定到小核心，让大核心给游戏引擎用
+    // 将所有线程绑定到中大核心（高性能核心），提升渲染性能
     SetupCpuAffinity();
 
     displayInfo = android::ANativeWindowCreator::GetDisplayInfo();
@@ -203,13 +245,15 @@ int main() {
     IsMenuOpen.store(1);
     int lastOrientation = displayInfo.orientation;
     int frameCounter = 0;
+    bool firstFrame = true; // 首帧无上一帧需要等待
+
+    // 帧率控制：固定时间步进，避免累积误差
+    auto nextFrameTime = std::chrono::steady_clock::now();
 
     //Paradise_hook = new c_driver();
     StartReadThread();
     // ── 主循环 ──
     while (IsToolActive == 1) {
-        // 0. 记录帧开始时间（用于帧率控制）
-        auto frameStartTime = std::chrono::steady_clock::now();
 
         // 1. 屏幕旋转重新初始化（在帧开始前处理，不破坏渲染流水线）
         if (gNeedReinitialize) {
@@ -232,14 +276,15 @@ int main() {
                 LOGD("Touch device reconnected: fd=%d\n", touch_fd);
 
             LOGD("Main loop: skipping this frame after reinit\n");
+            firstFrame = true; // reinit 后无上一帧需要等待
             continue; // 跳过本帧渲染，下帧用新管线
         }
 
         // 2. 处理输入事件
         process_input_event(touch_fd);
 
-        // 3. 每 30 帧检测一次屏幕旋转（约 0.5 秒），降低 Binder IPC 开销
-        if (++frameCounter >= 30) {
+        // 3. 每 60 帧检测一次屏幕旋转（约 0.5 秒 @ 120 FPS），降低 Binder IPC 开销
+        if (++frameCounter >= 60) {
             frameCounter = 0;
             update_info();
             refresh_touch_device_range();
@@ -256,31 +301,57 @@ int main() {
             }
         }
 
-        // 4. 渲染（先用上一帧读取的数据渲染）
+        // 4. 在 fence wait 前读取游戏数据（减少 8-16ms 延迟）
+        GameFrameData gameData = ReadGameData();
+
+        // 5. 等待 GPU pipeline 清空（首帧跳过，无上一帧需要等待）
+        if (!firstFrame) {
+            gImGui.waitForPreviousFrame(gApp);
+        }
+        firstFrame = false;
+
+        // 6. fence 释放后使用预读数据渲染
         ImGui_ProcessPendingTextureLoads();
         gImGui.beginFrame(gWindow, displayInfo.width, displayInfo.height);
-        DrawObjects();  // 使用缓存的数据绘制
+
+        // 统计 FPS（每秒更新一次）
+        gFrameCount++;
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - gLastFPSUpdateTime).count();
+        if (elapsed >= 1000) {  // 每 1000ms 更新一次
+            gCurrentFPS = gFrameCount * 1000.0f / elapsed;
+            gFrameCount = 0;
+            gLastFPSUpdateTime = now;
+        }
+
+        DrawObjectsWithData(gameData);  // 使用预读数据（延迟更低）
         if (IsMenuOpen == 1)
             Draw_Menu();
 
+        DrawFPSCounter();  // 显示 FPS 计数器（左下角）
+
         if (IsToolActive == 0) {
             gImGui.endFrame();
-            gImGui.frame_render(gApp);
+            gImGui.submitAndPresent(gApp);
             break;
         }
 
         gImGui.endFrame();
-        gImGui.frame_render(gApp);  // Present 在这里完成
+        gImGui.submitAndPresent(gApp);  // MAILBOX 模式非阻塞，降低延迟
 
-        // 5. 帧率控制（基于帧开始时间，精确控制）
-        if (gTargetFPS > 0) {
-            auto targetFrameTime = std::chrono::microseconds(1000000 / gTargetFPS);
+        // 7. 帧率控制
+        // MAILBOX present mode 非阻塞，需要主动限制帧率
+        // 仅在 gTargetFPS > 60 时才主动限制（避免超过屏幕刷新率）
+        if (gTargetFPS > 60) {
+            int effectiveFPS = gTargetFPS;
+            auto targetDuration = std::chrono::microseconds(1000000 / effectiveFPS);
+            nextFrameTime += targetDuration;
+
             auto now = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - frameStartTime);
-
-            if (elapsed < targetFrameTime) {
-                auto sleepTime = targetFrameTime - elapsed;
-                std::this_thread::sleep_for(sleepTime);
+            if (nextFrameTime <= now) {
+                nextFrameTime = now + targetDuration;
+            } else {
+                std::this_thread::sleep_for(nextFrameTime - now);
             }
         }
     }

@@ -105,10 +105,10 @@ bool VulkanApp::init(ANativeWindow* window) {
                                      // 使用更通用的格式选择
                                      .add_fallback_format({ VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR })
                                      .add_fallback_format({ VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR })
-                                     // MAILBOX: 非阻塞，最低延迟（避免 VSync 锁相）
+                                     // MAILBOX: 非阻塞 present，降低延迟（8-16ms），略增功耗
                                      .set_desired_present_mode(VK_PRESENT_MODE_MAILBOX_KHR)
-                                     .add_fallback_present_mode(VK_PRESENT_MODE_IMMEDIATE_KHR)
                                      .add_fallback_present_mode(VK_PRESENT_MODE_FIFO_KHR)
+                                     .add_fallback_present_mode(VK_PRESENT_MODE_IMMEDIATE_KHR)
                                      .set_desired_extent(width, height)
                                      .set_pre_transform_flags(VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
                                      .set_image_usage_flags(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
@@ -118,6 +118,9 @@ bool VulkanApp::init(ANativeWindow* window) {
         return false;
     }
     auto vkb_swap = swap_ret.value();
+
+    // 记录实际使用的 present mode
+    LOGI("Swapchain created with present mode: %d (FIFO=2, MAILBOX=3)", vkb_swap.present_mode);
 
     swapchain = vkb_swap.swapchain;
     swapchainImages = vkb_swap.get_images().value();
@@ -399,10 +402,10 @@ bool VulkanApp::rebuildSwapchain(ANativeWindow* window) {
     auto swap_ret = swapchain_builder.set_old_swapchain(swapchain) // 重用旧 swapchain
                                      .add_fallback_format({ VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR })
                                      .add_fallback_format({ VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR })
-                                     // MAILBOX: 非阻塞，最低延迟（避免 VSync 锁相）
+                                     // MAILBOX: 非阻塞 present，降低延迟（8-16ms），略增功耗
                                      .set_desired_present_mode(VK_PRESENT_MODE_MAILBOX_KHR)
-                                     .add_fallback_present_mode(VK_PRESENT_MODE_IMMEDIATE_KHR)
                                      .add_fallback_present_mode(VK_PRESENT_MODE_FIFO_KHR)
+                                     .add_fallback_present_mode(VK_PRESENT_MODE_IMMEDIATE_KHR)
                                      .set_desired_extent(width, height)
                                      .set_pre_transform_flags(VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
                                      .set_image_usage_flags(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
