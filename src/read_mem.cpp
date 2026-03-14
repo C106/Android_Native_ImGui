@@ -16,6 +16,7 @@
 #endif
 
 extern std::atomic<bool> IsToolActive;
+extern int gTargetFPS;  // 从 main.cpp 导入
 
 // 双缓冲实例
 FrameSynchronizer<ReadFrameData> gFrameSync;
@@ -24,11 +25,43 @@ FrameSynchronizer<ReadFrameData> gFrameSync;
 static std::thread gReadThread;
 static std::atomic<bool> gReadThreadRunning{false};
 static uint64_t sLibUE4 = 0; // 读取线程用的 libUE4 副本
+static std::atomic<int> gGameFPSLevel{6}; // 游戏 FPS Level (默认 6=60fps)
 
 // ═══════════════════════════════════════════
 //  名称缓存
 // ═══════════════════════════════════════════
 static std::unordered_map<int32_t, std::string> nameCache;
+
+// 类名分类映射表（类名 → {显示名称, 类型}）
+struct ClassInfo {
+    std::string displayName;
+    ActorType type;
+};
+
+static const std::unordered_map<std::string, ClassInfo> kClassNameMap = {
+    // 玩家角色
+    {"BP_TrainPlayerPawn_C",    {"骨骼测试", ActorType::PLAYER}},
+    {"BP_PlayerPawn_CG35_C",    {"骨骼测试", ActorType::PLAYER}},
+    {"BP_PlayerPawn_C",         {"玩家", ActorType::PLAYER}},
+
+    // 载具
+    {"BP_Vehicle_C",            {"载具", ActorType::VEHICLE}},
+    {"BP_Car_C",                {"汽车", ActorType::VEHICLE}},
+    {"BP_Helicopter_C",         {"直升机", ActorType::VEHICLE}},
+
+    // 其他（道具、NPC等）
+    // 用户按需填充
+};
+
+// 分类 actor（根据类名映射表）
+// 返回 {displayName, actorType}，如果类名不在映射表中返回 {"", ActorType::OTHER}
+static std::pair<std::string, ActorType> ClassifyActor(const std::string& className) {
+    auto it = kClassNameMap.find(className);
+    if (it != kClassNameMap.end()) {
+        return {it->second.displayName, it->second.type};
+    }
+    return {"", ActorType::OTHER};  // 不在映射表中，归类为 OTHER 但不显示
+}
 
 // 骨骼名 → 自定义ID 映射表
 static const std::unordered_map<std::string, int> gBoneNameToID = {
@@ -46,6 +79,7 @@ static const std::unordered_map<std::string, int> gBoneNameToID = {
     {"calf_r",            BONE_R_KNEE},
     {"foot_l",            BONE_L_FOOT},
     {"foot_r",            BONE_R_FOOT},
+    {"Root",              BONE_ROOT},      // 根骨骼（用于 bottom label）
 };
 
 std::string GetNameByIndex(int32_t index, uint64_t libUE4) {
@@ -295,23 +329,114 @@ void DumpBones() {
 // ═══════════════════════════════════════════
 //  读取线程
 // ═══════════════════════════════════════════
-static std::mutex gActorListMtx;
-static std::shared_ptr<std::vector<CachedActor>> gSharedActors =
-    std::make_shared<std::vector<CachedActor>>();
 
+// 读取游戏 FPS Level（仅读取 FPS Level，不打印其他设置）
+static int ReadGameFPSLevel() {
+    if (!Paradise_hook || driver_stat.load(std::memory_order_relaxed) <= 0) {
+        return 6; // 默认 60fps
+    }
+
+    // 通过 GameInstance → FrontendHUD → UserSettings 访问 SettingConfig
+    uint64_t uworld = Paradise_hook->read<uint64_t>(sLibUE4 + offset.Gworld);
+    if (uworld == 0) return 6;
+
+    uint64_t gameInstance = Paradise_hook->read<uint64_t>(uworld + 0xb00);
+    if (gameInstance == 0) return 6;
+
+    uint64_t frontendHUD = Paradise_hook->read<uint64_t>(gameInstance + 0x4a8);
+    if (frontendHUD == 0) return 6;
+
+    uint64_t userSettings = Paradise_hook->read<uint64_t>(frontendHUD + 0xbc8);
+    if (userSettings == 0) return 6;
+
+    // 读取 FPS Level (offset 0x120)
+    int fpsLevel = Paradise_hook->read<int32_t>(userSettings + 0x120);
+
+    // 验证范围 (2-9)
+    if (fpsLevel < 2 || fpsLevel > 9) {
+        return 6; // 默认 60fps
+    }
+
+    return fpsLevel;
+}
+
+// FPS Level → 实际 FPS 映射
+static int GetFPSFromLevel(int fpsLevel) {
+    switch (fpsLevel) {
+        case 2: return 20;
+        case 3: return 25;
+        case 4: return 30;
+        case 5: return 40;
+        case 6: return 60;
+        case 7: return 90;
+        case 8: return 120;
+        case 9: return 144;
+        default: return 60;  // 默认 60fps
+    }
+}
+
+// FPS Level → 读取间隔映射 (ms)
+static int GetReadIntervalFromFPSLevel(int fpsLevel) {
+    switch (fpsLevel) {
+        case 2: return 50;   // 20fps → 50ms 间隔
+        case 3: return 40;   // 25fps → 40ms 间隔
+        case 4: return 33;   // 30fps → 33ms 间隔
+        case 5: return 25;   // 40fps → 25ms 间隔
+        case 6: return 16;   // 60fps → 16ms 间隔
+        case 7: return 11;   // 90fps → 11ms 间隔
+        case 8: return 8;    // 120fps → 8ms 间隔
+        case 9: return 7;    // 144fps → 7ms 间隔
+        default: return 16;  // 默认 60fps
+    }
+}
+
+static std::mutex gActorListMtx;
+static std::shared_ptr<ClassifiedActors> gClassifiedActors =
+    std::make_shared<ClassifiedActors>();
+
+// 新接口：获取分类后的 actor 列表
+std::shared_ptr<ClassifiedActors> GetClassifiedActors() {
+    std::lock_guard<std::mutex> lock(gActorListMtx);
+    return gClassifiedActors;
+}
+
+// 旧接口：保留兼容性，返回所有 actor（合并三个列表）
 std::shared_ptr<std::vector<CachedActor>> GetCachedActors() {
     std::lock_guard<std::mutex> lock(gActorListMtx);
-    return gSharedActors;
+    auto all = std::make_shared<std::vector<CachedActor>>();
+    all->reserve(gClassifiedActors->players.size() +
+                 gClassifiedActors->vehicles.size() +
+                 gClassifiedActors->others.size());
+    all->insert(all->end(), gClassifiedActors->players.begin(), gClassifiedActors->players.end());
+    all->insert(all->end(), gClassifiedActors->vehicles.begin(), gClassifiedActors->vehicles.end());
+    all->insert(all->end(), gClassifiedActors->others.begin(), gClassifiedActors->others.end());
+    return all;
 }
 
 static void readThreadFunc() {
     // 保存上一次扫描的 actor 列表，用于保留已构建的骨骼映射
     static std::unordered_map<uint64_t, CachedActor> previousActors;
 
+    // FPS Level 读取计数器（每 10 次扫描读取一次 FPS Level）
+    int fpsLevelReadCounter = 0;
+
     while (gReadThreadRunning.load(std::memory_order_relaxed)) {
         if (driver_stat.load(std::memory_order_acquire) <= 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             continue;
+        }
+
+        // 每 10 次扫描读取一次游戏 FPS Level（减少开销）
+        if (fpsLevelReadCounter++ >= 10) {
+            int newFPSLevel = ReadGameFPSLevel();
+            gGameFPSLevel.store(newFPSLevel, std::memory_order_relaxed);
+
+            // 自动设置 gTargetFPS 以匹配游戏帧率
+            int newTargetFPS = GetFPSFromLevel(newFPSLevel);
+            gTargetFPS = newTargetFPS;
+
+            fpsLevelReadCounter = 0;
+            LOGI("Game FPS Level updated: %d -> Target FPS: %d", newFPSLevel, newTargetFPS);
         }
 
         ReadFrameData frame;
@@ -347,7 +472,47 @@ static void readThreadFunc() {
                 className = GetNameByIndex(classNameIdx, sLibUE4);
             }
 
-            CachedActor ca(addr, rootComp, std::move(className));
+            // 在读取线程中分类 actor（减少渲染线程工作量）
+            auto [displayName, actorType] = ClassifyActor(className);
+
+            // 如果不在映射表中（displayName 为空），跳过该 actor
+            if (displayName.empty()) {
+                continue;
+            }
+
+            CachedActor ca(addr, rootComp, std::move(className), std::move(displayName), actorType);
+
+            // 读取 PlayerName（FString: ptr+0x0=TCHAR* Data, ptr+0x8=int32 Num）
+            {
+                uint64_t fstringData = Paradise_hook->read<uint64_t>(addr + offset.PlayerName);
+                int32_t fstringLen = Paradise_hook->read<int32_t>(addr + offset.PlayerName + 0x8);
+                if (fstringData != 0 && fstringLen > 0 && fstringLen < 128) {
+                    // UE4 FString 存储 UTF-16LE
+                    std::vector<char16_t> utf16buf(fstringLen);
+                    Paradise_hook->read(fstringData, utf16buf.data(), fstringLen * sizeof(char16_t));
+                    // 简易 UTF-16 → UTF-8 转换（仅 BMP 字符）
+                    std::string name;
+                    name.reserve(fstringLen * 3);
+                    for (int j = 0; j < fstringLen - 1; j++) {  // -1 跳过 null terminator
+                        char16_t c = utf16buf[j];
+                        if (c == 0) break;
+                        if (c < 0x80) {
+                            name += (char)c;
+                        } else if (c < 0x800) {
+                            name += (char)(0xC0 | (c >> 6));
+                            name += (char)(0x80 | (c & 0x3F));
+                        } else {
+                            name += (char)(0xE0 | (c >> 12));
+                            name += (char)(0x80 | ((c >> 6) & 0x3F));
+                            name += (char)(0x80 | (c & 0x3F));
+                        }
+                    }
+                    ca.playerName = std::move(name);
+                }
+            }
+
+            // 读取 TeamID
+            ca.teamID = Paradise_hook->read<int32_t>(addr + offset.TeamID);
 
             // 检查是否已有该 actor 的骨骼映射（从上次扫描中恢复）
             auto prevIt = previousActors.find(addr);
@@ -394,24 +559,50 @@ static void readThreadFunc() {
             }
         }
 
+        // 按类型分类 actor（在读取线程中完成，减少渲染线程工作量）
+        auto classified = std::make_shared<ClassifiedActors>();
+        for (auto& actor : newActors) {
+            switch (actor.actorType) {
+                case ActorType::PLAYER:
+                    classified->players.push_back(std::move(actor));
+                    break;
+                case ActorType::VEHICLE:
+                    classified->vehicles.push_back(std::move(actor));
+                    break;
+                case ActorType::OTHER:
+                    classified->others.push_back(std::move(actor));
+                    break;
+            }
+        }
+
         {
-            auto newList = std::make_shared<std::vector<CachedActor>>(std::move(newActors));
             std::lock_guard<std::mutex> lock(gActorListMtx);
-            gSharedActors = newList;
+            gClassifiedActors = classified;
         }
 
         // 提交基本信息供 UI 显示
         frame.valid = true;
         gFrameSync.submit(frame);
 
-        // 扫描间隔 1000ms（1秒）- 骨骼映射已缓存，无需频繁扫描
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        // 根据游戏 FPS Level 动态调整扫描间隔
+        int fpsLevel = gGameFPSLevel.load(std::memory_order_relaxed);
+        int intervalMs = GetReadIntervalFromFPSLevel(fpsLevel);
+        std::this_thread::sleep_for(std::chrono::milliseconds(intervalMs));
     }
 }
 
 void StartReadThread() {
     if (gReadThreadRunning.load()) return;
     gReadThreadRunning.store(true);
+
+    // 启动时立即读取一次游戏 FPS Level 并设置 Target FPS
+    if (Paradise_hook && driver_stat.load(std::memory_order_relaxed) > 0) {
+        int initialFPSLevel = ReadGameFPSLevel();
+        gGameFPSLevel.store(initialFPSLevel, std::memory_order_relaxed);
+        gTargetFPS = GetFPSFromLevel(initialFPSLevel);
+        LOGI("Initial Game FPS Level: %d -> Target FPS: %d", initialFPSLevel, gTargetFPS);
+    }
+
     gReadThread = std::thread(readThreadFunc);
 }
 
@@ -419,4 +610,349 @@ void StopReadThread() {
     gReadThreadRunning.store(false);
     if (gReadThread.joinable())
         gReadThread.join();
+}
+
+// ═══════════════════════════════════════════
+//  扫描 GUObjectArray 查找特定类的实例
+// ═══════════════════════════════════════════
+
+// 存储扫描结果
+static std::vector<std::pair<uint64_t, std::string>> gScanResults;
+static std::mutex gScanResultsMutex;
+void DebugGUObjectArray() {
+      printf("=== Debug GUObjectArray ===\n");
+      printf("libUE4 base: 0x%lx\n", sLibUE4);
+
+      // 测试不同的地址
+      uint64_t test1 = sLibUE4 + 0x147063A0;
+      uint64_t test2 = sLibUE4 + 0x14706480;
+      uint64_t test3 = sLibUE4 + 0x1470653C;
+      uint64_t test4 = sLibUE4 + 0x14706540;
+
+      printf("GUObjectArray (0x147063A0): 0x%lx\n", test1);
+      printf("ObjObjects (0x14706480): 0x%lx\n", test2);
+      printf("NumElements addr (0x1470653C): 0x%lx\n", test3);
+      printf("MaxElements addr (0x14706540): 0x%lx\n", test4);
+
+      // 读取值
+      int32_t numElements = Paradise_hook->read<int32_t>(test3);
+      int32_t maxElements = Paradise_hook->read<int32_t>(test4);
+
+      printf("NumElements value: %d\n", numElements);
+      printf("MaxElements value: %d\n", maxElements);
+
+      // 读取 chunk 指针
+      uint64_t chunkPtr = Paradise_hook->read<uint64_t>(test2 + 0xC8);
+      printf("First chunk pointer: 0x%lx\n", chunkPtr);
+
+      // 读取第一个对象
+      if (chunkPtr != 0) {
+          uint64_t firstObj = Paradise_hook->read<uint64_t>(chunkPtr);
+          printf("First object: 0x%lx\n", firstObj);
+      }
+      fflush(stdout);
+}
+void ScanForClass(const char* className) {
+    printf("=== ScanForClass called for: %s ===\n", className);
+    fflush(stdout);
+
+    DebugGUObjectArray();
+
+    if (!Paradise_hook || driver_stat.load(std::memory_order_relaxed) <= 0) {
+        printf("ERROR: Driver not initialized\n");
+        fflush(stdout);
+        return;
+    }
+
+    std::vector<std::pair<uint64_t, std::string>> results;
+
+    // 根据文档，offset.GUObject = 0x14706480 是 ObjObjects 的静态地址
+    // 方法1: 使用 GUObjectArray 基址 (0x147063A0)
+    uint64_t GUObjectArrayBase = sLibUE4 + 0x147063A0;
+
+    // 读取 NumElements (GUObjectArray + 0x19C)
+    int32_t NumElements = Paradise_hook->read<int32_t>(GUObjectArrayBase + 0x19C);
+    int32_t MaxElements = Paradise_hook->read<int32_t>(GUObjectArrayBase + 0x1A0);
+
+    printf("NumElements: %d, MaxElements: %d\n", NumElements, MaxElements);
+    fflush(stdout);
+
+    if (NumElements <= 0 || NumElements > 2000000) {
+        printf("ERROR: Invalid NumElements: %d\n", NumElements);
+        fflush(stdout);
+        return;
+    }
+
+    // ObjObjects 在 GUObjectArray + 0xE0
+    uint64_t ObjObjectsBase = GUObjectArrayBase + 0xE0;
+
+    // 读取第一个 chunk 指针 (ObjObjects + 0xC8)
+    uint64_t FirstChunkPtr = Paradise_hook->read<uint64_t>(ObjObjectsBase + 0xC8);
+
+    printf("ObjObjectsBase: 0x%lx\n", ObjObjectsBase);
+    printf("FirstChunkPtr: 0x%lx\n", FirstChunkPtr);
+    fflush(stdout);
+
+    if (FirstChunkPtr == 0) {
+        printf("ERROR: FirstChunkPtr is NULL!\n");
+        fflush(stdout);
+
+        // 尝试备用方法：直接从 offset.GUObject 读取
+        printf("Trying alternative method...\n");
+        fflush(stdout);
+        uint64_t altChunkPtr = Paradise_hook->read<uint64_t>(sLibUE4 + offset.GUObject);
+        printf("Alternative chunk pointer: 0x%lx\n", altChunkPtr);
+        fflush(stdout);
+
+        if (altChunkPtr == 0) {
+            printf("ERROR: Alternative method also failed\n");
+            fflush(stdout);
+            return;
+        }
+        FirstChunkPtr = altChunkPtr;
+    }
+
+    printf("Scanning GUObjectArray: FirstChunk=0x%lx, Num=%d\n", FirstChunkPtr, NumElements);
+    printf("Looking for class: %s\n", className);
+    fflush(stdout);
+
+    int foundCount = 0;
+    int sampleCount = 0;
+    int validObjectCount = 0;
+    std::string targetClassName(className);
+
+    // 遍历对象数组（简化版：假设只有一个 chunk）
+    for (int i = 0; i < NumElements && i < 500000; i++) {
+        // FUObjectItem 大小 = 0x18 (24 字节)
+        // +0x00: UObject* Object
+        uint64_t objectPtr = Paradise_hook->read<uint64_t>(FirstChunkPtr + i * 0x18);
+
+        if (objectPtr == 0 || objectPtr < 0x10000ULL || objectPtr > 0x800000000000ULL) {
+            continue;
+        }
+
+        validObjectCount++;
+
+        // 获取对象名称
+        std::string objName = GetObjectName(objectPtr, sLibUE4);
+
+        // 打印前 50 个有效对象的详细信息
+        if (sampleCount < 50 && !objName.empty()) {
+            // 读取对象的类指针
+            uint64_t classPtr = Paradise_hook->read<uint64_t>(objectPtr + 0x10);
+            std::string className_actual;
+            if (classPtr != 0) {
+                int32_t classNameIdx = Paradise_hook->read<int32_t>(classPtr + 0x18);
+                className_actual = GetNameByIndex(classNameIdx, sLibUE4);
+            }
+
+            printf("Sample[%d] Obj=0x%lx Name=%s Class=%s\n",
+                   sampleCount, objectPtr, objName.c_str(), className_actual.c_str());
+            fflush(stdout);
+            sampleCount++;
+        }
+
+        // 检查是否包含目标类名（不区分大小写）
+        std::string objNameLower = objName;
+        std::string targetLower = targetClassName;
+        std::transform(objNameLower.begin(), objNameLower.end(), objNameLower.begin(), ::tolower);
+        std::transform(targetLower.begin(), targetLower.end(), targetLower.begin(), ::tolower);
+
+        if (objNameLower.find(targetLower) != std::string::npos) {
+            // 读取类名进行验证
+            uint64_t classPtr = Paradise_hook->read<uint64_t>(objectPtr + 0x10);
+            std::string className_actual;
+            if (classPtr != 0) {
+                int32_t classNameIdx = Paradise_hook->read<int32_t>(classPtr + 0x18);
+                className_actual = GetNameByIndex(classNameIdx, sLibUE4);
+            }
+
+            results.push_back({objectPtr, objName + " [Class: " + className_actual + "]"});
+            foundCount++;
+            printf("[%d] Found: 0x%lx -> %s (Class: %s)\n",
+                   foundCount, objectPtr, objName.c_str(), className_actual.c_str());
+            fflush(stdout);
+
+            // 限制结果数量，避免过多
+            if (foundCount >= 100) {
+                printf("Reached limit of 100 results, stopping scan\n");
+                fflush(stdout);
+                break;
+            }
+        }
+
+        // 每 10000 个对象打印一次进度
+        if (i > 0 && i % 10000 == 0) {
+            printf("Progress: %d/%d objects scanned, %d valid, found %d matches\n",
+                   i, NumElements, validObjectCount, foundCount);
+            fflush(stdout);
+        }
+    }
+
+    printf("Scan complete: scanned %d objects, %d valid, found %d instances of %s\n",
+           NumElements, validObjectCount, foundCount, className);
+    fflush(stdout);
+
+    // 保存结果
+    {
+        std::lock_guard<std::mutex> lock(gScanResultsMutex);
+        gScanResults = std::move(results);
+    }
+}
+
+std::vector<std::pair<uint64_t, std::string>> GetScanResults() {
+    std::lock_guard<std::mutex> lock(gScanResultsMutex);
+    return gScanResults;
+}
+
+void ClearScanResults() {
+    std::lock_guard<std::mutex> lock(gScanResultsMutex);
+    gScanResults.clear();
+}
+
+// 专门查找 UClass 对象（类定义本身）
+void FindUClass(const char* className) {
+    printf("=== FindUClass called for: %s ===\n", className);
+    fflush(stdout);
+
+    if (!Paradise_hook || driver_stat.load(std::memory_order_relaxed) <= 0) {
+        printf("ERROR: Driver not initialized\n");
+        fflush(stdout);
+        return;
+    }
+
+    std::vector<std::pair<uint64_t, std::string>> results;
+
+    uint64_t GUObjectArrayBase = sLibUE4 + 0x147063A0;
+    int32_t NumElements = Paradise_hook->read<int32_t>(GUObjectArrayBase + 0x19C);
+    uint64_t ObjObjectsBase = GUObjectArrayBase + 0xE0;
+    uint64_t FirstChunkPtr = Paradise_hook->read<uint64_t>(ObjObjectsBase + 0xC8);
+
+    if (FirstChunkPtr == 0) {
+        printf("ERROR: FirstChunkPtr is NULL!\n");
+        fflush(stdout);
+        return;
+    }
+
+    printf("Looking for UClass: %s\n", className);
+    fflush(stdout);
+
+    int foundCount = 0;
+    std::string targetClassName(className);
+    std::transform(targetClassName.begin(), targetClassName.end(), targetClassName.begin(), ::tolower);
+
+    for (int i = 0; i < NumElements && i < 500000; i++) {
+        uint64_t objectPtr = Paradise_hook->read<uint64_t>(FirstChunkPtr + i * 0x18);
+
+        if (objectPtr == 0 || objectPtr < 0x10000ULL || objectPtr > 0x800000000000ULL) {
+            continue;
+        }
+
+        // 读取对象的类指针
+        uint64_t classPtr = Paradise_hook->read<uint64_t>(objectPtr + 0x10);
+        if (classPtr == 0) continue;
+
+        // 获取类的名称
+        int32_t classNameIdx = Paradise_hook->read<int32_t>(classPtr + 0x18);
+        std::string className_actual = GetNameByIndex(classNameIdx, sLibUE4);
+
+        // 检查这个对象的类是否是 "Class"（即这个对象本身是一个 UClass）
+        std::string classNameLower = className_actual;
+        std::transform(classNameLower.begin(), classNameLower.end(), classNameLower.begin(), ::tolower);
+
+        if (classNameLower == "class") {
+            // 这是一个 UClass 对象，获取它的名称
+            std::string objName = GetObjectName(objectPtr, sLibUE4);
+            std::string objNameLower = objName;
+            std::transform(objNameLower.begin(), objNameLower.end(), objNameLower.begin(), ::tolower);
+
+            // 检查是否匹配目标类名
+            if (objNameLower.find(targetClassName) != std::string::npos) {
+                results.push_back({objectPtr, objName});
+                foundCount++;
+                printf("[%d] Found UClass: 0x%lx -> %s\n", foundCount, objectPtr, objName.c_str());
+                fflush(stdout);
+
+                if (foundCount >= 100) {
+                    break;
+                }
+            }
+        }
+
+        if (i > 0 && i % 10000 == 0) {
+            printf("Progress: %d/%d objects scanned, found %d UClass matches\n", i, NumElements, foundCount);
+            fflush(stdout);
+        }
+    }
+
+    printf("FindUClass complete: found %d UClass objects matching %s\n", foundCount, className);
+    fflush(stdout);
+
+    // 保存结果
+    {
+        std::lock_guard<std::mutex> lock(gScanResultsMutex);
+        gScanResults = std::move(results);
+    }
+}
+
+// 通过 GameInstance → FrontendHUD → UserSettings 访问 SettingConfig
+void FindSettingConfigViaGameInstance() {
+    printf("=== Reading Game FPS Level ===\n");
+    fflush(stdout);
+
+    if (!Paradise_hook || driver_stat.load(std::memory_order_relaxed) <= 0) {
+        printf("ERROR: Driver not initialized\n");
+        fflush(stdout);
+        return;
+    }
+
+    // 1. 从 UWorld 获取 GameInstance
+    uint64_t uworld = Paradise_hook->read<uint64_t>(sLibUE4 + offset.Gworld);
+    if (uworld == 0) {
+        printf("ERROR: UWorld is NULL\n");
+        fflush(stdout);
+        return;
+    }
+
+    uint64_t gameInstance = Paradise_hook->read<uint64_t>(uworld + 0xb00);
+    if (gameInstance == 0) {
+        printf("ERROR: GameInstance not found\n");
+        fflush(stdout);
+        return;
+    }
+
+    // 2. 从 GameInstance 获取 AssociatedFrontendHUD (offset 0x4a8)
+    uint64_t frontendHUD = Paradise_hook->read<uint64_t>(gameInstance + 0x4a8);
+    if (frontendHUD == 0) {
+        printf("ERROR: AssociatedFrontendHUD is NULL\n");
+        fflush(stdout);
+        return;
+    }
+
+    // 3. 从 FrontendHUD 读取 UserSettings (offset 0xbc8)
+    uint64_t userSettings = Paradise_hook->read<uint64_t>(frontendHUD + 0xbc8);
+    if (userSettings == 0) {
+        printf("ERROR: UserSettings is NULL\n");
+        fflush(stdout);
+        return;
+    }
+
+    // 4. 读取 FPS Level (offset 0x120)
+    int fpsLevel = Paradise_hook->read<int32_t>(userSettings + 0x120);
+
+    // FPS Level 映射
+    const char* fpsMapping[] = {
+        nullptr, nullptr,
+        "20fps", "25fps", "30fps", "40fps", "60fps", "90fps", "120fps", "144fps"
+    };
+
+    printf("FPS Level: %d", fpsLevel);
+    if (fpsLevel >= 2 && fpsLevel <= 9) {
+        printf(" (%s)\n", fpsMapping[fpsLevel]);
+    } else {
+        printf(" (Invalid)\n");
+    }
+
+    printf("Read interval will be: %dms\n", GetReadIntervalFromFPSLevel(fpsLevel));
+    fflush(stdout);
 }

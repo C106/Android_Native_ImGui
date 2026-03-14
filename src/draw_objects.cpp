@@ -5,14 +5,6 @@
 #include <unordered_map>
 #include <vector>
 
-// 类名 → 显示名称映射表，无映射的 actor 不绘制
-static const std::unordered_map<std::string, std::string> kClassNameMap = {
-    {"BP_TrainPlayerPawn_C", "骨骼测试"},
-    {"BP_PlayerPawn_CG35_C", "骨骼测试"},
-    // {"BP_Vehicle_C", "载具"},
-    // 用户按需填充
-};
-
 // 骨骼连接定义（用于绘制骨架线条）
 static const std::pair<int, int> kBoneConnections[] = {
     // 头部到躯干
@@ -44,6 +36,11 @@ bool gShowAllClassNames = false;
 bool gUseBatchBoneRead = true;  // 默认使用批量读取（优化模式）
 int gBoneCount = 0;
 float gMaxSkeletonDistance = 200.0f;  // 默认 200 米，超过不绘制骨骼
+
+// 分类显示开关（默认全部显示）
+bool gShowPlayers = true;
+bool gShowVehicles = true;
+bool gShowOthers = true;
 
 // TeamID → 颜色映射（使用固定色板，按 teamID % 数量 循环）
 static ImU32 GetTeamColor(int teamID) {
@@ -102,11 +99,23 @@ void DrawObjectsWithData(const GameFrameData& data) {
     if (!gShowObjects) return;
     if (!data.valid) return;
 
-    auto actors = GetCachedActors();
-    if (!actors || actors->empty()) return;
+    // 获取分类后的 actor 列表
+    auto classified = GetClassifiedActors();
+    if (!classified) return;
 
-    // 使用预读数据渲染（数据在 fence wait 前已读取，延迟更低）
-    DrawObjectsWithDataInternal(actors, data.VPMat, data.localPlayerPos);
+    // 按类型分别绘制（根据开关控制）
+    if (gShowPlayers && !classified->players.empty()) {
+        auto players = std::make_shared<std::vector<CachedActor>>(classified->players);
+        DrawObjectsWithDataInternal(players, data.VPMat, data.localPlayerPos);
+    }
+    if (gShowVehicles && !classified->vehicles.empty()) {
+        auto vehicles = std::make_shared<std::vector<CachedActor>>(classified->vehicles);
+        DrawObjectsWithDataInternal(vehicles, data.VPMat, data.localPlayerPos);
+    }
+    if (gShowOthers && !classified->others.empty()) {
+        auto others = std::make_shared<std::vector<CachedActor>>(classified->others);
+        DrawObjectsWithDataInternal(others, data.VPMat, data.localPlayerPos);
+    }
 }
 
 // 旧接口（保留兼容性，立即读取并绘制）
@@ -133,14 +142,14 @@ static void DrawObjectsWithDataInternal(
             continue;
         }
 
-        auto mapIt = kClassNameMap.find(ca.className);
+        // 使用预分类的 displayName（读取线程已完成类名比对）
         const char* label = nullptr;
-        if (mapIt != kClassNameMap.end()) {
-            label = mapIt->second.c_str();
+        if (!ca.displayName.empty()) {
+            label = ca.displayName.c_str();
         } else if (gShowAllClassNames && !ca.className.empty()) {
             label = ca.className.c_str();
         } else {
-            continue;
+            continue;  // 无显示名称，跳过
         }
 
         // 检查是否有骨骼映射（使用 boneMapBuilt 标志）
