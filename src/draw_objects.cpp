@@ -2,8 +2,10 @@
 #include "read_mem.h"
 #include "ImGuiLayer.h"
 #include "driver_manager.h"
+#include "game_fps_monitor.h"
 #include <unordered_map>
 #include <vector>
+#include <algorithm>
 
 // 骨骼连接定义（用于绘制骨架线条）
 static const std::pair<int, int> kBoneConnections[] = {
@@ -42,6 +44,28 @@ bool gShowPlayers = true;
 bool gShowVehicles = true;
 bool gShowOthers = true;
 
+// 绘制模块开关（默认全部启用）
+bool gDrawSkeleton = true;   // 绘制骨骼线条
+bool gDrawDistance = true;   // 绘制距离信息
+bool gDrawName = true;       // 绘制名称标签
+bool gDrawBox = false;       // 绘制包围盒（预留，默认关闭）
+
+// 骨骼屏幕坐标缓存（渲染线程写入，auto-aim 读取——同一线程，无需 mutex）
+static std::unordered_map<uint64_t, BoneScreenData> gBoneScreenCache;
+
+// ── 骨骼插值缓存 ──
+// 缓存上一帧每个 actor 的骨骼世界坐标，用于 lerp 平滑
+struct BoneWorldCache {
+    Vec3 positions[BONE_COUNT];
+    bool valid[BONE_COUNT];
+    uint64_t lastFrameCounter;  // 上次更新时的引擎帧号
+    bool initialized;
+};
+static std::unordered_map<uint64_t, BoneWorldCache> gBoneWorldCache;
+
+// 上一帧引擎帧号（用于检测引擎是否推进了新帧）
+static uint64_t gLastEngineFrame = 0;
+
 // TeamID → 颜色映射（使用固定色板，按 teamID % 数量 循环）
 static ImU32 GetTeamColor(int teamID) {
     static const ImU32 kTeamColors[] = {
@@ -61,14 +85,18 @@ static ImU32 GetTeamColor(int teamID) {
 
 // 前向声明
 static void DrawObjectsWithDataInternal(
-    const std::shared_ptr<std::vector<CachedActor>>& actors,
+    const std::vector<CachedActor>& actors,
     const FMatrix& VPMat,
-    const Vec3& localPlayerPos);
+    const Vec3& localPlayerPos,
+    uint64_t engineFrame,
+    float renderDeltaTime);
 
 // 读取游戏数据（在 fence wait 前调用，减少延迟）
 GameFrameData ReadGameData() {
     GameFrameData data;
     data.valid = false;
+    data.gameDeltaTime = 0.0f;
+    data.frameCounter = 0;
 
     if (driver_stat.load(std::memory_order_relaxed) <= 0) return data;
     if (address.Matrix == 0) return data;
@@ -90,53 +118,106 @@ GameFrameData ReadGameData() {
         }
     }
 
+    // 读取 FApp::DeltaTime（GOT 表，两次解引用）
+    if (address.libUE4 != 0 && offset.FAppDeltaTimeGOT != 0) {
+        uint64_t gotEntry = Paradise_hook->read<uint64_t>(address.libUE4 + offset.FAppDeltaTimeGOT);
+        if (gotEntry != 0) {
+            double deltaTime = Paradise_hook->read<double>(gotEntry);
+            if (deltaTime > 0.0 && deltaTime < 1.0) {
+                PushGameDeltaTime(deltaTime);
+                data.gameDeltaTime = (float)deltaTime;
+            }
+        }
+    }
+
+    // 读取 GFrameCounter（与 DeltaTime 同步）
+    if (address.libUE4 != 0 && offset.GFrameCounterGOT != 0) {
+        uint64_t gotEntry = Paradise_hook->read<uint64_t>(address.libUE4 + offset.GFrameCounterGOT);
+        if (gotEntry != 0) {
+            data.frameCounter = Paradise_hook->read<uint64_t>(gotEntry);
+        }
+    }
+
     data.valid = true;
     return data;
 }
 
+// 仅读取 GFrameCounter（轻量，用于帧同步轮询）
+uint64_t ReadFrameCounter() {
+    if (driver_stat.load(std::memory_order_relaxed) <= 0) return 0;
+    if (address.libUE4 == 0 || offset.GFrameCounterGOT == 0) return 0;
+    uint64_t gotEntry = Paradise_hook->read<uint64_t>(address.libUE4 + offset.GFrameCounterGOT);
+    if (gotEntry == 0) return 0;
+    return Paradise_hook->read<uint64_t>(gotEntry);
+}
+
 // 使用预读数据绘制（在 fence wait 后调用）
-void DrawObjectsWithData(const GameFrameData& data) {
+void DrawObjectsWithData(const GameFrameData& data, float renderDeltaTime) {
     if (!gShowObjects) return;
     if (!data.valid) return;
+
+    // 定期清理缓存（每 2 秒，假设 60 FPS）
+    static int cleanupCounter = 0;
+    if (++cleanupCounter >= 120) {
+        cleanupCounter = 0;
+        gBoneScreenCache.clear();
+        // 清理过期的插值缓存（超过 120 帧未更新的 actor）
+        for (auto it = gBoneWorldCache.begin(); it != gBoneWorldCache.end(); ) {
+            if (data.frameCounter > it->second.lastFrameCounter + 120) {
+                it = gBoneWorldCache.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // 更新引擎帧号（用于插值缓存过期判断）
+    gLastEngineFrame = data.frameCounter;
+
+    // VP 矩阵直接使用帧数据中读取的（每帧一次，不再高频轮询）
+    const FMatrix& vpToUse = data.VPMat;
 
     // 获取分类后的 actor 列表
     auto classified = GetClassifiedActors();
     if (!classified) return;
 
-    // 按类型分别绘制（根据开关控制）
+    // 按类型分别绘制（根据开关控制，直接传引用避免拷贝）
     if (gShowPlayers && !classified->players.empty()) {
-        auto players = std::make_shared<std::vector<CachedActor>>(classified->players);
-        DrawObjectsWithDataInternal(players, data.VPMat, data.localPlayerPos);
+        DrawObjectsWithDataInternal(classified->players, vpToUse, data.localPlayerPos,
+                                    data.frameCounter, renderDeltaTime);
     }
     if (gShowVehicles && !classified->vehicles.empty()) {
-        auto vehicles = std::make_shared<std::vector<CachedActor>>(classified->vehicles);
-        DrawObjectsWithDataInternal(vehicles, data.VPMat, data.localPlayerPos);
+        DrawObjectsWithDataInternal(classified->vehicles, vpToUse, data.localPlayerPos,
+                                    data.frameCounter, renderDeltaTime);
     }
     if (gShowOthers && !classified->others.empty()) {
-        auto others = std::make_shared<std::vector<CachedActor>>(classified->others);
-        DrawObjectsWithDataInternal(others, data.VPMat, data.localPlayerPos);
+        DrawObjectsWithDataInternal(classified->others, vpToUse, data.localPlayerPos,
+                                    data.frameCounter, renderDeltaTime);
     }
 }
 
 // 旧接口（保留兼容性，立即读取并绘制）
 void DrawObjects() {
     GameFrameData data = ReadGameData();
-    DrawObjectsWithData(data);
+    DrawObjectsWithData(data, 0.016f);  // 默认 ~60fps
 }
 
 // 实际的绘制逻辑（提取为独立函数）
 static void DrawObjectsWithDataInternal(
-    const std::shared_ptr<std::vector<CachedActor>>& actors,
+    const std::vector<CachedActor>& actors,
     const FMatrix& VPMat,
-    const Vec3& localPlayerPos)
+    const Vec3& localPlayerPos,
+    uint64_t engineFrame,
+    float renderDeltaTime)
 {
 
     // 绘制有映射的 actor
     ImGuiIO& io = ImGui::GetIO();
     ImDrawList* draw_list = ImGui::GetBackgroundDrawList();
-    Vec2 screenPos;
+    float screenW = io.DisplaySize.x;
+    float screenH = io.DisplaySize.y;
 
-    for (const auto& ca : *actors) {
+    for (const auto& ca : actors) {
         // 跳过本地玩家 actor
         if (address.LocalPlayerActor != 0 && ca.actorAddr == address.LocalPlayerActor) {
             continue;
@@ -146,22 +227,32 @@ static void DrawObjectsWithDataInternal(
         const char* label = nullptr;
         if (!ca.displayName.empty()) {
             label = ca.displayName.c_str();
-        } else if (gShowAllClassNames && !ca.className.empty()) {
-            label = ca.className.c_str();
+        } else if (!ca.className.empty()) {
+            label = ca.className.c_str();  // 没有 displayName 时使用 className
         } else {
-            continue;  // 无显示名称，跳过
+            continue;  // 无任何名称，跳过
         }
 
         // 检查是否有骨骼映射（使用 boneMapBuilt 标志）
-        bool hasBoneMap = ca.boneMapBuilt;
+        bool hasBoneMap = ca.boneMapBuilt && ca.skelMeshCompAddr != 0;
 
-        // 实时读取 actor 位置（每帧读取，确保与游戏引擎同步）
+        // 对于有骨骼的 actor，从 mesh 变换中提取位置（合并读取，省 1 次 ioctl）
         Vec3 actorPos = Vec3::Zero();
         float distance = 0.0f;
-        if (ca.rootCompAddr != 0) {
+        FTransform meshTransform;
+        bool hasMeshTransform = false;
+
+        if (hasBoneMap) {
+            // 骨骼 actor：读取 mesh 世界变换，同时获取位置
+            meshTransform = Paradise_hook->read<FTransform>(ca.skelMeshCompAddr + offset.ComponentToWorld);
+            actorPos = meshTransform.Translation;
+            hasMeshTransform = true;
+            distance = Vec3::Distance(localPlayerPos, actorPos) / 100.0f;
+        } else if (ca.rootCompAddr != 0) {
+            // 无骨骼 actor：读取 RootComponent 位置（1 次 ioctl）
             FTransform actorTransform = Paradise_hook->read<FTransform>(ca.rootCompAddr + offset.ComponentToWorld);
             actorPos = actorTransform.Translation;
-            distance = Vec3::Distance(localPlayerPos, actorPos) / 100.0f;  // 转换为米（UE4 单位是厘米）
+            distance = Vec3::Distance(localPlayerPos, actorPos) / 100.0f;
         } else {
             continue;  // 无 RootComponent，跳过
         }
@@ -206,21 +297,23 @@ static void DrawObjectsWithDataInternal(
         bool hasBottomLabel = false;
 
         if (drawSkeleton) {
-            uint64_t SkeletalMeshComponent = Paradise_hook->read<uint64_t>(ca.actorAddr + offset.SkeletalMeshComponent);
-            if (SkeletalMeshComponent != 0) {
-                // 限制 BoneCount 避免读取过大数组（防御性编程）
+            // 屏幕外剔除：先用 actor 位置做粗略检测，屏幕外跳过骨骼读取
+            Vec2 cullScreenPos;
+            bool onScreen = WorldToScreen(actorPos, VPMat, screenW, screenH, cullScreenPos);
+            // 带边距检测（角色可能部分在屏幕外但骨骼可见）
+            float margin = 200.0f;
+            bool inBounds = onScreen &&
+                cullScreenPos.x > -margin && cullScreenPos.x < screenW + margin &&
+                cullScreenPos.y > -margin && cullScreenPos.y < screenH + margin;
+
+            if (inBounds && hasMeshTransform && ca.cachedBoneCount > 0 && ca.boneDataPtr != 0) {
+                // 使用缓存的静态指针，无需再读取 SkeletalMeshComponent/BoneCount/BoneDataPtr
+                int BoneCount = ca.cachedBoneCount;
+                uint64_t BoneDataPtr = ca.boneDataPtr;
                 constexpr int MAX_BONE_COUNT = 150;
 
-                // 使用 ComponentSpaceTransforms（单缓冲）
-                uint64_t ComponentSpaceTransforms = SkeletalMeshComponent + offset.ComponentSpaceTransforms;
-                int BoneCount = Paradise_hook->read<int>(ComponentSpaceTransforms + 0x8);
-                uint64_t BoneDataPtr = Paradise_hook->read<uint64_t>(ComponentSpaceTransforms);
-
-                if (BoneCount > 0 && BoneCount <= MAX_BONE_COUNT && BoneDataPtr != 0) {
-                    FTransform meshTransform = Paradise_hook->read<FTransform>(
-                        SkeletalMeshComponent + offset.ComponentToWorld);
-
-                    // 计算 mesh 变换矩阵（提到循环外，避免重复计算）
+                if (BoneCount <= MAX_BONE_COUNT) {
+                    // meshTransform 已在位置读取时获取，直接使用
                     FMatrix meshMatrix = TransformToMatrix(meshTransform);
 
                     // 提取关键骨骼（简化：只使用 translation，无验证）
@@ -274,9 +367,16 @@ static void DrawObjectsWithDataInternal(
 
                     // 只有足够多的骨骼有效时才绘制
                     if (validCount >= 10) {
-                        // 计算所有关键骨骼的屏幕坐标 + 标签位置（一次遍历）
+                        // 计算所有关键骨骼的世界坐标 + 插值平滑 + 屏幕投影
                         Vec2 boneScreenPos[BONE_COUNT];
                         bool boneOnScreen[BONE_COUNT] = {false};
+
+                        // 查找/创建插值缓存
+                        auto& cache = gBoneWorldCache[ca.actorAddr];
+
+                        // 插值系数：渲染帧率高于引擎帧率时平滑过渡
+                        // lerpFactor 越小越平滑，越大越跟手
+                        float lerpFactor = std::min(1.0f, renderDeltaTime * 20.0f);  // ~20Hz 收敛速度
 
                         for (int boneID = 0; boneID < BONE_COUNT; boneID++) {
                             if (ca.boneMap[boneID] < 0) continue;
@@ -288,6 +388,24 @@ static void DrawObjectsWithDataInternal(
                                 meshMatrix.M[0][1] * boneLocal.X + meshMatrix.M[1][1] * boneLocal.Y + meshMatrix.M[2][1] * boneLocal.Z + meshMatrix.M[3][1],
                                 meshMatrix.M[0][2] * boneLocal.X + meshMatrix.M[1][2] * boneLocal.Y + meshMatrix.M[2][2] * boneLocal.Z + meshMatrix.M[3][2]
                             };
+
+                            // 插值平滑：与上一帧缓存位置做 lerp
+                            if (cache.initialized && cache.valid[boneID]) {
+                                Vec3 prev = cache.positions[boneID];
+                                // 距离过大说明瞬移/传送，不插值
+                                float dist = Vec3::Distance(prev, worldPos);
+                                if (dist < 500.0f) {
+                                    worldPos = Vec3{
+                                        prev.X + (worldPos.X - prev.X) * lerpFactor,
+                                        prev.Y + (worldPos.Y - prev.Y) * lerpFactor,
+                                        prev.Z + (worldPos.Z - prev.Z) * lerpFactor
+                                    };
+                                }
+                            }
+
+                            // 更新缓存
+                            cache.positions[boneID] = worldPos;
+                            cache.valid[boneID] = true;
 
                             // 保存标签位置
                             if (boneID == BONE_HEAD) {
@@ -305,59 +423,44 @@ static void DrawObjectsWithDataInternal(
                             }
                         }
 
+                        // 标记缓存已初始化
+                        cache.lastFrameCounter = engineFrame;
+                        cache.initialized = true;
+
                         // 绘制骨骼连接线（使用距离衰减的透明度，超过设定距离几乎透明）
-                        for (const auto& conn : kBoneConnections) {
-                            int bone1 = conn.first;
-                            int bone2 = conn.second;
-                            if (boneOnScreen[bone1] && boneOnScreen[bone2]) {
-                                ImVec2 p1(boneScreenPos[bone1].x, boneScreenPos[bone1].y);
-                                ImVec2 p2(boneScreenPos[bone2].x, boneScreenPos[bone2].y);
-                                draw_list->AddLine(p1, p2, IM_COL32(0, 255, 0, boneAlpha), 2.0f);
+                        if (gDrawSkeleton) {
+                            for (const auto& conn : kBoneConnections) {
+                                int bone1 = conn.first;
+                                int bone2 = conn.second;
+                                if (boneOnScreen[bone1] && boneOnScreen[bone2]) {
+                                    ImVec2 p1(boneScreenPos[bone1].x, boneScreenPos[bone1].y);
+                                    ImVec2 p2(boneScreenPos[bone2].x, boneScreenPos[bone2].y);
+                                    draw_list->AddLine(p1, p2, IM_COL32(0, 255, 0, boneAlpha), 2.0f);
+                                }
                             }
                         }
+
+                        // 缓存骨骼屏幕坐标供 auto-aim 使用
+                        BoneScreenData bsd;
+                        std::copy(std::begin(boneScreenPos), std::end(boneScreenPos), std::begin(bsd.screenPos));
+                        std::copy(std::begin(boneOnScreen), std::end(boneOnScreen), std::begin(bsd.onScreen));
+                        bsd.distance = distance;
+                        bsd.teamID = ca.teamID;
+                        bsd.actorAddr = ca.actorAddr;
+                        bsd.valid = true;
+
+                        gBoneScreenCache[ca.actorAddr] = bsd;
                     }
                 }
             }
         }
-/*
-        // Fallback: 如果没有骨骼标签位置，使用 actor 位置
-        if (!hasTopLabel || !hasBottomLabel) {
-            if (actorPos != Vec3::Zero()) {
-                if (!hasTopLabel) {
-                    topLabelWorldPos = actorPos;
-                    topLabelWorldPos.Z += 100.0f;  // 假设角色高度约 100cm
-                    hasTopLabel = true;
-                }
-                if (!hasBottomLabel) {
-                    bottomLabelWorldPos = actorPos;
-                    bottomLabelWorldPos.Z -= 20.0f;  // 脚下 20cm
-                    hasBottomLabel = true;
-                }
-            } else if (ca.rootCompAddr != 0) {
-                // 重新尝试读取 actor 位置
-                FTransform actorTransform = Paradise_hook->read<FTransform>(ca.rootCompAddr + offset.ComponentToWorld);
-                if (actorTransform.Translation != Vec3::Zero()) {
-                    if (!hasTopLabel) {
-                        topLabelWorldPos = actorTransform.Translation;
-                        topLabelWorldPos.Z += 100.0f;
-                        hasTopLabel = true;
-                    }
-                    if (!hasBottomLabel) {
-                        bottomLabelWorldPos = actorTransform.Translation;
-                        bottomLabelWorldPos.Z -= 40.0f;
-                        hasBottomLabel = true;
-                    }
-                }
-            }
-        }
-*/
+
         // 绘制 Top Label（名称）
-        if (hasTopLabel && !ca.playerName.empty()) {
+        if (gDrawName && hasTopLabel && !ca.playerName.empty()) {
             Vec2 topLabelScreenPos;
             if (WorldToScreen(topLabelWorldPos, VPMat, io.DisplaySize.x, io.DisplaySize.y, topLabelScreenPos)) {
                 ImVec2 labelPos(topLabelScreenPos.x, topLabelScreenPos.y);
                 ImU32 teamColor = GetTeamColor(ca.teamID);
-                ImU32 teamColorWithAlpha = (teamColor & 0x00FFFFFF) | (alpha << 24);
 
                 // 构建显示文本：[队伍ID] 玩家名
                 char displayName[256];
@@ -383,7 +486,7 @@ static void DrawObjectsWithDataInternal(
         }
 
         // 绘制 Bottom Label（距离）
-        if (hasBottomLabel && distance > 0.0f) {
+        if (gDrawDistance && hasBottomLabel && distance > 0.0f) {
             Vec2 bottomLabelScreenPos;
             if (WorldToScreen(bottomLabelWorldPos, VPMat, io.DisplaySize.x, io.DisplaySize.y, bottomLabelScreenPos)) {
                 ImVec2 labelPos(bottomLabelScreenPos.x, bottomLabelScreenPos.y);
@@ -407,4 +510,15 @@ static void DrawObjectsWithDataInternal(
         }
 
     }
+}
+
+// 供 auto-aim 访问骨骼缓存（同线程调用，返回引用避免拷贝）
+const std::unordered_map<uint64_t, BoneScreenData>& GetBoneScreenCache() {
+    return gBoneScreenCache;
+}
+
+// 清理资源
+void ShutdownDrawObjects() {
+    gBoneScreenCache.clear();
+    gBoneWorldCache.clear();
 }

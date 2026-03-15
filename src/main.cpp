@@ -5,13 +5,15 @@
 #include "draw_menu.h"
 #include "draw_objects.h"
 #include "read_mem.h"
+#include "auto_aim.h"
 #include <chrono>
 #include <atomic>
 #include <thread>
 #include "Gyro.h"
 #include "volume_control.h"
 #include "driver_manager.h"
-#include <sched.h>
+#include "cpu_affinity.h"
+#include "game_fps_monitor.h"
 #ifdef NDEBUG
 #define LOGD(...) ((void)0)
 #define LOGE(...) ((void)0)
@@ -37,73 +39,9 @@ int gTargetFPS = 120;
 // FPS 统计
 static int gFrameCount = 0;
 static float gCurrentFPS = 0.0f;
+static int gEffectiveFPS = 0;  // 实际生效的帧率（自适应后）
 static auto gLastFPSUpdateTime = std::chrono::steady_clock::now();
 
-// ═══════════════════════════════════════════
-//  CPU 核心亲和性：将进程绑定到小核心
-// ═══════════════════════════════════════════
-static cpu_set_t gBigCoreMask;
-
-static void SetupCpuAffinity() {
-    // 读取每个 CPU 核心的最大频率，区分大小核
-    int numCpus = sysconf(_SC_NPROCESSORS_CONF);
-    if (numCpus <= 0) numCpus = 8;
-
-    std::vector<std::pair<int, long>> cpuFreqs;  // {cpu_id, max_freq}
-    for (int i = 0; i < numCpus; i++) {
-        char path[128];
-        snprintf(path, sizeof(path),
-                 "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i);
-        FILE* f = fopen(path, "r");
-        long freq = 0;
-        if (f) {
-            fscanf(f, "%ld", &freq);
-            fclose(f);
-        }
-        cpuFreqs.push_back({i, freq});
-    }
-
-    // 找到最小和最大频率
-    long minFreq = LONG_MAX;
-    long maxFreq = 0;
-    for (const auto& p : cpuFreqs) {
-        if (p.second > 0) {
-            if (p.second < minFreq) minFreq = p.second;
-            if (p.second > maxFreq) maxFreq = p.second;
-        }
-    }
-
-    // 构建中大核心掩码：所有频率 > 最小频率的核心（排除小核心）
-    CPU_ZERO(&gBigCoreMask);
-    int bigCount = 0;
-    for (const auto& p : cpuFreqs) {
-        if (p.second > minFreq) {
-            CPU_SET(p.first, &gBigCoreMask);
-            bigCount++;
-        }
-    }
-
-    if (bigCount == 0 || bigCount == numCpus) {
-        // 无法区分大小核，不设置亲和性
-        LOGD("CPU affinity: cannot distinguish big/LITTLE (%d/%d), skipping\n",
-             bigCount, numCpus);
-        return;
-    }
-
-    // 绑定当前进程到中大核心（高性能核心）
-    if (sched_setaffinity(0, sizeof(cpu_set_t), &gBigCoreMask) == 0) {
-        LOGD("CPU affinity: bound process to %d big/medium cores (max_freq=%ld KHz)\n",
-             bigCount, maxFreq);
-        for (int i = 0; i < numCpus; i++) {
-            if (CPU_ISSET(i, &gBigCoreMask)) {
-                long freq = cpuFreqs[i].second;
-                LOGD("  Big/Medium core: CPU %d (freq=%ld KHz)\n", i, freq);
-            }
-        }
-    } else {
-        LOGD("CPU affinity: sched_setaffinity failed: %s\n", strerror(errno));
-    }
-}
 
 // 重新初始化所有组件（用于屏幕旋转后）
 void reinitializeAll() {
@@ -179,7 +117,7 @@ void reinitializeAll() {
 }
 
 // 在屏幕左下角显示 FPS
-static void DrawFPSCounter() {
+static void DrawFPSCounter(const game_fps_monitor::GameFPSStats& gameStats) {
     ImGuiIO& io = ImGui::GetIO();
 
     // 左下角位置（留出边距）
@@ -203,17 +141,41 @@ static void DrawFPSCounter() {
         // 显示 FPS（绿色文字）
         ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "FPS: %.1f", gCurrentFPS);
 
-        // 显示目标 FPS（灰色小字）
+        // 显示目标 FPS（灰色小字），如果自适应降低了则显示实际值
         ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "(Target: %d)", gTargetFPS);
+        if (gEffectiveFPS > 0 && gEffectiveFPS < gTargetFPS) {
+            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "(Limit: %d/%d)", gEffectiveFPS, gTargetFPS);
+        } else {
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "(Target: %d)", gTargetFPS);
+        }
+
+        // 显示游戏实际 FPS + 抖动诊断
+        if (gameStats.fps > 0.5f) {
+            // 使用从内存读取的游戏 FPS Level 判断（85% 作为阈值）
+            int gameTargetFPS = GetGameTargetFPS();
+            float threshold = gameTargetFPS * 0.9f;
+            bool isLowFPS = gameStats.fps < threshold;
+            ImVec4 fpsColor = isLowFPS ? ImVec4(1.0f, 0.0f, 0.0f, 1.0f) : ImVec4(0.0f, 1.0f, 0.0f, 1.0f);
+            ImGui::TextColored(fpsColor, "Game: %.0f", gameStats.fps);
+
+            // 显示 Jank 计数（红色，仅在有掉帧时显示）
+            if (gameStats.jank_count > 0) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "Jank: %d", gameStats.jank_count);
+            }
+
+            // 显示最大帧时间（黄色）
+            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Max: %.1fms", gameStats.frametime_max_ms);
+        }
     }
     ImGui::End();
 }
 
 
 int main() {
-    // 将所有线程绑定到中大核心（高性能核心），提升渲染性能
-    SetupCpuAffinity();
+    // 初始化 CPU 拓扑并将渲染主线程绑定到大核
+    InitCpuTopology();
+    SetThreadAffinity(CoreTier::BIG);
 
     displayInfo = android::ANativeWindowCreator::GetDisplayInfo();
 
@@ -239,7 +201,7 @@ int main() {
         LOGE("No touch device found!\n");
         return -1;
     }
-    std::thread volume_monitor(volume);
+    std::thread volume_monitor([]{ SetThreadAffinity(CoreTier::LITTLE); volume(); });
     volume_monitor.detach();
     IsToolActive.store(1);
     IsMenuOpen.store(1);
@@ -252,6 +214,11 @@ int main() {
 
     //Paradise_hook = new c_driver();
     StartReadThread();
+    InitAutoAim();
+
+    // 帧时间跟踪
+    auto lastFrameTime = std::chrono::steady_clock::now();
+
     // ── 主循环 ──
     while (IsToolActive == 1) {
 
@@ -304,6 +271,27 @@ int main() {
         // 4. 在 fence wait 前读取游戏数据（减少 8-16ms 延迟）
         GameFrameData gameData = ReadGameData();
 
+        // 4.5 等待引擎推进新帧（GFrameCounter 同步）
+        if (gameData.frameCounter != 0) {
+            static uint64_t sLastRenderedFrame = 0;
+            if (gameData.frameCounter == sLastRenderedFrame) {
+                auto waitDeadline = std::chrono::steady_clock::now()
+                    + std::chrono::microseconds(1000000 / std::max(gTargetFPS, 30));
+                while (std::chrono::steady_clock::now() < waitDeadline) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(200));
+                    uint64_t cur = ReadFrameCounter();
+                    if (cur != sLastRenderedFrame) {
+                        gameData.frameCounter = cur;
+                        break;
+                    }
+                }
+            }
+            // 仅在帧确实推进时更新，超时则保持旧值（下帧继续等待）
+            if (gameData.frameCounter != sLastRenderedFrame) {
+                sLastRenderedFrame = gameData.frameCounter;
+            }
+        }
+
         // 5. 等待 GPU pipeline 清空（首帧跳过，无上一帧需要等待）
         if (!firstFrame) {
             gImGui.waitForPreviousFrame(gApp);
@@ -324,11 +312,25 @@ int main() {
             gLastFPSUpdateTime = now;
         }
 
-        DrawObjectsWithData(gameData);  // 使用预读数据（延迟更低）
+        // 计算帧时间
+        auto currentFrameTime = std::chrono::steady_clock::now();
+        float frameDeltaTime = std::chrono::duration<float>(currentFrameTime - lastFrameTime).count();
+        lastFrameTime = currentFrameTime;
+
+        DrawObjectsWithData(gameData, frameDeltaTime);  // 使用预读数据 + 插值平滑
+
+        // 缓存游戏 FPS 统计（每帧一次，避免重复加锁）
+        auto gameStats = GetGameFPSStats();
+
+        // 自瞄更新
+        if (gAutoAim) {
+            gAutoAim->Update(frameDeltaTime);
+        }
+
         if (IsMenuOpen == 1)
             Draw_Menu();
 
-        DrawFPSCounter();  // 显示 FPS 计数器（左下角）
+        DrawFPSCounter(gameStats);  // 显示 FPS 计数器（左下角）
 
         if (IsToolActive == 0) {
             gImGui.endFrame();
@@ -339,25 +341,22 @@ int main() {
         gImGui.endFrame();
         gImGui.submitAndPresent(gApp);  // MAILBOX 模式非阻塞，降低延迟
 
-        // 7. 帧率控制
-        // MAILBOX present mode 非阻塞，需要主动限制帧率
-        // 仅在 gTargetFPS > 60 时才主动限制（避免超过屏幕刷新率）
-        if (gTargetFPS > 60) {
-            int effectiveFPS = gTargetFPS;
-            auto targetDuration = std::chrono::microseconds(1000000 / effectiveFPS);
+        // 7. 兜底限速（仅在 frameCounter 不可用时生效）
+        gEffectiveFPS = gTargetFPS;  // 保存供 FPS counter 显示
+        if (gameData.frameCounter == 0) {
+            auto targetDuration = std::chrono::microseconds(1000000 / gTargetFPS);
             nextFrameTime += targetDuration;
-
-            auto now = std::chrono::steady_clock::now();
-            if (nextFrameTime <= now) {
-                nextFrameTime = now + targetDuration;
-            } else {
-                std::this_thread::sleep_for(nextFrameTime - now);
-            }
+            auto nowTime = std::chrono::steady_clock::now();
+            if (nextFrameTime <= nowTime) nextFrameTime = nowTime + targetDuration;
+            else std::this_thread::sleep_for(nextFrameTime - nowTime);
         }
     }
 
     // ── 清理 ──
+    StopGameFPSMonitor();
+    ShutdownAutoAim();
     StopReadThread();
+    ShutdownDrawObjects();  // 清理绘制缓存
     gImGui.shutdown(gApp);
     ImGui_TextureLoaderShutdown(gApp);
     gApp.cleanup();
