@@ -1,0 +1,417 @@
+Class: SkeletalMeshComponent.SkinnedMeshComponent.MeshComponent.PrimitiveComponent.SceneComponent.ActorComponent.Object
+	byte AnimationMode;//[Offset: 0xae8, Size: 0x1]
+	class Object* AnimBlueprintGeneratedClass;//[Offset: 0xaf0, Size: 0x8]
+	class AnimInstance* AnimClass;//[Offset: 0xaf8, Size: 0x8]
+	bool bAutoInitAnimInstance;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0xb00, Size: 0x1]
+	AnimInstance* AnimScriptInstance;//[Offset: 0xb08, Size: 0x8]
+	AnimInstance*[] SubInstances;//[Offset: 0xb10, Size: 0x10]
+	AnimInstance*[] NewSubInstances;//[Offset: 0xb20, Size: 0x10]
+	AnimInstance*[] DirtySubInstances;//[Offset: 0xb30, Size: 0x10]
+	AnimInstance*[] StopTickSubInstances;//[Offset: 0xb40, Size: 0x10]
+	AnimInstance* PostProcessAnimInstance;//[Offset: 0xb50, Size: 0x8]
+	SingleAnimationPlayData AnimationData;//[Offset: 0xb58, Size: 0x18]
+	Transform[] CachedBoneSpaceTransforms;//[Offset: 0xba8, Size: 0x10]
+	Transform[] CachedComponentSpaceTransforms;//[Offset: 0xbb8, Size: 0x10]
+	float GlobalAnimRateScale;//[Offset: 0xbe8, Size: 0x4]
+	enum UseAsyncScene;//[Offset: 0xbec, Size: 0x1]
+	bool bHasValidBodies;//(ByteOffset: 0, ByteMask: 1, FieldMask: 1)[Offset: 0xbed, Size: 0x1]
+	byte KinematicBonesUpdateType;//[Offset: 0xbee, Size: 0x1]
+	int UpdateKinematicBonesRate;//[Offset: 0xbf0, Size: 0x4]
+	byte PhysicsTransformUpdateMode;//[Offset: 0xbf4, Size: 0x1]
+	bool bBlendPhysics;//(ByteOffset: 0, ByteMask: 1, FieldMask: 1)[Offset: 0xbf5, Size: 0x1]
+	bool bEnablePhysicsOnDedicatedServer;//(ByteOffset: 0, ByteMask: 2, FieldMask: 2)[Offset: 0xbf5, Size: 0x1]
+	bool bEnableCreatePhysicsOnDedicatedServer;//(ByteOffset: 0, ByteMask: 4, FieldMask: 4)[Offset: 0xbf5, Size: 0x1]
+	bool bNeedUpdatePhysicsTickRegisteredState;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0xbf6, Size: 0x1]
+	bool bUpdateJointsFromAnimation;//(ByteOffset: 0, ByteMask: 1, FieldMask: 1)[Offset: 0xbf7, Size: 0x1]
+	bool bDisableClothSimulation;//(ByteOffset: 0, ByteMask: 2, FieldMask: 2)[Offset: 0xbf7, Size: 0x1]
+	bool bAllowAnimCurveEvaluation;//(ByteOffset: 0, ByteMask: 4, FieldMask: 4)[Offset: 0xbf7, Size: 0x1]
+	bool bDisableAnimCurves;//(ByteOffset: 0, ByteMask: 8, FieldMask: 8)[Offset: 0xbf7, Size: 0x1]
+	FName[] DisallowedAnimCurves;//[Offset: 0xbf8, Size: 0x10]
+	bool bCollideWithEnvironment;//(ByteOffset: 0, ByteMask: 1, FieldMask: 1)[Offset: 0xc08, Size: 0x1]
+	bool bCollideWithAttachedChildren;//(ByteOffset: 0, ByteMask: 2, FieldMask: 2)[Offset: 0xc08, Size: 0x1]
+	bool bLocalSpaceSimulation;//(ByteOffset: 0, ByteMask: 4, FieldMask: 4)[Offset: 0xc08, Size: 0x1]
+	bool bClothMorphTarget;//(ByteOffset: 0, ByteMask: 8, FieldMask: 8)[Offset: 0xc08, Size: 0x1]
+	bool bResetAfterTeleport;//(ByteOffset: 0, ByteMask: 16, FieldMask: 16)[Offset: 0xc08, Size: 0x1]
+	float ClothBlendWeight;//[Offset: 0xc0c, Size: 0x4]
+	Vector RootBoneTranslation;//[Offset: 0xc14, Size: 0xc]
+	bool bDeferMovementFromSceneQueries;//(ByteOffset: 0, ByteMask: 1, FieldMask: 1)[Offset: 0xc20, Size: 0x1]
+	bool bNoSkeletonUpdate;//(ByteOffset: 0, ByteMask: 2, FieldMask: 2)[Offset: 0xc20, Size: 0x1]
+	bool bPauseAnims;//(ByteOffset: 0, ByteMask: 4, FieldMask: 4)[Offset: 0xc20, Size: 0x1]
+	bool bUseRefPoseOnInitAnim;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0xc21, Size: 0x1]
+	bool bEnablePerPolyCollision;//(ByteOffset: 0, ByteMask: 1, FieldMask: 1)[Offset: 0xc22, Size: 0x1]
+	BodySetup* BodySetup;//[Offset: 0xc28, Size: 0x8]
+	bool bForceRefpose;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0xc30, Size: 0x1]
+	bool bOnlyAllowAutonomousTickPose;//(ByteOffset: 0, ByteMask: 1, FieldMask: 1)[Offset: 0xc31, Size: 0x1]
+	bool bIsAutonomousTickPose;//(ByteOffset: 0, ByteMask: 2, FieldMask: 2)[Offset: 0xc31, Size: 0x1]
+	bool bOldForceRefPose;//(ByteOffset: 0, ByteMask: 4, FieldMask: 4)[Offset: 0xc31, Size: 0x1]
+	bool bShowPrePhysBones;//(ByteOffset: 0, ByteMask: 8, FieldMask: 8)[Offset: 0xc31, Size: 0x1]
+	bool bRequiredBonesUpToDate;//(ByteOffset: 0, ByteMask: 16, FieldMask: 16)[Offset: 0xc31, Size: 0x1]
+	bool bAnimTreeInitialised;//(ByteOffset: 0, ByteMask: 32, FieldMask: 32)[Offset: 0xc31, Size: 0x1]
+	bool bIncludeComponentLocationIntoBounds;//(ByteOffset: 0, ByteMask: 64, FieldMask: 64)[Offset: 0xc31, Size: 0x1]
+	bool bEnableLineCheckWithBounds;//(ByteOffset: 0, ByteMask: 128, FieldMask: 128)[Offset: 0xc31, Size: 0x1]
+	uint16 CachedAnimCurveUidVersion;//[Offset: 0xc32, Size: 0x2]
+	Vector LineCheckBoundsScale;//[Offset: 0xc34, Size: 0xc]
+	delegate OnConstraintBroken;//[Offset: 0xc48, Size: 0x10]
+	Transform[] SaveBoneSpaceTransfroms;//[Offset: 0xc58, Size: 0x10]
+	class ClothingSimulationFactory* ClothingSimulationFactory;//[Offset: 0xd58, Size: 0x8]
+	float TeleportDistanceThreshold;//[Offset: 0xd60, Size: 0x4]
+	float TeleportRotationThreshold;//[Offset: 0xd64, Size: 0x4]
+	delegate OnAnimInitialized;//[Offset: 0xe98, Size: 0x10]
+	delegate OnPreAnimClearScriptInstance;//[Offset: 0xea8, Size: 0x10]
+	delegate OnCompletePostAnimationEvaluationEnd;//[Offset: 0xeb8, Size: 0x10]
+	delegate DynamicMulticastDelegate_OnFinalizeBoneTransform;//[Offset: 0xec8, Size: 0x10]
+	bool bEnableUpdateOverlapsEvent;//(ByteOffset: 0, ByteMask: 1, FieldMask: 1)[Offset: 0xed8, Size: 0x1]
+	delegate OnSkeletalUpdateOverlapsEvent;//[Offset: 0xee0, Size: 0x10]
+	AnimSequence* SequenceToPlay;//[Offset: 0x1000, Size: 0x8]
+	AnimationAsset* AnimToPlay;//[Offset: 0x1008, Size: 0x8]
+	bool bDefaultLooping;//(ByteOffset: 0, ByteMask: 1, FieldMask: 1)[Offset: 0x1010, Size: 0x1]
+	bool bDefaultPlaying;//(ByteOffset: 0, ByteMask: 2, FieldMask: 2)[Offset: 0x1010, Size: 0x1]
+	float DefaultPosition;//[Offset: 0x1014, Size: 0x4]
+	float DefaultPlayRate;//[Offset: 0x1018, Size: 0x4]
+	uint32 LastPoseTickFrame;//[Offset: 0x101c, Size: 0x4]
+	float LastPoseTickTime;//[Offset: 0x1020, Size: 0x4]
+	bool bNeedsQueuedAnimEventsDispatched;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0x1058, Size: 0x1]
+	bool bIsNeedUpdate;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0x105a, Size: 0x1]
+	delegate OnMeshLODChangeDelegate;//[Offset: 0x1060, Size: 0x10]
+	bool bSkeletalMeshDirty;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0x1089, Size: 0x1]
+	FName BoneRetargetSource;//[Offset: 0x1090, Size: 0x8]
+	Transform MeshShiftTransform;//[Offset: 0x10a0, Size: 0x30]
+	FName MeshShiftRefBone;//[Offset: 0x10d0, Size: 0x8]
+	FName MeshShiftAnchorRefBone;//[Offset: 0x10d8, Size: 0x8]
+	bool bUseMeshShiftFeature;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0x10e0, Size: 0x1]
+	bool bOnlyPartOfShiftRefBoneAsRoot;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0x10e1, Size: 0x1]
+	enum MeshShiftCompensationType;//[Offset: 0x10e2, Size: 0x1]
+	SkeletalMeshComponent* MeshShiftCompensationBaseSkelComp;//[Offset: 0x10e4, Size: 0x8]
+	MeshShiftParam AnimOverrideMeshShiftParam;//[Offset: 0x10f0, Size: 0x10]
+	Vector DynamicBoneScaleFeature_Scale3D;//[Offset: 0x1120, Size: 0xc]
+	FName[] DynamicBoneScaleFeature_BoneNameList;//[Offset: 0x1130, Size: 0x10]
+	bool bUseDynamicBoneScaleFeature;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0x1140, Size: 0x1]
+	bool bIsOverrideScale;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0x1141, Size: 0x1]
+	bool bIsEnableBatchSection;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0x1142, Size: 0x1]
+	DynamicBatchSectionInfo[] BatchSectionList;//[Offset: 0x1148, Size: 0x10]
+	MaterialInterface*[] OriginalMaterials;//[Offset: 0x1158, Size: 0x10]
+	void UnbindClothFromMasterPoseComponent(bool bRestoreSimulationSpace);// 0xc92bff8
+	void SuspendClothingSimulation();// 0xc92bfe4
+	void Stop();// 0xc92bfd0
+	void SnapshotPose(out PoseSnapshot Snapshot);// 0xc92bf20
+	static void SingleNodeInstance_OverrideBoneRetargetParam(const bool InIsUseRetargetFeature, const bool InIsConsiderMasterPoseRetarget, const bool InIsForeceUseBaseSkeletonAsRetargetSource, SkeletalMeshComponent* InTargetSkelComp);// 0xc92bdd8
+	static void SingleNodeInstance_ActiveBoneRetargetFeature(const bool InIsActive, SkeletalMeshComponent* InTargetSkelComp);// 0xc92bd20
+	void SetUpdateAnimationInEditor(const bool NewUpdateState);// 0xc92bc9c
+	void SetTeleportRotationThreshold(float threshold);// 0xc92bc20
+	void SetTeleportDistanceThreshold(float threshold);// 0xc92bba4
+	void SetPosition(float InPos, bool bFireNotifies);// 0xc92bae4
+	void SetPlayRate(float Rate);// 0xc92ba68
+	void SetPhysicsBlendWeight(float PhysicsBlendWeight);// 0xc92b9ec
+	void SetNotifyRigidBodyCollisionBelow(bool bNewNotifyRigidBodyCollision, FName BoneName, bool bIncludeSelf);// 0xc92b8d8
+	void SetNeedUpdateChildTransformsOnFinalizeAnimationUpdate(bool bUpdate);// 0xc92b854
+	void SetMorphTarget(FName MorphTargetName, float Value, bool bRemoveZeroWeight);// 0xc92b758
+	void SetEnablePhysicsBlending(bool bNewBlendPhysics);// 0xc92b6d4
+	void SetEnableGravityOnAllBodiesBelow(bool bEnableGravity, FName BoneName, bool bIncludeSelf);// 0xc92b5c8
+	void SetEnableBodyGravity(bool bEnableGravity, FName BoneName);// 0xc92b500
+	void SetDisableAnimCurves(bool bInDisableAnimCurves);// 0xc92b47c
+	void SetConstraintProfileForAll(FName ProfileName, bool bDefaultIfNotFound);// 0xc92b3bc
+	void SetConstraintProfile(FName JointName, FName ProfileName, bool bDefaultIfNotFound);// 0xc92b2c4
+	void SetClothMaxDistanceScale(float Scale);// 0xc92b248
+	void SetBodyNotifyRigidBodyCollision(bool bNewNotifyRigidBodyCollision, FName BoneName);// 0xc92b178
+	void SetAnimInstanceClass(class Object NewClass, bool bTickAnimationNow);// 0xc92b0b8
+	void SetAnimationMode(byte InAnimationMode);// 0xc92b03c
+	void SetAnimation(AnimationAsset* NewAnimToPlay);// 0xc92afc0
+	void SetAngularLimits(FName InBoneName, float Swing1LimitAngle, float TwistLimitAngle, float Swing2LimitAngle);// 0xc92ae94
+	void SetAllowedAnimCurvesEvaluation(out const FName[] List, bool bAllow);// 0xc92adac
+	void SetAllowAnimCurveEvaluation(bool bInAllow);// 0xc92ad28
+	void SetAllMotorsAngularVelocityDrive(bool bEnableSwingDrive, bool bEnableTwistDrive, bool bSkipCustomPhysicsType);// 0xc92ac14
+	void SetAllMotorsAngularPositionDrive(bool bEnableSwingDrive, bool bEnableTwistDrive, bool bSkipCustomPhysicsType);// 0xc92ab00
+	void SetAllMotorsAngularDriveParams(float InSpring, float InDamping, float InForceLimit, bool bSkipCustomPhysicsType);// 0xc92a9cc
+	void SetAllBodiesSimulatePhysics(bool bNewSimulate);// 0xc92a948
+	void SetAllBodiesPhysicsBlendWeight(float PhysicsBlendWeight, bool bSkipCustomPhysicsType);// 0xc92a888
+	void SetAllBodiesBelowSimulatePhysics(out const FName InBoneName, bool bNewSimulate, bool bIncludeSelf);// 0xc92a768
+	void SetAllBodiesBelowPhysicsBlendWeight(out const FName InBoneName, float PhysicsBlendWeight, bool bSkipCustomPhysicsType, bool bIncludeSelf);// 0xc92a60c
+	void ResumeClothingSimulation();// 0xc92a5f8
+	void ResetClothTeleportMode();// 0xc92a5e4
+	void ResetAllowedAnimCurveEvaluation();// 0xc92a5d0
+	void ResetAllBodiesSimulatePhysics();// 0xc92a5bc
+	void PlayAnimation(AnimationAsset* NewAnimToPlay, bool bLooping);// 0xc92a4fc
+	void Play(bool bLooping);// 0xc92a478
+	void PerformDelayedInitRefreshPose();// 0xc92a45c
+	void PerformDelayedInitAnimTick();// 0xc92a440
+	void PauseIMSimulation(int InPauseFrameCount);// 0xc92a3c4
+	void OverrideAnimationData(AnimationAsset* InAnimToPlay, bool bIsLooping, bool bIsPlaying, float Position, float PlayRate);// 0xc92a244
+	void MarkMeshShiftFeature(const bool InIsUseShiftFeature, const bool InIsOnlyPartOfShiftRefBoneAsRoot, out const Transform InShiftTransform, const FName InShiftRefBone, const FName InAnchorRefBone);// 0xc92a090
+	void MarkMeshShiftCompensation(const enum InMeshShiftCompensationType, SkeletalMeshComponent* InCompensationBaseSkelComp);// 0xc929fd8
+	void MarkDynamicBoneScaleFeature(const bool InIsUseDynamicBoneScaleFeature, const bool InIsOverrideScale, out const FName[] InTargetBoneNameList, out const Vector InDynamicScale3D);// 0xc929e54
+	bool K2_GetClosestPointOnPhysicsAsset(out const Vector WorldPosition, out Vector ClosestWorldPosition, out Vector Normal, out FName BoneName, out float Distance);// 0xc929c58
+	bool IsSectionBatched(int LODIndex);// 0xc929bc0
+	bool IsPlaying();// 0xc929b88
+	bool IsInitRefreshPoseDelay();// 0xc929b48
+	bool IsInitAnimTickDelay();// 0xc929b08
+	static bool IsEnableAnimBoneStateDirtyFeature();// 0xc929ad0
+	bool IsClothingSimulationSuspended();// 0xc929a98
+	bool IsBodyGravityEnabled(FName BoneName);// 0xc929a08
+	bool HandleExistingParallelIMPhysicsEvaluationTask(bool bBlockOnTask);// 0xc929970
+	bool HandleExistingParallelEvaluationTask(bool bBlockOnTask, bool bPerformPostAnimEvaluation);// 0xc929894
+	float GetTeleportRotationThreshold();// 0xc929860
+	float GetTeleportDistanceThreshold();// 0xc92982c
+	AnimInstance*[] GetSubAnimInstances();// 0xc9297ac
+	AnimInstance*[] GetStopTickSubAnimInstances();// 0xc9296ec
+	Vector GetSkeletalCenterOfMass();// 0xc9296b4
+	Transform GetRetargetBoneRelativeTMInBaseRefPose(out const FName InTargetBoneName);// 0xc929600
+	float GetRawCurveValue(out const FName InCurveName);// 0xc929564
+	AnimInstance* GetPostProcessInstance();// 0xc929530
+	float GetPosition();// 0xc9294fc
+	float GetPlayRate();// 0xc9294c8
+	AnimInstance*[] GetNewSubAnimInstances();// 0xc929448
+	float GetMorphTarget(FName MorphTargetName);// 0xc9293bc
+	int64 GetLastPoseTickFrame_BP();// 0xc929388
+	bool GetDisableAnimCurves();// 0xc929364
+	AnimInstance*[] GetDirtySubAnimInstances();// 0xc9292e4
+	void GetCurrentJointAngles(FName InBoneName, out float Swing1Angle, out float TwistAngle, out float Swing2Angle);// 0xc929174
+	float GetClothMaxDistanceScale();// 0xc929140
+	Transform[] GetBoneSpaceTransfromsForCopy(SkeletalMeshComponent* Other);// 0xc929070
+	float GetBoneMass(FName BoneName, bool bScaleMass);// 0xc928fa0
+	AnimInstance* GetAnimInstance();// 0xc928f6c
+	float GetAnimationPosition(AnimationAsset* Animation);// 0xc928ee0
+	byte GetAnimationMode();// 0xc928eac
+	AnimInstance*[] GetAllSubAnimInstances();// 0xc928e2c
+	bool GetAllowedAnimCurveEvaluate();// 0xc928e0c
+	void ForceClothNextUpdateTeleportAndReset();// 0xc928df8
+	void ForceClothNextUpdateTeleport();// 0xc928de4
+	FName FindConstraintBoneName(int ConstraintIndex);// 0xc928d58
+	void DelayInitRefreshPose();// 0xc928d3c
+	void DelayInitAnimTick(out const DelayInitAnimTickParam InInitAnimTickParam);// 0xc928c78
+	void CopyBoneSpaceTransfroms(Transform[] InputTransforms);// 0xc928b9c
+	void ClearMorphTargets();// 0xc928b88
+	void ClearInterpolateBoneCache(float DurationTime);// 0xc928b0c
+	void BreakConstraint(Vector Impulse, Vector HitLocation, FName InBoneName);// 0xc928a08
+	void BindClothToMasterPoseComponent();// 0xc9289f4
+	void BatchSectionsWithAtlas(int LODIdx, bool IsBatchSection);// 0xc928934
+	void AutoBatchSection(int LODIdx, int[] BatchIndices, bool IsBatchSection);// 0xc9287d0
+	void AnimOverrideMeshShiftParam_Stop(out const MeshShiftParam InAnimMeshShiftParam);// 0xc928744
+	void AnimOverrideMeshShiftParam_Start(out const MeshShiftParam InAnimMeshShiftParam);// 0xc9286b8
+	void AllowAnimCurveEvaluation(FName NameOfCurve, bool bAllow);// 0xc9285f8
+	void AddStopTickSubAnimInstance(AnimInstance* NewInstance);// 0xc92857c
+	void AddNewSubAnimInstance(AnimInstance* NewInstance);// 0xc928500
+	void AddImpulseToAllBodiesBelow(Vector Impulse, FName BoneName, bool bVelChange, bool bIncludeSelf);// 0xc9283a8
+	void AddForceToAllBodiesBelow(Vector Force, FName BoneName, bool bAccelChange, bool bIncludeSelf);// 0xc928250
+	void AddDirtySubAnimInstance(AnimInstance* NewInstance);// 0xc9281d4
+	void AccumulateAllBodiesBelowPhysicsBlendWeight(out const FName InBoneName, float AddPhysicsBlendWeight, bool bSkipCustomPhysicsType);// 0xc9280bc
+
+-----------------------UE4-------------------------- 
+Class: SkinnedMeshComponent.MeshComponent.PrimitiveComponent.SceneComponent.ActorComponent.Object
+	SkeletalMesh* SkeletalMesh;//[Offset: 0x7f0, Size: 0x8]
+	SkinnedMeshComponent* MasterPoseComponent;//[Offset: 0x7f8, Size: 0x8]
+	Transform[] ComponentSpaceBoneExtraTransform;//[Offset: 0x800, Size: 0x10]
+	bool bUseBoundsFromMasterPoseComponent;//(ByteOffset: 0, ByteMask: 2, FieldMask: 2)[Offset: 0x890, Size: 0x1]
+	PhysicsAsset* PhysicsAssetOverride;//[Offset: 0x8b8, Size: 0x8]
+	bool bOverrideMinLod;//(ByteOffset: 0, ByteMask: 1, FieldMask: 1)[Offset: 0x8c0, Size: 0x1]
+	int ForcedLodModel;//[Offset: 0x8c4, Size: 0x4]
+	int MinLodModel;//[Offset: 0x8c8, Size: 0x4]
+	int MaxLodModel;//[Offset: 0x8cc, Size: 0x4]
+	bool[] LODDynamicMask;//[Offset: 0x8d0, Size: 0x10]
+	SkelMeshComponentLODInfo[] LODInfo;//[Offset: 0x8f0, Size: 0x10]
+	float StreamingDistanceMultiplier;//[Offset: 0x900, Size: 0x4]
+	Color WireframeColor;//[Offset: 0x904, Size: 0x4]
+	bool bForceWireframe;//(ByteOffset: 0, ByteMask: 1, FieldMask: 1)[Offset: 0x908, Size: 0x1]
+	bool bDisplayBones;//(ByteOffset: 0, ByteMask: 2, FieldMask: 2)[Offset: 0x908, Size: 0x1]
+	bool bDisableMorphTarget;//(ByteOffset: 0, ByteMask: 4, FieldMask: 4)[Offset: 0x908, Size: 0x1]
+	bool bHideSkin;//(ByteOffset: 0, ByteMask: 8, FieldMask: 8)[Offset: 0x908, Size: 0x1]
+	bool bPerBoneMotionBlur;//(ByteOffset: 0, ByteMask: 1, FieldMask: 1)[Offset: 0x920, Size: 0x1]
+	byte UpdateBoundsRate;//[Offset: 0x921, Size: 0x1]
+	bool bComponentUseFixedSkelBounds;//(ByteOffset: 0, ByteMask: 1, FieldMask: 1)[Offset: 0x923, Size: 0x1]
+	bool bConsiderAllBodiesForBounds;//(ByteOffset: 0, ByteMask: 2, FieldMask: 2)[Offset: 0x923, Size: 0x1]
+	bool bFixCachedLocalBoundsIssue;//(ByteOffset: 0, ByteMask: 4, FieldMask: 4)[Offset: 0x923, Size: 0x1]
+	byte MeshComponentUpdateFlag;//[Offset: 0x924, Size: 0x1]
+	bool NeedUpdateEveryFrame;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0x925, Size: 0x1]
+	bool NeedRateTickWhenNoRender;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0x926, Size: 0x1]
+	bool bIndirectLightingCachePositionUsingActorPosition;//(ByteOffset: 0, ByteMask: 1, FieldMask: 1)[Offset: 0x927, Size: 0x1]
+	bool bForceMeshObjectUpdate;//(ByteOffset: 0, ByteMask: 2, FieldMask: 2)[Offset: 0x927, Size: 0x1]
+	bool bCanHighlightSelectedSections;//(ByteOffset: 0, ByteMask: 1, FieldMask: 1)[Offset: 0x934, Size: 0x1]
+	bool bRecentlyRendered;//(ByteOffset: 0, ByteMask: 2, FieldMask: 2)[Offset: 0x934, Size: 0x1]
+	byte CustomSortAlternateIndexMode;//[Offset: 0x935, Size: 0x1]
+	bool bCastCapsuleDirectShadow;//(ByteOffset: 0, ByteMask: 1, FieldMask: 1)[Offset: 0x936, Size: 0x1]
+	bool bCastCapsuleIndirectShadow;//(ByteOffset: 0, ByteMask: 2, FieldMask: 2)[Offset: 0x936, Size: 0x1]
+	float CapsuleIndirectShadowMinVisibility;//[Offset: 0x938, Size: 0x4]
+	bool bCPUSkinning;//(ByteOffset: 0, ByteMask: 1, FieldMask: 1)[Offset: 0x93c, Size: 0x1]
+	BoxSphereBounds CachedLocalBounds;//[Offset: 0x954, Size: 0x1c]
+	bool bCachedLocalBoundsUpToDate;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0x970, Size: 0x1]
+	bool bEnableUpdateRateOptimizations;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0x971, Size: 0x1]
+	bool bDisplayDebugUpdateRateOptimizations;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0x972, Size: 0x1]
+	bool bRenderStatic;//(ByteOffset: 0, ByteMask: 1, FieldMask: 1)[Offset: 0x973, Size: 0x1]
+	bool bUseBoneVisibilityPropagateFeature;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0x974, Size: 0x1]
+	bool bOverrideAnimUpdateRateParameters;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0x988, Size: 0x1]
+	bool bOverrideAnimUpdateRateParameters_ByComponent;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0x989, Size: 0x1]
+	bool bRunWithOverrideAnimUpdateRateParameters;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0x98a, Size: 0x1]
+	AnimUpdateRateParameters CustomAnimUpdateRateParams;//[Offset: 0x990, Size: 0xa8]
+	void UpdateSkinWeightForRemapping(SkinWeightInfoForFPP WeightInfo);// 0xc933a28
+	void UnloadSkinWeightProfile(FName InProfileName);// 0xc9339ac
+	void UnHideBoneByName(FName BoneName);// 0xc933930
+	void TransformToBoneSpace(FName BoneName, Vector InPosition, Rotator InRotation, out Vector OutPosition, out Rotator OutRotation);// 0xc933780
+	void TransformFromBoneSpace(FName BoneName, Vector InPosition, Rotator InRotation, out Vector OutPosition, out Rotator OutRotation);// 0xc9335d0
+	void SwitchToOverrideSkinWeights(int LODIndex);// 0xc933554
+	void SetVertexColorOverride_LinearColor(int LODIndex, out const LinearColor[] VertexColors);// 0xc933480
+	bool SetSkinWeightProfile(FName InProfileName);// 0xc9333f0
+	void SetSkinWeightOverride(int LODIndex, out const SkelMeshSkinWeightInfo[] SkinWeights);// 0xc93331c
+	void SetSkeletalMesh(SkeletalMesh* NewMesh, bool bReinitPose, bool bCheckBoneMap, bool bTickAnimationNow);// 0xc9331c4
+	void SetRenderStatic(bool bNewValue);// 0xc933140
+	void SetPhysicsAsset(PhysicsAsset* NewPhysicsAsset, bool bForceReInit);// 0xc933078
+	void SetMinLOD(int InNewMinLOD);// 0xc932ffc
+	void SetMasterPoseComponent(SkinnedMeshComponent* NewMasterBoneComponent, bool bForceUpdate);// 0xc932f3c
+	void SetForcedLOD(int InNewForcedLOD);// 0xc932ec0
+	void SetCastCapsuleIndirectShadow(bool bNewValue);// 0xc932e3c
+	void SetCastCapsuleDirectShadow(bool bNewValue);// 0xc932db8
+	void SetCapsuleIndirectShadowMinVisibility(float NewValue);// 0xc932d3c
+	int ScaleBoneExtraOffsprings(FName InputBoneName, Vector InputScale);// 0xc932c6c
+	int RotateBoneExtraOffsprings(FName InputBoneName, Rotator InputRotation);// 0xc932b9c
+	void RemoveMasterPoseComponent();// 0xc932b88
+	void RefreshUpdateRateParamsEnsureTrackerOrder();// 0xc932b74
+	void RefreshUpdateRateParams();// 0xc932b60
+	void PropagateBoneUnHidden(int BoneIndex);// 0xc932ae4
+	void PropagateBoneHidden(int BoneIndex, byte PhysBodyOption);// 0xc932a2c
+	void OnSkinnedMeshComponentMeshInited__DelegateSignature(int PredicatedLOD);// 0xffffff86e53b7300
+	void OnSkinnedMeshComponentLODResourceUpdated__DelegateSignature(int PredicatedLOD);// 0xffffff86e53b7300
+	int OffsetBoneExtraOffsprings(FName InputBoneName, Vector InputTranslation);// 0xc93295c
+	bool IsUsingSkinWeightProfile();// 0xc93293c
+	bool IsSectionBatched(int LODIndex);// 0xc9328a4
+	bool IsBoneHiddenByName(FName BoneName);// 0xc932814
+	void InvalidateCachedBounds();// 0xc932800
+	void HideBoneByName(FName BoneName, byte PhysBodyOption);// 0xc932748
+	bool HasSkinweightProfileByName(FName InProfileName);// 0xc9326b0
+	FName GetSocketBoneName(FName InSocketName);// 0xc932624
+	SkeletalMesh* GetSkeletalMesh();// 0xc9325e8
+	FName GetParentBone(FName BoneName);// 0xc93255c
+	int GetNumLODs();// 0xc932528
+	int GetNumBones();// 0xc9324f4
+	FName GetCurrentSkinWeightProfileName();// 0xc9324d8
+	Transform GetBoneTransform(int BoneIndex);// 0xc932434
+	FName GetBoneName(int BoneIndex);// 0xc9323a8
+	Vector GetBoneLocation(FName BoneName, byte Space);// 0xc9322dc
+	int GetBoneIndex(FName BoneName);// 0xc932250
+	void FollowBoneUnHidden(SkinnedMeshComponent* InUnHiddenLeaderComp, FName BoneName);// 0xc932194
+	void FollowBoneHidden(SkinnedMeshComponent* InHiddenLeaderComp, FName BoneName, byte PhysBodyOption);// 0xc93209c
+	FName FindClosestBone_K2(Vector TestLocation, out Vector BoneLocation, float IgnoreScale, bool bRequirePhysicsAsset);// 0xc931f34
+	void EnableMeshClipPlane(out const Plane ClipPlane, int PlaneIndex);// 0xc931e54
+	void EnableMeshClipArc(out const Plane ClipPlane, out const Vector4 ClipSphere);// 0xc931d5c
+	void EnableMeshClip4Planes(out const Plane[] ClipPlanes, bool bBox);// 0xc931c6c
+	void DisableMeshClipPlane(int PlaneIndex);// 0xc931be8
+	void DisableMeshClipArc();// 0xc931bcc
+	void DisableMeshClip4Planes();// 0xc931bb0
+	void ClearVertexColorOverride(int LODIndex);// 0xc931b34
+	void ClearSkinWeightProfile();// 0xc931b20
+	void ClearSkinWeightOverride(int LODIndex);// 0xc931aa4
+	void ClearBoneExtraOffset();// 0xc931a90
+	bool BoneIsChildOf(FName BoneName, FName ParentBoneName);// 0xc9319c8
+
+-----------------------UE4-------------------------- 
+Class: MeshComponent.PrimitiveComponent.SceneComponent.ActorComponent.Object
+	MaterialInterface*[] OverrideMaterials;//[Offset: 0x7a8, Size: 0x10]
+	MaterialInterface* OverlayMaterial;//[Offset: 0x7b8, Size: 0x8]
+	MaterialInterface*[] IndexedOverlayMaterials;//[Offset: 0x7c0, Size: 0x10]
+	bool bUseIndexedOverlayMaterials;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0x7d0, Size: 0x1]
+	bool bUseOverlayMaterials;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0x7d1, Size: 0x1]
+	float OverlayMaterialMaxDrawDistance;//[Offset: 0x7d4, Size: 0x4]
+	bool bIsEnableRetrieveDefaultMat;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0x7e9, Size: 0x1]
+	void SetVectorParameterValueOnMaterials(const FName ParameterName, const Vector ParameterValue);// 0xc8aec8c
+	void SetUseOverlayMaterials(bool bNewUseOverlayMaterials);// 0xc8aec08
+	void SetUseIndexedOverlayMaterials(bool bNewUseIndexedOverlayMaterials);// 0xc8aeb84
+	void SetScalarParameterValueOnMaterials(const FName ParameterName, const float ParameterValue);// 0xc8aeacc
+	void SetOverlayMaterialMaxDrawDistance(float InMaxDrawDistance);// 0xc8aea50
+	void SetOverlayMaterial(MaterialInterface* NewOverlayMaterial);// 0xc8ae9d4
+	void SetIndexedOverlayMaterial(int ElementIndex, MaterialInterface* Material);// 0xc8ae91c
+	void PrestreamTextures(float Seconds, bool bPrioritizeCharacterTextures, int CinematicTextureGroups);// 0xc8ae810
+	bool IsMaterialSlotNameValid(FName MaterialSlotName);// 0xc8ae778
+	bool GetUseOverlayMaterials();// 0xc8ae740
+	bool GetUseIndexedOverlayMaterials();// 0xc8ae708
+	MaterialInterface* GetOverlayMaterial();// 0xc8ae6d4
+	FName[] GetMaterialSlotNames();// 0xc8ae64c
+	MaterialInterface*[] GetMaterials();// 0xc8ae5c4
+	int GetMaterialIndex(FName MaterialSlotName);// 0xc8ae530
+	MaterialInterface*[] GetIndexedOverlayMaterials();// 0xc8ae4b0
+	void EnableMeshClipPlane(out const Plane ClipPlane, int PlaneIndex);// 0xc8ae3d0
+	void EnableMeshClipArc(out const Plane ClipPlane, out const Vector4 ClipSphere);// 0xc8ae2d8
+	void EnableMeshClip4Planes(out const Plane[] ClipPlanes, bool bBox);// 0xc8ae1e8
+	void DisableMeshClipPlane(int PlaneIndex);// 0xc8ae164
+	void DisableMeshClipArc();// 0xc8ae148
+	void DisableMeshClip4Planes();// 0xc8ae12c
+
+-----------------------UE4-------------------------- 
+Class: SkeletalMesh.Object
+	Skeleton* Skeleton;//[Offset: 0x48, Size: 0x8]
+	bool bAllowCPUAccess;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0x50, Size: 0x1]
+	bool bForceAllowCPUAccess;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0x51, Size: 0x1]
+	int EncodeBits_Position;//[Offset: 0x54, Size: 0x4]
+	int EncodeBits_TexCoord;//[Offset: 0x58, Size: 0x4]
+	int EncodeBits_Normal;//[Offset: 0x5c, Size: 0x4]
+	int EncodeBits_Generic;//[Offset: 0x60, Size: 0x4]
+	int EncodeBits_VertexColor;//[Offset: 0x64, Size: 0x4]
+	int EncodeSpeed;//[Offset: 0x68, Size: 0x4]
+	int DecodeSpeed;//[Offset: 0x6c, Size: 0x4]
+	BoxSphereBounds ImportedBounds;//[Offset: 0x70, Size: 0x1c]
+	BoxSphereBounds ExtendedBounds;//[Offset: 0x8c, Size: 0x1c]
+	Vector PositiveBoundsExtension;//[Offset: 0xa8, Size: 0xc]
+	Vector NegativeBoundsExtension;//[Offset: 0xb4, Size: 0xc]
+	bool bIsStreamable;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0xc0, Size: 0x1]
+	bool bCompressData;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0xc1, Size: 0x1]
+	Vector IndirectLightingCachePositionOffset;//[Offset: 0xc4, Size: 0xc]
+	SkeletalMaterial[] Materials;//[Offset: 0x150, Size: 0x10]
+	MaterialInterface* ReplaceMaterialInterface;//[Offset: 0x160, Size: 0x8]
+	BoneMirrorInfo[] SkelMirrorTable;//[Offset: 0x168, Size: 0x10]
+	byte SkelMirrorAxis;//[Offset: 0x178, Size: 0x1]
+	byte SkelMirrorFlipAxis;//[Offset: 0x179, Size: 0x1]
+	float CullingScreenSize;//[Offset: 0x17c, Size: 0x4]
+	SkeletalMeshLODInfo[] LODInfo;//[Offset: 0x180, Size: 0x10]
+	bool bUseAnyLODFeature;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0x190, Size: 0x1]
+	MeshPerLODBiasArray[] PerLODBiasTypeInfo;//[Offset: 0x198, Size: 0x10]
+	bool bUseLODBiasExt;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0x1a8, Size: 0x1]
+	bool bAutoUpdateLODBiasExt;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0x1a9, Size: 0x1]
+	MeshLODBiasCondition[] PerLODBiasTypeInfoExt;//[Offset: 0x1b0, Size: 0x10]
+	bool bUseFullPrecisionUVs;//(ByteOffset: 0, ByteMask: 1, FieldMask: 1)[Offset: 0x1c0, Size: 0x1]
+	bool bUsedWithDynamicInstancing;//(ByteOffset: 0, ByteMask: 2, FieldMask: 2)[Offset: 0x1c0, Size: 0x1]
+	bool bHasBeenSimplified;//(ByteOffset: 0, ByteMask: 4, FieldMask: 4)[Offset: 0x1c0, Size: 0x1]
+	bool bHasVertexColors;//(ByteOffset: 0, ByteMask: 8, FieldMask: 8)[Offset: 0x1c0, Size: 0x1]
+	bool bEnablePerPolyCollision;//(ByteOffset: 0, ByteMask: 16, FieldMask: 16)[Offset: 0x1c0, Size: 0x1]
+	bool bEnableSelfCollision;//(ByteOffset: 0, ByteMask: 32, FieldMask: 32)[Offset: 0x1c0, Size: 0x1]
+	BodySetup* BodySetup;//[Offset: 0x1c8, Size: 0x8]
+	PhysicsAsset* PhysicsAsset;//[Offset: 0x1d0, Size: 0x8]
+	PhysicsAsset* ShadowPhysicsAsset;//[Offset: 0x1d8, Size: 0x8]
+	NodeMappingContainer*[] NodeMappingData;//[Offset: 0x1e0, Size: 0x10]
+	bool LodModelsHasSkinweight;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0x1f0, Size: 0x1]
+	MorphTarget*[] MorphTargets;//[Offset: 0x1f8, Size: 0x10]
+	ClothingAssetData_Legacy[] ClothingAssets;//[Offset: 0x378, Size: 0x10]
+	class AnimInstance* PostProcessAnimBlueprint;//[Offset: 0x388, Size: 0x8]
+	ClothingAssetBase*[] MeshClothingAssets;//[Offset: 0x390, Size: 0x10]
+	AssetUserData*[] AssetUserData;//[Offset: 0x3a0, Size: 0x10]
+	SkeletalMeshSocket*[] Sockets;//[Offset: 0x3b8, Size: 0x10]
+	FName TemplateRetargetSource;//[Offset: 0x3d8, Size: 0x8]
+	SkinWeightProfileInfo[] SkinWeightProfiles;//[Offset: 0x3e0, Size: 0x10]
+	int NumSockets();// 0xc926cf0
+	bool IsSectionUsingCloth(int InSectionIndex, bool bCheckCorrespondingSections);// 0xc926c1c
+	SkeletalMeshSocket* GetSocketByIndex(int Index);// 0xc926b90
+	Transform[] GetRefBonePose();// 0xc926b08
+	FName[] GetRefBoneInfo();// 0xc926a7c
+	NodeMappingContainer* GetNodeMappingContainer(Blueprint* SourceAsset);// 0xc9269f0
+	BoxSphereBounds GetImportedBounds();// 0xc9269a4
+	BoxSphereBounds GetBounds();// 0xc926958
+	SkeletalMeshSocket* FindSocketAndIndex(FName InSocketName, out int OutIndex);// 0xc926880
+	SkeletalMeshSocket* FindSocket(FName InSocketName);// 0xc9267f4
+	void AddDynamicSocket(SkeletalMeshSocket* InSocket);// 0xc926778
+
+-----------------------UE4-------------------------- 
+Class: Skeleton.Object
+	BoneNode[] BoneTree;//[Offset: 0x30, Size: 0x10]
+	<FName,OverrideBoneTranslationRetargetingModeConfig> OverrideBoneTranslationRetargetingModeConfigMap;//[Offset: 0x40, Size: 0x50]
+	Transform[] RefLocalPoses;//[Offset: 0x90, Size: 0x10]
+	Guid VirtualBoneGuid;//[Offset: 0x1b0, Size: 0x10]
+	VirtualBone[] VirtualBones;//[Offset: 0x1c0, Size: 0x10]
+	Skeleton*[] CompatibleSkeletons;//[Offset: 0x1d0, Size: 0x10]
+	<FName,FName> CustomSkeletonNameMap;//[Offset: 0x1e0, Size: 0x50]
+	<FName,BoneOffset> SkeletonNotOffsetName;//[Offset: 0x230, Size: 0x50]
+	FName[] RefBoneNames;//[Offset: 0x280, Size: 0x10]
+	SkinWeightInfoForFPP[] ExcludeBoneInfos;//[Offset: 0x290, Size: 0x10]
+	FName[] ExcludeBoneNameForAvatar;//[Offset: 0x2a0, Size: 0x10]
+	bool bIsFPPSkeleton;//(ByteOffset: 0, ByteMask: 1, FieldMask: 255)[Offset: 0x2b0, Size: 0x1]
+	SkeletalMeshSocket*[] Sockets;//[Offset: 0x2b8, Size: 0x10]
+	SmartNameContainer SmartNames;//[Offset: 0x318, Size: 0x50]
+	BlendProfile*[] BlendProfiles;//[Offset: 0x380, Size: 0x10]
+	AnimSlotGroup[] SlotGroups;//[Offset: 0x390, Size: 0x10]
+	AssetUserData*[] AssetUserData;//[Offset: 0x468, Size: 0x10]
+	void AddCompatibleSkeletonSoft(out const Skeleton* SourceSkeleton);// 0xc931088
+	void AddCompatibleSkeleton(const Skeleton* SourceSkeleton);// 0xc93100c

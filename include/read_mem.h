@@ -54,6 +54,9 @@ struct CachedActor {
     int teamID = -1;        // 队伍 ID（UAECharacter::TeamID），-1 表示未知
     int boneMap[BONE_COUNT]; // 骨骼ID → CST数组索引，-1表示未找到
     bool boneMapBuilt = false;  // 标记骨骼映射是否已构建
+    uint64_t skelMeshCompAddr = 0;  // 缓存 SkeletalMeshComponent 地址（静态，避免每帧读取）
+    uint64_t boneDataPtr = 0;       // 缓存 ComponentSpaceTransforms.Data（静态）
+    int cachedBoneCount = 0;        // 缓存 ComponentSpaceTransforms.Num（静态）
 
     CachedActor() : actorAddr(0), rootCompAddr(0), actorType(ActorType::OTHER) {
         for (int i = 0; i < BONE_COUNT; i++) {
@@ -101,3 +104,6 @@ void ClearScanResults();
 
 // 初始化 driver（UI 线程调用）
 void InitDriver(const char* packageName, uint64_t& libUE4Out);
+
+// 获取游戏目标 FPS（从 FPS Level 读取）
+int GetGameTargetFPS();

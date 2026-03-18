@@ -36,6 +36,7 @@ static const std::pair<int, int> kBoneConnections[] = {
 bool gShowObjects = true;
 bool gShowAllClassNames = false;
 bool gUseBatchBoneRead = true;  // 默认使用批量读取（优化模式）
+bool gEnableBoneSmoothing = false;  // 默认关闭，避免骨骼视觉上慢半拍
 int gBoneCount = 0;
 float gMaxSkeletonDistance = 200.0f;  // 默认 200 米，超过不绘制骨骼
 
@@ -156,11 +157,13 @@ void DrawObjectsWithData(const GameFrameData& data, float renderDeltaTime) {
     if (!gShowObjects) return;
     if (!data.valid) return;
 
+    // 每帧重建屏幕骨骼缓存，避免 auto-aim 读取到上一帧残留坐标。
+    gBoneScreenCache.clear();
+
     // 定期清理缓存（每 2 秒，假设 60 FPS）
     static int cleanupCounter = 0;
     if (++cleanupCounter >= 120) {
         cleanupCounter = 0;
-        gBoneScreenCache.clear();
         // 清理过期的插值缓存（超过 120 帧未更新的 actor）
         for (auto it = gBoneWorldCache.begin(); it != gBoneWorldCache.end(); ) {
             if (data.frameCounter > it->second.lastFrameCounter + 120) {
@@ -176,6 +179,14 @@ void DrawObjectsWithData(const GameFrameData& data, float renderDeltaTime) {
 
     // VP 矩阵直接使用帧数据中读取的（每帧一次，不再高频轮询）
     const FMatrix& vpToUse = data.VPMat;
+
+    if (gShowAllClassNames) {
+        auto allActors = GetCachedActors();
+        if (!allActors || allActors->empty()) return;
+        DrawObjectsWithDataInternal(*allActors, vpToUse, data.localPlayerPos,
+                                    data.frameCounter, renderDeltaTime);
+        return;
+    }
 
     // 获取分类后的 actor 列表
     auto classified = GetClassifiedActors();
@@ -223,14 +234,15 @@ static void DrawObjectsWithDataInternal(
             continue;
         }
 
-        // 使用预分类的 displayName（读取线程已完成类名比对）
+        // 默认只显示 ClassNameMap 中已映射的对象。
+        // 只有开启“显示所有类名”时，才回退显示原始 className。
         const char* label = nullptr;
         if (!ca.displayName.empty()) {
             label = ca.displayName.c_str();
-        } else if (!ca.className.empty()) {
-            label = ca.className.c_str();  // 没有 displayName 时使用 className
+        } else if (gShowAllClassNames && !ca.className.empty()) {
+            label = ca.className.c_str();
         } else {
-            continue;  // 无任何名称，跳过
+            continue;
         }
 
         // 检查是否有骨骼映射（使用 boneMapBuilt 标志）
@@ -295,6 +307,11 @@ static void DrawObjectsWithDataInternal(
         Vec3 bottomLabelWorldPos = Vec3::Zero(); // 根骨骼位置（绘制距离）
         bool hasTopLabel = false;
         bool hasBottomLabel = false;
+
+        // 无骨骼对象也给一个基于 actor 原点的文本锚点，确保“显示所有类名”能覆盖整个 actor 数组。
+        topLabelWorldPos = actorPos;
+        topLabelWorldPos.Z += 10.0f;
+        hasTopLabel = true;
 
         if (drawSkeleton) {
             // 屏幕外剔除：先用 actor 位置做粗略检测，屏幕外跳过骨骼读取
@@ -374,9 +391,11 @@ static void DrawObjectsWithDataInternal(
                         // 查找/创建插值缓存
                         auto& cache = gBoneWorldCache[ca.actorAddr];
 
-                        // 插值系数：渲染帧率高于引擎帧率时平滑过渡
-                        // lerpFactor 越小越平滑，越大越跟手
-                        float lerpFactor = std::min(1.0f, renderDeltaTime * 20.0f);  // ~20Hz 收敛速度
+                        float lerpFactor = 1.0f;
+                        if (gEnableBoneSmoothing) {
+                            // lerpFactor 越小越平滑，越大越跟手。
+                            lerpFactor = std::min(1.0f, renderDeltaTime * 35.0f);
+                        }
 
                         for (int boneID = 0; boneID < BONE_COUNT; boneID++) {
                             if (ca.boneMap[boneID] < 0) continue;
@@ -390,7 +409,7 @@ static void DrawObjectsWithDataInternal(
                             };
 
                             // 插值平滑：与上一帧缓存位置做 lerp
-                            if (cache.initialized && cache.valid[boneID]) {
+                            if (gEnableBoneSmoothing && cache.initialized && cache.valid[boneID]) {
                                 Vec3 prev = cache.positions[boneID];
                                 // 距离过大说明瞬移/传送，不插值
                                 float dist = Vec3::Distance(prev, worldPos);
@@ -447,6 +466,7 @@ static void DrawObjectsWithDataInternal(
                         bsd.distance = distance;
                         bsd.teamID = ca.teamID;
                         bsd.actorAddr = ca.actorAddr;
+                        bsd.frameCounter = engineFrame;
                         bsd.valid = true;
 
                         gBoneScreenCache[ca.actorAddr] = bsd;
@@ -456,18 +476,19 @@ static void DrawObjectsWithDataInternal(
         }
 
         // 绘制 Top Label（名称）
-        if (gDrawName && hasTopLabel && !ca.playerName.empty()) {
+        if (gDrawName && hasTopLabel) {
             Vec2 topLabelScreenPos;
             if (WorldToScreen(topLabelWorldPos, VPMat, io.DisplaySize.x, io.DisplaySize.y, topLabelScreenPos)) {
                 ImVec2 labelPos(topLabelScreenPos.x, topLabelScreenPos.y);
                 ImU32 teamColor = GetTeamColor(ca.teamID);
 
-                // 构建显示文本：[队伍ID] 玩家名
                 char displayName[256];
-                if (ca.teamID >= 0) {
+                if (!ca.playerName.empty() && ca.teamID >= 0) {
                     snprintf(displayName, sizeof(displayName), "[%d] %s", ca.teamID, ca.playerName.c_str());
-                } else {
+                } else if (!ca.playerName.empty()) {
                     snprintf(displayName, sizeof(displayName), "%s", ca.playerName.c_str());
+                } else {
+                    snprintf(displayName, sizeof(displayName), "%s", label);
                 }
 
                 // 使用字体指针直接缩放（更明显的效果）

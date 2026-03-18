@@ -20,12 +20,14 @@ struct BoneScreenData {
     float distance;
     int teamID;
     uint64_t actorAddr;
+    uint64_t frameCounter;
     bool valid;
 };
 
 extern bool gShowObjects;
 extern bool gShowAllClassNames;
 extern bool gUseBatchBoneRead;  // true=批量读取（优化），false=逐个读取（调试）
+extern bool gEnableBoneSmoothing;  // true=骨骼插值平滑，false=低延迟直出
 extern int gBoneCount;
 extern float gMaxSkeletonDistance;  // 超过此距离不绘制骨骼（米）
 

@@ -29,4 +29,11 @@ public:
     void endFrame();
     void uploadFonts(VulkanApp& app);
     void testRender(VulkanApp& app);
+
+    // 拆分 frame_render 为两阶段，降低数据读取到显示的延迟
+    void waitForPreviousFrame(VulkanApp& app);
+    void submitAndPresent(VulkanApp& app);
+
+private:
+    uint32_t currentFrameIndex = 0; // waitForPreviousFrame 计算，submitAndPresent 使用
 };

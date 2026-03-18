@@ -1,8 +1,11 @@
 #include "read_mem.h"
+#include "cpu_affinity.h"
+#include "game_fps_monitor.h"
 #include <android/log.h>
 #include <thread>
 #include <chrono>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <memory>
 #include <string>
@@ -17,6 +20,7 @@
 
 extern std::atomic<bool> IsToolActive;
 extern int gTargetFPS;  // 从 main.cpp 导入
+extern bool gShowAllClassNames;  // 从 draw_objects.cpp 导入
 
 // 双缓冲实例
 FrameSynchronizer<ReadFrameData> gFrameSync;
@@ -45,10 +49,17 @@ static const std::unordered_map<std::string, ClassInfo> kClassNameMap = {
     {"BP_PlayerPawn_C",         {"玩家", ActorType::PLAYER}},
 
     // 载具
-    {"BP_Vehicle_C",            {"载具", ActorType::VEHICLE}},
-    {"BP_Car_C",                {"汽车", ActorType::VEHICLE}},
-    {"BP_Helicopter_C",         {"直升机", ActorType::VEHICLE}},
-
+    {"VH_4SportCar_C",            {"敞篷跑车", ActorType::VEHICLE}},
+    {"BP_VH_Buggy_C",                {"双人赛车", ActorType::VEHICLE}},
+    {"VH_Dacia_New_C",         {"轿车", ActorType::VEHICLE}},
+    {"VH_UZA01_New_C",         {"吉普", ActorType::VEHICLE}},
+    {"VH_CoupeRB_1_C",         {"轿跑", ActorType::VEHICLE}},
+    {"VH_Drift_001_New_C",         {"拉力赛车", ActorType::VEHICLE}},
+    {"VH_Horse_1_C",         {"马", ActorType::VEHICLE}},
+    {"VH_PG117_C",         {"快艇", ActorType::VEHICLE}},
+    {"VH_BROM_C",         {"装甲车", ActorType::VEHICLE}},
+    {"PickUp_02_C",         {"小货车", ActorType::VEHICLE}},
+    {"VH_StationWagon_New_C",         {"旅行车", ActorType::VEHICLE}},
     // 其他（道具、NPC等）
     // 用户按需填充
 };
@@ -182,48 +193,18 @@ void InitDriver(const char* packageName, uint64_t& libUE4Out) {
         printf("[+] pid = %d\n", pid);
         libUE4Out = Paradise_hook->get_module_base("libUE4.so");
         sLibUE4 = libUE4Out;
+        address.libUE4 = libUE4Out;  // 保存到 address 结构体
         if(libUE4Out){
             printf("libUE4: %lx\n",libUE4Out);
         }
 
+        StartGameFPSMonitor(packageName);
+        EnableMemoryMode(true);  // 启用内存读取模式
+
         address.Matrix = Paradise_hook->read<uint64_t>(
             Paradise_hook->read<uint64_t>(libUE4Out + offset.CanvasMap) + 0x20) + 0x270;
 
-        // 读取 Gworld
-        uint64_t gworld = Paradise_hook->read<uint64_t>(libUE4Out + offset.Gworld);
-
-        // 获取本地玩家 actor（从 Gworld 获取 NetDriver）
-        if (gworld != 0) {
-            uint64_t netDriver = Paradise_hook->read<uint64_t>(gworld + offset.NetDriver);
-
-            if (netDriver != 0) {
-                // 尝试 ServerConnection（客户端）
-                uint64_t serverConnection = Paradise_hook->read<uint64_t>(netDriver + offset.ServerConnection);
-
-                uint64_t connection = 0;
-                if (serverConnection != 0) {
-                    connection = serverConnection;
-                } else {
-                    // 回退到 ClientConnections[0]（服务器/单机）
-                    uint64_t clientConnectionsArray = netDriver + 0x90;
-                    uint64_t clientConnectionsData = Paradise_hook->read<uint64_t>(clientConnectionsArray);
-                    int clientConnectionsCount = Paradise_hook->read<int>(clientConnectionsArray + 0x8);
-
-                    if (clientConnectionsData != 0 && clientConnectionsCount > 0) {
-                        connection = Paradise_hook->read<uint64_t>(clientConnectionsData);
-                    }
-                }
-
-                if (connection != 0) {
-                    // NetConnection 继承自 Player，直接获取 PlayerController
-                    uint64_t playerController = Paradise_hook->read<uint64_t>(connection + offset.PlayerController);
-
-                    if (playerController != 0) {
-                        address.LocalPlayerActor = Paradise_hook->read<uint64_t>(playerController + offset.AcknowledgedPawn);
-                    }
-                }
-            }
-        }
+        // LocalPlayerActor 由读取线程定期刷新（每 ~10 次扫描）
 
         // 启动读取线程
         StartReadThread();
@@ -375,20 +356,14 @@ static int GetFPSFromLevel(int fpsLevel) {
     }
 }
 
-// FPS Level → 读取间隔映射 (ms)
-static int GetReadIntervalFromFPSLevel(int fpsLevel) {
-    switch (fpsLevel) {
-        case 2: return 50;   // 20fps → 50ms 间隔
-        case 3: return 40;   // 25fps → 40ms 间隔
-        case 4: return 33;   // 30fps → 33ms 间隔
-        case 5: return 25;   // 40fps → 25ms 间隔
-        case 6: return 16;   // 60fps → 16ms 间隔
-        case 7: return 11;   // 90fps → 11ms 间隔
-        case 8: return 8;    // 120fps → 8ms 间隔
-        case 9: return 7;    // 144fps → 7ms 间隔
-        default: return 16;  // 默认 60fps
-    }
+// 获取游戏目标 FPS（供外部调用）
+int GetGameTargetFPS() {
+    int fpsLevel = gGameFPSLevel.load(std::memory_order_relaxed);
+    return GetFPSFromLevel(fpsLevel);
 }
+
+// FPS Level → 读取间隔（已废弃，读取线程固定 500ms）
+// GetReadIntervalFromFPSLevel 不再使用
 
 static std::mutex gActorListMtx;
 static std::shared_ptr<ClassifiedActors> gClassifiedActors =
@@ -414,57 +389,83 @@ std::shared_ptr<std::vector<CachedActor>> GetCachedActors() {
 }
 
 static void readThreadFunc() {
-    // 保存上一次扫描的 actor 列表，用于保留已构建的骨骼映射
-    static std::unordered_map<uint64_t, CachedActor> previousActors;
+    SetThreadAffinity(CoreTier::MEDIUM);
 
-    // FPS Level 读取计数器（每 10 次扫描读取一次 FPS Level）
-    int fpsLevelReadCounter = 0;
+    // 上一次的 uworld 地址，用于检测 world 切换
+    uint64_t prevUworld = 0;
 
     while (gReadThreadRunning.load(std::memory_order_relaxed)) {
         if (driver_stat.load(std::memory_order_acquire) <= 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
             continue;
-        }
-
-        // 每 10 次扫描读取一次游戏 FPS Level（减少开销）
-        if (fpsLevelReadCounter++ >= 10) {
-            int newFPSLevel = ReadGameFPSLevel();
-            gGameFPSLevel.store(newFPSLevel, std::memory_order_relaxed);
-
-            // 自动设置 gTargetFPS 以匹配游戏帧率
-            int newTargetFPS = GetFPSFromLevel(newFPSLevel);
-            gTargetFPS = newTargetFPS;
-
-            fpsLevelReadCounter = 0;
-            LOGI("Game FPS Level updated: %d -> Target FPS: %d", newFPSLevel, newTargetFPS);
         }
 
         ReadFrameData frame;
 
+        // ── 每次扫描都读取 uworld（检测 world 切换）──
         frame.uworld = Paradise_hook->read<uint64_t>(sLibUE4 + offset.Gworld);
         if (frame.uworld == 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
             continue;
         }
+
+        // 检测 world 切换 → 清空 name 缓存
+        if (frame.uworld != prevUworld) {
+            nameCache.clear();
+            nameCache.clear();
+            prevUworld = frame.uworld;
+        }
+
+        // ── 每次扫描都刷新低频数据 ──
+
+        // 刷新游戏 FPS Level
+        int newFPSLevel = ReadGameFPSLevel();
+        gGameFPSLevel.store(newFPSLevel, std::memory_order_relaxed);
+        gTargetFPS = GetFPSFromLevel(newFPSLevel);
+
+        // 刷新 LocalPlayerActor
+        uint64_t netDriver = Paradise_hook->read<uint64_t>(frame.uworld + offset.NetDriver);
+        if (netDriver != 0) {
+            uint64_t serverConnection = Paradise_hook->read<uint64_t>(netDriver + offset.ServerConnection);
+            uint64_t connection = 0;
+            if (serverConnection != 0) {
+                connection = serverConnection;
+            } else {
+                uint64_t clientConnectionsArray = netDriver + 0x90;
+                uint64_t clientConnectionsData = Paradise_hook->read<uint64_t>(clientConnectionsArray);
+                int clientConnectionsCount = Paradise_hook->read<int>(clientConnectionsArray + 0x8);
+                if (clientConnectionsData != 0 && clientConnectionsCount > 0) {
+                    connection = Paradise_hook->read<uint64_t>(clientConnectionsData);
+                }
+            }
+            if (connection != 0) {
+                uint64_t playerController = Paradise_hook->read<uint64_t>(connection + offset.PlayerController);
+                if (playerController != 0) {
+                    address.LocalPlayerActor = Paradise_hook->read<uint64_t>(playerController + offset.AcknowledgedPawn);
+                }
+            }
+        }
+
+        // ── Actor 列表扫描 ──
         frame.persistentLevel = Paradise_hook->read<uint64_t>(frame.uworld + offset.PersistentLevel);
         uint64_t TArray = Paradise_hook->read<uint64_t>(frame.persistentLevel + offset.TArray);
         frame.actorCount = Paradise_hook->read<int>(frame.persistentLevel + offset.TArray + 0x8);
         if (frame.actorCount <= 0) frame.actorCount = 0;
 
-        // 扫描 actor 列表，缓存地址 + RootComponent 指针
-        std::vector<CachedActor> newActors;
-        newActors.reserve(frame.actorCount);
-
         std::vector<uint64_t> ptrBuf(frame.actorCount);
         Paradise_hook->read(TArray, ptrBuf.data(), frame.actorCount * sizeof(uint64_t));
+
+        std::vector<CachedActor> newActors;
+        newActors.reserve(frame.actorCount);
 
         for (int i = 0; i < frame.actorCount; i++) {
             uint64_t addr = ptrBuf[i];
             if (addr <= 0x10000000 || addr == 0 || addr % 4 != 0 || addr >= 0x10000000000)
                 continue;
+
+            // 每次都完整读取，不使用缓存
             uint64_t rootComp = Paradise_hook->read<uint64_t>(addr + offset.RootComponent);
 
-            // 读取 actor 类名（2 次 ioctl，nameCache 自动缓存重复类名）
             std::string className;
             uint64_t classPtr = Paradise_hook->read<uint64_t>(addr + 0x10);
             if (classPtr != 0) {
@@ -472,28 +473,20 @@ static void readThreadFunc() {
                 className = GetNameByIndex(classNameIdx, sLibUE4);
             }
 
-            // 在读取线程中分类 actor（减少渲染线程工作量）
             auto [displayName, actorType] = ClassifyActor(className);
-
-            // 如果不在映射表中（displayName 为空），跳过该 actor
-            if (displayName.empty()) {
-                continue;
-            }
+            // 不过滤任何 actor，即使不在映射表中也保留（使用 className 显示）
 
             CachedActor ca(addr, rootComp, std::move(className), std::move(displayName), actorType);
 
-            // 读取 PlayerName（FString: ptr+0x0=TCHAR* Data, ptr+0x8=int32 Num）
             {
                 uint64_t fstringData = Paradise_hook->read<uint64_t>(addr + offset.PlayerName);
                 int32_t fstringLen = Paradise_hook->read<int32_t>(addr + offset.PlayerName + 0x8);
                 if (fstringData != 0 && fstringLen > 0 && fstringLen < 128) {
-                    // UE4 FString 存储 UTF-16LE
                     std::vector<char16_t> utf16buf(fstringLen);
                     Paradise_hook->read(fstringData, utf16buf.data(), fstringLen * sizeof(char16_t));
-                    // 简易 UTF-16 → UTF-8 转换（仅 BMP 字符）
                     std::string name;
                     name.reserve(fstringLen * 3);
-                    for (int j = 0; j < fstringLen - 1; j++) {  // -1 跳过 null terminator
+                    for (int j = 0; j < fstringLen - 1; j++) {
                         char16_t c = utf16buf[j];
                         if (c == 0) break;
                         if (c < 0x80) {
@@ -511,39 +504,35 @@ static void readThreadFunc() {
                 }
             }
 
-            // 读取 TeamID
             ca.teamID = Paradise_hook->read<int32_t>(addr + offset.TeamID);
 
-            // 检查是否已有该 actor 的骨骼映射（从上次扫描中恢复）
-            auto prevIt = previousActors.find(addr);
-            if (prevIt != previousActors.end() && prevIt->second.boneMapBuilt && prevIt->second.className == className) {
-                // 复用已构建的骨骼映射
-                std::copy(std::begin(prevIt->second.boneMap), std::end(prevIt->second.boneMap), std::begin(ca.boneMap));
-                ca.boneMapBuilt = true;
-            } else {
-                // 只为尚未构建骨骼映射的 actor 构建
-                uint64_t skelMeshComp = Paradise_hook->read<uint64_t>(addr + offset.SkeletalMeshComponent);
-                if (skelMeshComp != 0) {
-                    uint64_t skelMesh = Paradise_hook->read<uint64_t>(skelMeshComp + offset.SkeletalMesh);
-                    if (skelMesh != 0) {
-                        // 读取 RefBoneInfo
-                        uint64_t boneInfoPtr = Paradise_hook->read<uint64_t>(skelMesh + offset.RefBoneInfo);
-                        int boneInfoCount = Paradise_hook->read<int>(skelMesh + offset.RefBoneInfo + 0x8);
+            uint64_t skelMeshComp = Paradise_hook->read<uint64_t>(addr + offset.SkeletalMeshComponent);
+            if (skelMeshComp != 0) {
+                ca.skelMeshCompAddr = skelMeshComp;
+                int boneCount = Paradise_hook->read<int>(skelMeshComp + offset.ComponentSpaceTransforms + 0x8);
+                uint64_t boneDataPtr = Paradise_hook->read<uint64_t>(skelMeshComp + offset.ComponentSpaceTransforms);
+                if (boneCount > 0 && boneCount < 300 && boneDataPtr != 0) {
+                    ca.cachedBoneCount = boneCount;
+                    ca.boneDataPtr = boneDataPtr;
+                }
 
-                        if (boneInfoCount > 0 && boneInfoCount < 300) {
-                            constexpr int kBoneInfoStride = 0x10;
-                            for (int j = 0; j < boneInfoCount; j++) {
-                                int32_t nameIndex = Paradise_hook->read<int32_t>(boneInfoPtr + j * kBoneInfoStride);
-                                std::string boneName = GetNameByIndex(nameIndex, sLibUE4);
+                uint64_t skelMesh = Paradise_hook->read<uint64_t>(skelMeshComp + offset.SkeletalMesh);
+                if (skelMesh != 0) {
+                    uint64_t boneInfoPtr = Paradise_hook->read<uint64_t>(skelMesh + offset.RefBoneInfo);
+                    int boneInfoCount = Paradise_hook->read<int>(skelMesh + offset.RefBoneInfo + 0x8);
 
-                                // 查找是否在映射表中
-                                auto it = gBoneNameToID.find(boneName);
-                                if (it != gBoneNameToID.end()) {
-                                    ca.boneMap[it->second] = j;  // 记录该骨骼在 CST 数组中的索引
-                                }
+                    if (boneInfoCount > 0 && boneInfoCount < 300) {
+                        constexpr int kBoneInfoStride = 0x10;
+                        for (int j = 0; j < boneInfoCount; j++) {
+                            int32_t nameIndex = Paradise_hook->read<int32_t>(boneInfoPtr + j * kBoneInfoStride);
+                            std::string boneName = GetNameByIndex(nameIndex, sLibUE4);
+
+                            auto it = gBoneNameToID.find(boneName);
+                            if (it != gBoneNameToID.end()) {
+                                ca.boneMap[it->second] = j;
                             }
-                            ca.boneMapBuilt = true;  // 标记为已构建
                         }
+                        ca.boneMapBuilt = true;
                     }
                 }
             }
@@ -551,15 +540,7 @@ static void readThreadFunc() {
             newActors.push_back(std::move(ca));
         }
 
-        // 更新 previousActors 映射（保留骨骼映射供下次扫描使用）
-        previousActors.clear();
-        for (const auto& actor : newActors) {
-            if (actor.boneMapBuilt) {
-                previousActors[actor.actorAddr] = actor;
-            }
-        }
-
-        // 按类型分类 actor（在读取线程中完成，减少渲染线程工作量）
+        // 分类
         auto classified = std::make_shared<ClassifiedActors>();
         for (auto& actor : newActors) {
             switch (actor.actorType) {
@@ -580,29 +561,17 @@ static void readThreadFunc() {
             gClassifiedActors = classified;
         }
 
-        // 提交基本信息供 UI 显示
         frame.valid = true;
         gFrameSync.submit(frame);
 
-        // 根据游戏 FPS Level 动态调整扫描间隔
-        int fpsLevel = gGameFPSLevel.load(std::memory_order_relaxed);
-        int intervalMs = GetReadIntervalFromFPSLevel(fpsLevel);
-        std::this_thread::sleep_for(std::chrono::milliseconds(intervalMs));
+        // 固定 500ms 扫描间隔
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 }
 
 void StartReadThread() {
     if (gReadThreadRunning.load()) return;
     gReadThreadRunning.store(true);
-
-    // 启动时立即读取一次游戏 FPS Level 并设置 Target FPS
-    if (Paradise_hook && driver_stat.load(std::memory_order_relaxed) > 0) {
-        int initialFPSLevel = ReadGameFPSLevel();
-        gGameFPSLevel.store(initialFPSLevel, std::memory_order_relaxed);
-        gTargetFPS = GetFPSFromLevel(initialFPSLevel);
-        LOGI("Initial Game FPS Level: %d -> Target FPS: %d", initialFPSLevel, gTargetFPS);
-    }
-
     gReadThread = std::thread(readThreadFunc);
 }
 
@@ -953,6 +922,6 @@ void FindSettingConfigViaGameInstance() {
         printf(" (Invalid)\n");
     }
 
-    printf("Read interval will be: %dms\n", GetReadIntervalFromFPSLevel(fpsLevel));
+    printf("Read interval: 500ms (fixed)\n");
     fflush(stdout);
 }

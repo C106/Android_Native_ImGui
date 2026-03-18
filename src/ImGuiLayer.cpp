@@ -31,6 +31,16 @@ void ImGuiLayer::init(ANativeWindow* new_window, VulkanApp& app) {
     ImGui::Spectrum::StyleColorsSpectrum();
     window = new_window;
 
+    // 触摸优化：增大控件尺寸和间距
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.ItemSpacing = ImVec2(12.0f, 10.0f);        // 默认 8x4 -> 12x10
+    style.ItemInnerSpacing = ImVec2(8.0f, 8.0f);     // 默认 4x4 -> 8x8
+    style.FramePadding = ImVec2(8.0f, 10.0f);        // 默认 4x8 -> 8x10
+    style.GrabMinSize = 20.0f;                       // 默认 12 -> 20
+    style.GrabRounding = 6.0f;                       // 默认 4 -> 6
+    style.TouchExtraPadding = ImVec2(4.0f, 4.0f);    // 默认 0x0 -> 4x4
+    style.ScrollbarSize = 18.0f;                     // 默认 14 -> 18
+
     // Android 平台初始化
     if (!ImGui_ImplAndroid_Init(window)) {
         LOGE( "Failed to initialize ImGui Android backend");
@@ -171,43 +181,42 @@ void ImGuiLayer::endFrame() {
     ImGui::Render();
 }
 
-void ImGuiLayer::frame_render(VulkanApp& app) {
-    if (!initialized) {
-        LOGI("ImGui not initialized, skipping frame_render");
-        return;
-    }
+void ImGuiLayer::waitForPreviousFrame(VulkanApp& app) {
+    if (!initialized) return;
 
-    uint32_t frameIndex = app.currentFrame % app.maxFramesInFlight;
+    currentFrameIndex = app.currentFrame % app.maxFramesInFlight;
 
-    // -------------------------
-    // 1) 等待当前帧的 fence（新的同步方式）
-    // -------------------------
-    VkResult r = vkWaitForFences(app.device, 1, &app.inFlightFences[frameIndex], VK_TRUE, UINT64_MAX);
+    VkResult r = vkWaitForFences(app.device, 1, &app.inFlightFences[currentFrameIndex], VK_TRUE, UINT64_MAX);
     if (r != VK_SUCCESS) {
-        LOGE( "Frame fence wait failed: %d", r);
+        LOGE("Frame fence wait failed: %d", r);
+    }
+}
+
+void ImGuiLayer::submitAndPresent(VulkanApp& app) {
+    if (!initialized) {
+        LOGI("ImGui not initialized, skipping submitAndPresent");
         return;
     }
 
+    uint32_t frameIndex = currentFrameIndex;
+
     // -------------------------
-    // 2) 获取下一张 swapchain image（使用 0 超时避免阻塞）
+    // 1) 获取下一张 swapchain image（阻塞等待，fence 已确保 pipeline 有空间）
     // -------------------------
     uint32_t imageIndex = UINT32_MAX;
-    r = vkAcquireNextImageKHR(app.device, app.swapchain, 0,  // 0 超时：非阻塞
+    VkResult r = vkAcquireNextImageKHR(app.device, app.swapchain, UINT64_MAX,
                               app.imageAvailableSemaphores[frameIndex], VK_NULL_HANDLE, &imageIndex);
 
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) {
         app.swapchainRebuildRequired = true;
         return;
-    } else if (r == VK_NOT_READY || r == VK_TIMEOUT) {
-        // 图像暂时不可用，跳过本帧（避免阻塞）
-        return;
     } else if (r != VK_SUCCESS) {
-        LOGE( "Acquire image failed: %d", r);
+        LOGE("Acquire image failed: %d", r);
         return;
     }
 
     // -------------------------
-    // 3) 新的同步方式：只在需要时等待图像
+    // 2) 同步：只在需要时等待图像
     // -------------------------
     if (app.imagesInFlight[imageIndex] != VK_NULL_HANDLE) {
         vkWaitForFences(app.device, 1, &app.imagesInFlight[imageIndex], VK_TRUE, UINT64_MAX);
@@ -218,7 +227,7 @@ void ImGuiLayer::frame_render(VulkanApp& app) {
     vkResetFences(app.device, 1, &app.inFlightFences[frameIndex]);
 
     // -------------------------
-    // 4) 录制命令缓冲
+    // 3) 录制命令缓冲
     // -------------------------
     VkCommandBuffer cmd = app.frames[frameIndex].cmd;
     VkCommandPool cmdPool = app.frames[frameIndex].cmdPool;
@@ -236,7 +245,7 @@ void ImGuiLayer::frame_render(VulkanApp& app) {
     VkRenderPassBeginInfo rpbi{};
     rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     rpbi.renderPass = app.renderPass;
-    rpbi.framebuffer = app.swapchainFramebuffers[imageIndex]; // 使用独立的 framebuffer 数组
+    rpbi.framebuffer = app.swapchainFramebuffers[imageIndex];
     rpbi.renderArea.offset = { 0, 0 };
     rpbi.renderArea.extent = gSwapchainExtent;
     rpbi.clearValueCount = 1;
@@ -251,12 +260,10 @@ void ImGuiLayer::frame_render(VulkanApp& app) {
     }
 
     vkCmdEndRenderPass(cmd);
-   
     vkEndCommandBuffer(cmd);
 
-
     // -------------------------
-    // 5) 提交（修复同步）
+    // 4) 提交
     // -------------------------
     VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkSubmitInfo submitInfo{};
@@ -271,12 +278,12 @@ void ImGuiLayer::frame_render(VulkanApp& app) {
 
     r = vkQueueSubmit(app.graphicsQueue, 1, &submitInfo, app.inFlightFences[frameIndex]);
     if (r != VK_SUCCESS) {
-        LOGE( "Queue submit failed: %d", r);
+        LOGE("Queue submit failed: %d", r);
         return;
     }
 
     // -------------------------
-    // 6) Present
+    // 5) Present
     // -------------------------
     VkPresentInfoKHR presentInfo{};
     presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -290,13 +297,18 @@ void ImGuiLayer::frame_render(VulkanApp& app) {
     if (present_result == VK_ERROR_OUT_OF_DATE_KHR || present_result == VK_SUBOPTIMAL_KHR) {
         app.swapchainRebuildRequired = true;
     } else if (present_result != VK_SUCCESS) {
-        LOGE( "Present failed: %d", present_result);
+        LOGE("Present failed: %d", present_result);
     }
 
     // -------------------------
-    // 7) 前进到下一帧
+    // 6) 前进到下一帧
     // -------------------------
     app.currentFrame++;
+}
+
+void ImGuiLayer::frame_render(VulkanApp& app) {
+    waitForPreviousFrame(app);
+    submitAndPresent(app);
 }
 
 void ImGuiLayer::testRender(VulkanApp& app) {

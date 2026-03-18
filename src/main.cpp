@@ -271,27 +271,6 @@ int main() {
         // 4. 在 fence wait 前读取游戏数据（减少 8-16ms 延迟）
         GameFrameData gameData = ReadGameData();
 
-        // 4.5 等待引擎推进新帧（GFrameCounter 同步）
-        if (gameData.frameCounter != 0) {
-            static uint64_t sLastRenderedFrame = 0;
-            if (gameData.frameCounter == sLastRenderedFrame) {
-                auto waitDeadline = std::chrono::steady_clock::now()
-                    + std::chrono::microseconds(1000000 / std::max(gTargetFPS, 30));
-                while (std::chrono::steady_clock::now() < waitDeadline) {
-                    std::this_thread::sleep_for(std::chrono::microseconds(200));
-                    uint64_t cur = ReadFrameCounter();
-                    if (cur != sLastRenderedFrame) {
-                        gameData.frameCounter = cur;
-                        break;
-                    }
-                }
-            }
-            // 仅在帧确实推进时更新，超时则保持旧值（下帧继续等待）
-            if (gameData.frameCounter != sLastRenderedFrame) {
-                sLastRenderedFrame = gameData.frameCounter;
-            }
-        }
-
         // 5. 等待 GPU pipeline 清空（首帧跳过，无上一帧需要等待）
         if (!firstFrame) {
             gImGui.waitForPreviousFrame(gApp);
@@ -341,9 +320,9 @@ int main() {
         gImGui.endFrame();
         gImGui.submitAndPresent(gApp);  // MAILBOX 模式非阻塞，降低延迟
 
-        // 7. 兜底限速（仅在 frameCounter 不可用时生效）
+        // 7. targetFPS 限速
         gEffectiveFPS = gTargetFPS;  // 保存供 FPS counter 显示
-        if (gameData.frameCounter == 0) {
+        if (gTargetFPS > 0) {
             auto targetDuration = std::chrono::microseconds(1000000 / gTargetFPS);
             nextFrameTime += targetDuration;
             auto nowTime = std::chrono::steady_clock::now();

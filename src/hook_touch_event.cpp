@@ -2,6 +2,7 @@
 #include "imgui.h"
 #include "ANativeWindowCreator.h"
 #include <android/log.h>
+#include <poll.h>
 
 #ifdef NDEBUG
 #define LOGI(...) ((void)0)
@@ -179,6 +180,20 @@ void process_input_event(int fd) {
     static int x = 0, y = 0;
     static bool pressed = false;
 
+    // 使用 poll() 检查是否有数据可读，避免 busy-wait
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+
+    // 使用非阻塞 poll，避免不必要的内核唤醒
+    int ret = poll(&pfd, 1, 0);
+    if (ret <= 0) {
+        // 无数据或错误，直接返回
+        return;
+    }
+
+    // 有数据可读，批量处理所有可用事件
     struct input_event ev;
     while (read(fd, &ev, sizeof(ev)) > 0) {
         if (ev.type == EV_ABS) {

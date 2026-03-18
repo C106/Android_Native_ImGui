@@ -41,7 +41,7 @@ struct VulkanApp {
     std::vector<VkSemaphore> imageAvailableSemaphores;
     std::vector<VkSemaphore> renderFinishedSemaphores;
     std::vector<VkFence> inFlightFences;
-    uint32_t maxFramesInFlight = 2; // 限制并行帧数
+    uint32_t maxFramesInFlight = 1; // 降低 pipeline 深度，减少延迟
 
     bool swapchainRebuildRequired = false;
 
