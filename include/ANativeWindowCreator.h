@@ -16,6 +16,7 @@
 #include <chrono>
 #include <algorithm>
 #include <unistd.h>
+#include <jni.h>
 #define ResolveMethod(ClassName, MethodName, Handle, MethodSignature)                                                                    \
     ClassName##__##MethodName = reinterpret_cast<decltype(ClassName##__##MethodName)>(symbolMethod.Find(Handle, MethodSignature));       \
     if (nullptr == ClassName##__##MethodName)                                                                                            \
@@ -414,15 +415,19 @@ namespace android
                 if (nullptr == data || nullptr == surface)
                     return;
 
+                void *surfaceRef = reinterpret_cast<Surface *>(reinterpret_cast<size_t>(surface) - sizeof(std::max_align_t) / 2);
+
                 // 清理镜像层
                 if (mirrorData != nullptr) {
-                    Functionals::GetInstance().RefBase__DecStrong(mirrorData, this);
+                    // mirrorData is retained with itself as the strong-ref id to avoid
+                    // RefBase rejecting transient stack addresses.
+                    Functionals::GetInstance().RefBase__DecStrong(mirrorData, mirrorData);
                     mirrorData = nullptr;
                 }
 
-                Functionals::GetInstance().RefBase__DecStrong(reinterpret_cast<Surface *>(reinterpret_cast<size_t>(surface) - sizeof(std::max_align_t) / 2), this);
+                Functionals::GetInstance().RefBase__DecStrong(surfaceRef, surfaceRef);
                 DisConnect();
-                Functionals::GetInstance().RefBase__DecStrong(data, this);
+                Functionals::GetInstance().RefBase__DecStrong(data, data);
             }
         };
 
@@ -464,29 +469,211 @@ namespace android
             }
         };
 
+        // 通过 JNI 获取 StatusBar 窗口 Token 的 SurfaceControl，用于 reparent
+        // 仅在 system_server 进程内有效（system uid = 1000）
+        struct StatusBarReparent
+        {
+            // 获取 StatusBar WindowToken 的 native SurfaceControl 指针
+            // 路径: WMS.mRoot → DisplayContent → DisplayPolicy.mStatusBar → parent (WindowToken) → SurfaceControl.mNativeObject
+            static void* FindStatusBarTokenSurfaceControl()
+            {
+                // 1. 获取 JavaVM
+                typedef jint (*GetVMs_t)(JavaVM**, jsize, jsize*);
+                auto getVMs = reinterpret_cast<GetVMs_t>(dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs"));
+                if (!getVMs) {
+                    __android_log_print(ANDROID_LOG_WARN, "ImGui", "[-] StatusBar: JNI_GetCreatedJavaVMs not found");
+                    return nullptr;
+                }
+
+                JavaVM* vm = nullptr;
+                jsize vmCount = 0;
+                if (getVMs(&vm, 1, &vmCount) != JNI_OK || !vm || vmCount == 0) {
+                    __android_log_print(ANDROID_LOG_WARN, "ImGui", "[-] StatusBar: No JavaVM available");
+                    return nullptr;
+                }
+
+                JNIEnv* env = nullptr;
+                bool needDetach = false;
+                jint envResult = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+                if (envResult == JNI_EDETACHED) {
+                    if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK) return nullptr;
+                    needDetach = true;
+                } else if (envResult != JNI_OK) {
+                    return nullptr;
+                }
+
+                void* result = nullptr;
+
+                // lambda: 统一清理
+                auto clearException = [&]() {
+                    if (env->ExceptionCheck()) env->ExceptionClear();
+                };
+
+                do {
+                    // 2. 检查是否在 system_server（尝试加载 WMS 类）
+                    jclass wmsClass = env->FindClass("com/android/server/wm/WindowManagerService");
+                    if (!wmsClass || env->ExceptionCheck()) {
+                        clearException();
+                        __android_log_print(ANDROID_LOG_WARN, "ImGui", "[-] StatusBar: Not in system_server, cannot access WMS");
+                        break;
+                    }
+
+                    // 3. 通过 ServiceManager 获取 window 服务（在同进程中就是 WMS 实例本身）
+                    jclass smClass = env->FindClass("android/os/ServiceManager");
+                    if (!smClass) { clearException(); break; }
+
+                    jmethodID getService = env->GetStaticMethodID(smClass, "getService",
+                        "(Ljava/lang/String;)Landroid/os/IBinder;");
+                    if (!getService) { clearException(); break; }
+
+                    jstring wmStr = env->NewStringUTF("window");
+                    jobject wms = env->CallStaticObjectMethod(smClass, getService, wmStr);
+                    env->DeleteLocalRef(wmStr);
+                    if (!wms || env->ExceptionCheck()) { clearException(); break; }
+
+                    // 4. WMS.mRoot → RootWindowContainer
+                    jfieldID mRootField = env->GetFieldID(wmsClass, "mRoot",
+                        "Lcom/android/server/wm/RootWindowContainer;");
+                    if (!mRootField || env->ExceptionCheck()) { clearException(); break; }
+
+                    jobject root = env->GetObjectField(wms, mRootField);
+                    if (!root) break;
+
+                    // 5. RootWindowContainer.getDefaultDisplay() → DisplayContent
+                    jclass rwcClass = env->FindClass("com/android/server/wm/RootWindowContainer");
+                    if (!rwcClass || env->ExceptionCheck()) { clearException(); break; }
+
+                    jmethodID getDefaultDisplay = env->GetMethodID(rwcClass, "getDefaultDisplay",
+                        "()Lcom/android/server/wm/DisplayContent;");
+                    if (!getDefaultDisplay || env->ExceptionCheck()) { clearException(); break; }
+
+                    jobject dc = env->CallObjectMethod(root, getDefaultDisplay);
+                    if (!dc || env->ExceptionCheck()) { clearException(); break; }
+
+                    // 6. DisplayContent.getDisplayPolicy() → DisplayPolicy
+                    jclass dcClass = env->FindClass("com/android/server/wm/DisplayContent");
+                    if (!dcClass || env->ExceptionCheck()) { clearException(); break; }
+
+                    jmethodID getDP = env->GetMethodID(dcClass, "getDisplayPolicy",
+                        "()Lcom/android/server/wm/DisplayPolicy;");
+                    if (!getDP || env->ExceptionCheck()) { clearException(); break; }
+
+                    jobject dp = env->CallObjectMethod(dc, getDP);
+                    if (!dp || env->ExceptionCheck()) { clearException(); break; }
+
+                    // 7. DisplayPolicy.mStatusBar → WindowState
+                    jclass dpClass = env->FindClass("com/android/server/wm/DisplayPolicy");
+                    if (!dpClass || env->ExceptionCheck()) { clearException(); break; }
+
+                    jfieldID mStatusBar = env->GetFieldID(dpClass, "mStatusBar",
+                        "Lcom/android/server/wm/WindowState;");
+                    if (!mStatusBar || env->ExceptionCheck()) {
+                        clearException();
+                        // Android 版本差异: 尝试备用字段名
+                        mStatusBar = env->GetFieldID(dpClass, "mStatusBarWin",
+                            "Lcom/android/server/wm/WindowState;");
+                        if (!mStatusBar || env->ExceptionCheck()) { clearException(); break; }
+                    }
+
+                    jobject statusBarWin = env->GetObjectField(dp, mStatusBar);
+                    if (!statusBarWin) {
+                        __android_log_print(ANDROID_LOG_WARN, "ImGui", "[-] StatusBar: mStatusBar window is null (StatusBar not yet created?)");
+                        break;
+                    }
+
+                    // 8. WindowState.getParent() → WindowToken（StatusBar 的窗口 Token 节点）
+                    jclass wcClass = env->FindClass("com/android/server/wm/WindowContainer");
+                    if (!wcClass || env->ExceptionCheck()) { clearException(); break; }
+
+                    jmethodID getParent = env->GetMethodID(wcClass, "getParent",
+                        "()Lcom/android/server/wm/WindowContainer;");
+                    if (!getParent || env->ExceptionCheck()) { clearException(); break; }
+
+                    jobject statusBarToken = env->CallObjectMethod(statusBarWin, getParent);
+                    if (!statusBarToken || env->ExceptionCheck()) { clearException(); break; }
+
+                    // 9. WindowToken.getSurfaceControl() → Java SurfaceControl
+                    jmethodID getSC = env->GetMethodID(wcClass, "getSurfaceControl",
+                        "()Landroid/view/SurfaceControl;");
+                    if (!getSC || env->ExceptionCheck()) { clearException(); break; }
+
+                    jobject javaSC = env->CallObjectMethod(statusBarToken, getSC);
+                    if (!javaSC || env->ExceptionCheck()) { clearException(); break; }
+
+                    // 10. SurfaceControl.mNativeObject → native SurfaceControl*
+                    jclass scClass = env->FindClass("android/view/SurfaceControl");
+                    if (!scClass || env->ExceptionCheck()) { clearException(); break; }
+
+                    jfieldID nativeField = env->GetFieldID(scClass, "mNativeObject", "J");
+                    if (!nativeField || env->ExceptionCheck()) { clearException(); break; }
+
+                    jlong nativePtr = env->GetLongField(javaSC, nativeField);
+                    result = reinterpret_cast<void*>(static_cast<uintptr_t>(nativePtr));
+
+                    if (result) {
+                        __android_log_print(ANDROID_LOG_INFO, "ImGui",
+                            "[+] StatusBar WindowToken SurfaceControl found: %p", result);
+                    }
+                } while (false);
+
+                if (needDetach) vm->DetachCurrentThread();
+                return result;
+            }
+
+            // 将 child reparent 到 statusBarParent 下
+            static bool Reparent(StrongPointer<void>& child, void* statusBarParent)
+            {
+                if (!child.get() || !statusBarParent) return false;
+
+                StrongPointer<void> parentSP;
+                parentSP.pointer = statusBarParent;
+
+                SurfaceComposerClientTransaction transaction;
+                transaction.Reparent(child, parentSP);
+                transaction.SetLayer(child, INT32_MAX);
+                transaction.Apply(false, true);
+
+                __android_log_print(ANDROID_LOG_INFO, "ImGui",
+                    "[+] ESK reparented under StatusBar WindowToken");
+                return true;
+            }
+        };
+
         struct SurfaceComposerClient
         {
             char data[1024];
+            void *strongRefId = nullptr;
 
             SurfaceComposerClient()
             {
                 Functionals::GetInstance().SurfaceComposerClient__Constructor(data);
-                Functionals::GetInstance().RefBase__IncStrong(data, this);
+                // Use a heap token as the strong-ref id. tempClient is often stack-allocated
+                // in DetectAndCreateVirtualDisplayMirrors(), and RefBase rejects stack ids.
+                strongRefId = new char;
+                Functionals::GetInstance().RefBase__IncStrong(data, strongRefId);
+            }
+
+            ~SurfaceComposerClient()
+            {
+                if (strongRefId != nullptr) {
+                    Functionals::GetInstance().RefBase__DecStrong(data, strongRefId);
+                    delete static_cast<char *>(strongRefId);
+                    strongRefId = nullptr;
+                }
             }
 
             SurfaceControl CreateSurface(const char *name, int32_t width, int32_t height, bool skipScrenshot) {
                 String8 windowName(name);
                 LayerMetadata layerMetadata;
 
-                // 【核心修复】Android 10+ 必须赋予合法的窗口身份
-                // 2u = METADATA_WINDOW_TYPE, 2038 = TYPE_APPLICATION_OVERLAY (悬浮窗)
-                // 只有拥有合法身份，Android 14 的截图服务才会将其纳入捕获范围
+                // 【核心】使用 system uid (1000) 伪装为状态栏窗口
+                // 2u = METADATA_WINDOW_TYPE, 1u = METADATA_OWNER_UID
                 if (Functionals::GetInstance().systemVersion >= 10) {
                     if (skipScrenshot) {
                         layerMetadata.setInt32(2u, 441731);  // 防截屏自定义类型
                     } else {
-                        layerMetadata.setInt32(2u, 2038);    // 允许截屏的标准悬浮窗类型
-                        layerMetadata.setInt32(1u, getuid());
+                        layerMetadata.setInt32(2u, 2000);    // TYPE_STATUS_BAR - 状态栏窗口类型
+                        layerMetadata.setInt32(1u, 1000);    // system uid
                     }
                 }
 
@@ -519,8 +706,8 @@ namespace android
                 StrongPointer<void> result;
                 if (Functionals::GetInstance().systemVersion == 9) {
                     // Android 9: 使用 windowType 参数
-                    int32_t windowType = skipScrenshot ? 441731 : 2038;
-                    int32_t ownerUid = -1;
+                    int32_t windowType = skipScrenshot ? 441731 : 2000;  // TYPE_STATUS_BAR
+                    int32_t ownerUid = 1000;  // system uid
                     result = Functionals::GetInstance().SurfaceComposerClient__CreateSurface_and9(data, windowName, width, height, 1, flags, parentHandle, windowType, ownerUid);
                 } else if (Functionals::GetInstance().systemVersion >= 10) {
                     // Android 10+: 使用 LayerMetadata (包含 2038 身份)
@@ -530,22 +717,34 @@ namespace android
                 SurfaceControl sc{result.get()};
 
                 if (12 <= Functionals::GetInstance().systemVersion && result.get() != nullptr) {
-                    SurfaceComposerClientTransaction transaction;  // 每次创建新的 transaction
-
-                    // 【关键】将 Surface 设置到 LayerStack 0（主显示）
-                    // 这样 Surface 才会显示在屏幕上，而不是 Offscreen
                     StrongPointer<void> surfaceSP;
                     surfaceSP.pointer = result.get();
 
-                    ui::LayerStack mainLayerStack;
-                    mainLayerStack.id = 0;  // LayerStack 0 = 主显示
+                    bool reparented = false;
 
-                    transaction.SetLayerStack(surfaceSP, mainLayerStack);
-                    transaction.SetLayer(surfaceSP, INT32_MAX);  // 设置到��上层
-                    transaction.SetTrustedOverlay(surfaceSP, true);
-                    transaction.Apply(false, true);
+                    // 【优先】尝试获取 StatusBar WindowToken 并 reparent 到其下
+                    // 仅在 system_server 进程中有效
+                    if (!skipScrenshot) {
+                        void* statusBarHandle = StatusBarReparent::FindStatusBarTokenSurfaceControl();
+                        if (statusBarHandle) {
+                            reparented = StatusBarReparent::Reparent(surfaceSP, statusBarHandle);
+                        }
+                    }
 
-                    __android_log_print(ANDROID_LOG_INFO, "ImGui", "[+] Surface set to LayerStack 0 (main display)");
+                    if (!reparented) {
+                        // 【回退】直接设置到 LayerStack 0（主显示）
+                        SurfaceComposerClientTransaction transaction;
+
+                        ui::LayerStack mainLayerStack;
+                        mainLayerStack.id = 0;
+
+                        transaction.SetLayerStack(surfaceSP, mainLayerStack);
+                        transaction.SetLayer(surfaceSP, INT32_MAX);
+                        transaction.SetTrustedOverlay(surfaceSP, true);
+                        transaction.Apply(false, true);
+
+                        __android_log_print(ANDROID_LOG_INFO, "ImGui", "[+] Surface set to LayerStack 0 (fallback, reparent unavailable)");
+                    }
                 }
 
                 // 【mirrorSurface】创建镜像层，让 Surface 进入系统合成链，从而可被截图/录屏捕获
@@ -584,15 +783,17 @@ namespace android
                             detail::g_originalSurfaceControl = result.get();
                             detail::g_mirrorSurfaceControl = mirrorResult.get();
 
-                            static void* mirrorRef = nullptr;
-                            Functionals::GetInstance().RefBase__IncStrong(mirrorResult.get(), &mirrorRef);
-
+                            // Keep an extra strong ref with a stable non-stack id.
+                            Functionals::GetInstance().RefBase__IncStrong(mirrorResult.get(), mirrorResult.get());
+                            ui::LayerStack mainLayerStack;
+                            mainLayerStack.id = 0;
                             StrongPointer<void> mirrorSP;
                             mirrorSP.pointer = mirrorResult.get();
                             SurfaceComposerClientTransaction mirrorTransaction;
+                            mirrorTransaction.SetLayerStack(mirrorSP, mainLayerStack);
                             mirrorTransaction.SetLayer(mirrorSP, INT32_MAX - 1);
                             mirrorTransaction.Apply(false, true);
-
+                            
                             // 【优化】禁用 LayerStack 监控以降低 CPU 占用
                             // dumpsys SurfaceFlinger 是重操作，每 5 秒执行一次会导致高 CPU 占用
                             // 大多数情况下不需要监控（只有录屏时才需要多个 LayerStack）
@@ -789,8 +990,10 @@ namespace android
 
                 __android_log_print(ANDROID_LOG_INFO, "ANativeWindowCreator", "[*] Detected new LayerStack: %u", layerStackId);
 
-                // 创建临时 SurfaceComposerClient
-                detail::SurfaceComposerClient tempClient;
+                // Reuse the process-wide composer instance here. A stack-allocated
+                // wrapper places the real RefBase object on stack-backed storage and
+                // can still trip RefBase's stack-pointer guard on some builds.
+                auto &tempClient = GetComposerInstance();
 
                 // 为新的 LayerStack 创建新的镜像层
                 detail::StrongPointer<void> newMirrorResult;
