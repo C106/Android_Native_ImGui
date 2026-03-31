@@ -1,0 +1,99 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// 骨骼查询点（世界坐标）
+struct BoneQuery {
+    vec4 worldPos;  // xyz = world position, w = tolerance (depth bias for comparison)
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer QueryBuffer {
+    BoneQuery items[];
+} queries;
+
+// 配置：VP 矩阵 + 深度缓冲尺寸
+layout(std430, set = 0, binding = 1) readonly buffer ConfigBuffer {
+    mat4 vp;
+    vec4 depthBufferSize;  // x=width, y=height, z=queryCount, w=depthTolerance
+} config;
+
+// 深度缓冲（只读）
+layout(std430, set = 0, binding = 2) readonly buffer DepthBuffer {
+    uint depth[];
+} depthBuf;
+
+// 结果：每个骨骼 1=可见 0=被遮挡
+layout(std430, set = 0, binding = 3) writeonly buffer ResultBuffer {
+    uint visible[];
+} results;
+
+void main() {
+    uint queryIndex = gl_GlobalInvocationID.x;
+    uint queryCount = uint(config.depthBufferSize.z);
+    if (queryIndex >= queryCount) return;
+
+    BoneQuery query = queries.items[queryIndex];
+    vec3 worldPos = query.worldPos.xyz;
+
+    // 投影到裁剪空间
+    vec4 clip = config.vp * vec4(worldPos, 1.0);
+
+    // 相机后面 → 不可见
+    if (clip.w <= 0.0001) {
+        results.visible[queryIndex] = 0u;
+        return;
+    }
+
+    // NDC
+    vec3 ndc = clip.xyz / clip.w;
+    float screenX = (ndc.x * 0.5 + 0.5) * config.depthBufferSize.x;
+    float screenY = (1.0 - (ndc.y * 0.5 + 0.5)) * config.depthBufferSize.y;
+    float boneDepth = ndc.z;
+
+    // 屏幕外 → 视为可见（不做遮挡判断）
+    int ix = int(screenX);
+    int iy = int(screenY);
+    int w = int(config.depthBufferSize.x);
+    int h = int(config.depthBufferSize.y);
+    if (ix < 0 || ix >= w || iy < 0 || iy >= h) {
+        results.visible[queryIndex] = 1u;
+        return;
+    }
+
+    // 采样深度缓冲（取 3x3 邻域最大场景深度）
+    // Reversed-Z: depth=1 最近，depth=0 最远，atomicMax 保留最近的遮挡体
+    // 邻域取 max 是为了保守估计：取最近的遮挡体来判断骨骼是否被遮挡
+    float maxSceneDepth = -1.0;  // 初始化为 < 0，表示无有效几何体
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            int sx = clamp(ix + dx, 0, w - 1);
+            int sy = clamp(iy + dy, 0, h - 1);
+            uint bufIndex = uint(sy) * uint(w) + uint(sx);
+            uint depthUint = depthBuf.depth[bufIndex];
+            // 0x00000000 是初始 sentinel（atomicMax 未更新过的像素 = 无几何体），跳过
+            if (depthUint != 0u) {
+                float d = uintBitsToFloat(depthUint);
+                maxSceneDepth = max(maxSceneDepth, d);
+            }
+        }
+    }
+
+    // 该区域无几何体 → 可见
+    if (maxSceneDepth < 0.0) {
+        results.visible[queryIndex] = 1u;
+        return;
+    }
+
+    // Reversed-Z 遮挡判断：
+    // 场景几何 depth 较大（更近），骨骼 depth 较小（更远）→ 被遮挡
+    // boneDepth < maxSceneDepth - tolerance → 骨骼比墙更远 → 被遮挡
+    float tolerance = config.depthBufferSize.w;
+    float queryTolerance = query.worldPos.w;
+    float totalTolerance = tolerance + queryTolerance;
+
+    if (boneDepth < maxSceneDepth - totalTolerance) {
+        results.visible[queryIndex] = 0u;  // 被遮挡
+    } else {
+        results.visible[queryIndex] = 1u;  // 可见
+    }
+}

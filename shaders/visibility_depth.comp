@@ -1,0 +1,141 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// 场景三角形（世界坐标）
+struct SceneTriangle {
+    vec4 a;  // xyz = position, w = unused
+    vec4 b;
+    vec4 c;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer TriangleBuffer {
+    SceneTriangle items[];
+} triangles;
+
+// 配置：VP 矩阵 + 深度缓冲尺寸 + 三角形数量
+layout(std430, set = 0, binding = 1) readonly buffer ConfigBuffer {
+    mat4 vp;
+    vec4 depthBufferSize;  // x=width, y=height, z=triangleCount, w=depthBias
+} config;
+
+// 深度缓冲（uint，Reversed-Z 下用 atomicMax 实现 z-test）
+// IEEE 754 正浮点数的位模式保持单调性，所以 atomicMax(uint) 等价于 max(float)
+layout(std430, set = 0, binding = 2) buffer DepthBuffer {
+    uint depth[];
+} depthBuf;
+
+// 将世界坐标投影到裁剪空间
+vec4 ProjectPoint(vec3 point) {
+    return config.vp * vec4(point, 1.0);
+}
+
+// 将 clip space 转换为屏幕空间 + NDC depth
+// 返回 (screenX, screenY, ndcDepth, clipW)
+vec4 ClipToScreen(vec4 clip) {
+    float w = clip.w;
+    if (w <= 0.0001) return vec4(-1.0, -1.0, -1.0, w);
+    vec3 ndc = clip.xyz / w;
+    float screenX = (ndc.x * 0.5 + 0.5) * config.depthBufferSize.x;
+    float screenY = (1.0 - (ndc.y * 0.5 + 0.5)) * config.depthBufferSize.y;
+    // NDC depth: Z/W，范围 [0,1] 对于 Vulkan 标准投影
+    // UE4 VP 矩阵的 Z 分量映射到 [0,1] 或 [near, far]
+    // 我们用 clip.z / clip.w 作为深度值，越小越近
+    float depth = ndc.z;
+    return vec4(screenX, screenY, depth, w);
+}
+
+// 软光栅：扫描线填充三角形，写入深度缓冲
+// 使用 edge function 方法（重心坐标）
+void RasterizeTriangle(vec4 s0, vec4 s1, vec4 s2) {
+    // 屏幕空间坐标
+    vec2 p0 = s0.xy;
+    vec2 p1 = s1.xy;
+    vec2 p2 = s2.xy;
+    float z0 = s0.z;
+    float z1 = s1.z;
+    float z2 = s2.z;
+
+    // 计算包围盒
+    vec2 bbMin = max(floor(min(min(p0, p1), p2)), vec2(0.0));
+    vec2 bbMax = min(ceil(max(max(p0, p1), p2)),
+                     vec2(config.depthBufferSize.x - 1.0, config.depthBufferSize.y - 1.0));
+
+    // 包围盒过大则跳过（防止单个巨大三角形卡住 GPU）
+    float bbArea = (bbMax.x - bbMin.x) * (bbMax.y - bbMin.y);
+    float maxPixels = config.depthBufferSize.x * config.depthBufferSize.y * 0.25;
+    if (bbArea > maxPixels || bbArea <= 0.0) return;
+
+    // Edge function: E(p) = (p1-p0) x (p-p0)
+    // 预计算边向量
+    vec2 e01 = p1 - p0;
+    vec2 e12 = p2 - p1;
+    vec2 e20 = p0 - p2;
+
+    // 三角形面积 * 2（用于重心坐标归一化）
+    float area2 = e01.x * e20.y - e01.y * e20.x;
+    // 退化三角形
+    if (abs(area2) < 0.001) return;
+    float invArea2 = 1.0 / area2;
+
+    // 深度偏移（避免 z-fighting）
+    float depthBias = config.depthBufferSize.w;
+
+    int ixMin = int(bbMin.x);
+    int ixMax = int(bbMax.x);
+    int iyMin = int(bbMin.y);
+    int iyMax = int(bbMax.y);
+
+    for (int iy = iyMin; iy <= iyMax; ++iy) {
+        for (int ix = ixMin; ix <= ixMax; ++ix) {
+            vec2 p = vec2(float(ix) + 0.5, float(iy) + 0.5);
+
+            // 重心坐标
+            float w0 = (e12.x * (p.y - p1.y) - e12.y * (p.x - p1.x)) * invArea2;
+            float w1 = (e20.x * (p.y - p2.y) - e20.y * (p.x - p2.x)) * invArea2;
+            float w2 = 1.0 - w0 - w1;
+
+            // 点在三角形内
+            if (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0) {
+                // 透视正确的深度插值
+                float depth = w0 * z0 + w1 * z1 + w2 * z2 + depthBias;
+
+                // 只处理有效深度（近平面之后）
+                if (depth > 0.0 && depth < 1.0) {
+                    // UE4 使用 Reversed-Z：depth=1 最近，depth=0 最远
+                    // 用 atomicMax 保留最近（最大）的深度，用于遮挡判断
+                    uint depthUint = floatBitsToUint(depth);
+                    uint bufIndex = uint(iy) * uint(config.depthBufferSize.x) + uint(ix);
+                    atomicMax(depthBuf.depth[bufIndex], depthUint);
+                }
+            }
+        }
+    }
+}
+
+void main() {
+    uint triIndex = gl_GlobalInvocationID.x;
+    uint triCount = uint(config.depthBufferSize.z);
+    if (triIndex >= triCount) return;
+
+    SceneTriangle tri = triangles.items[triIndex];
+
+    // 投影三个顶点
+    vec4 clip0 = ProjectPoint(tri.a.xyz);
+    vec4 clip1 = ProjectPoint(tri.b.xyz);
+    vec4 clip2 = ProjectPoint(tri.c.xyz);
+
+    // 转换到屏幕空间
+    vec4 s0 = ClipToScreen(clip0);
+    vec4 s1 = ClipToScreen(clip1);
+    vec4 s2 = ClipToScreen(clip2);
+
+    // 所有顶点都在相机后面则跳过
+    if (s0.w <= 0.0001 && s1.w <= 0.0001 && s2.w <= 0.0001) return;
+
+    // 至少一个顶点在相机前面：裁剪掉背面顶点
+    // 简化处理：跳过有任何顶点在相机后面的三角形（避免复杂的近平面裁剪）
+    if (s0.w <= 0.0001 || s1.w <= 0.0001 || s2.w <= 0.0001) return;
+
+    RasterizeTriangle(s0, s1, s2);
+}

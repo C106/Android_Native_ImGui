@@ -22,6 +22,10 @@ struct AutoAimConfig {
     bool drawDebug = false;          // 绘制调试信息
     float holtAlpha = 0.7f;          // Holt 位置平滑系数 (越高越灵敏)
     float holtBeta = 0.4f;           // Holt 趋势平滑系数 (越高越快适应速度变化)
+    float recoilBaseOffsetScale = 0.35f;      // 基础抬升 → 镜心偏移
+    float recoilKickOffsetScale = 120.0f;     // 枪口上跳基准幅度
+    float recoilRecoveryReturnScale = 0.30f;  // 后座回正速度倍率
+    float maxRecoilOffsetFraction = 0.35f;    // 最大镜心偏移占屏高比例
 };
 
 // Holt 双指数平滑状态
@@ -31,6 +35,69 @@ struct HoltState {
     bool initialized = false;
 };
 
+struct RecoilDebugInfo {
+    uint64_t entityComp = 0;
+    bool valid = false;
+
+    float verticalRecoilMin = 0.0f;
+    float verticalRecoilMax = 0.0f;
+    float verticalRecoilVariation = 0.0f;
+    float verticalRecoveryModifier = 0.0f;
+    float verticalRecoveryClamp = 0.0f;
+    float verticalRecoveryMax = 0.0f;
+
+    float leftMax = 0.0f;
+    float rightMax = 0.0f;
+    float horizontalTendency = 0.0f;
+
+    int bulletPerSwitch = 0;
+    float timePerSwitch = 0.0f;
+    bool switchOnTime = false;
+
+    float recoilSpeedVertical = 0.0f;
+    float recoilSpeedHorizontal = 0.0f;
+    float recoverySpeedVertical = 0.0f;
+    float recoilValueClimb = 0.0f;
+    float recoilValueFail = 0.0f;
+
+    float recoilModifierStand = 0.0f;
+    float recoilModifierCrouch = 0.0f;
+    float recoilModifierProne = 0.0f;
+    float recoilHorizontalMinScalar = 0.0f;
+    float burstEmptyDelay = 0.0f;
+
+    bool shootSightReturn = false;
+    float shootSightReturnSpeed = 0.0f;
+
+    float recoilCurveStart = 0.0f;
+    float recoilCurveEnd = 0.0f;
+    float recoilCurveOneBurstStart = 0.0f;
+    float recoilCurveOneBurstEnd = 0.0f;
+    float recoilCurveMultiBurstStart = 0.0f;
+    float recoilCurveMultiBurstEnd = 0.0f;
+    float recoilCurveSamplingInterval = 0.0f;
+
+    uint64_t recoilCurve = 0;
+    uint64_t recoilCurveOneBurst = 0;
+    uint64_t recoilCurveMultiBurst = 0;
+    int recoilCurveArrayNum = 0;
+    int recoilCurveOneBurstArrayNum = 0;
+    int recoilCurveMultiBurstArrayNum = 0;
+
+    float accessoriesVRecoilFactor = 0.0f;
+    float accessoriesVRecoilFactorModifier = 0.0f;
+    float verticalRecoilFactorModifier = 0.0f;
+    float accessoriesHRecoilFactor = 0.0f;
+    float accessoriesHRecoilFactorModifier = 0.0f;
+    float horizontalRecoilFactorModifier = 0.0f;
+    float accessoriesAllRecoilFactorModifier = 0.0f;
+    float accessoriesRecoveryFactor = 0.0f;
+
+    float realtimeVerticalRecoilSpeed = 0.0f;
+    float realtimeHorizontalRecoilSpeed = 0.0f;
+    float realtimeRecoverySpeed = 0.0f;
+};
+
 // 目标跟踪状态
 struct TargetState {
     uint64_t actorAddr = 0;
@@ -38,6 +105,11 @@ struct TargetState {
     Vec2 lastScreenPos;
     Vec2 lastError;
     Vec2 lastOutput;
+    Vec2 debugRawScreenCenter;
+    Vec2 debugEffectiveScreenCenter;
+    Vec2 debugRecoilCenterOffset;
+    float recoilBaseLiftOffset = 0.0f;
+    float recoilKickOffset = 0.0f;
     bool valid = false;
     HoltState holt;
     // debug 显示用
@@ -64,6 +136,7 @@ struct TargetState {
     float debugSensFire4x = 0.0f;
     float debugSensFire6x = 0.0f;
     float debugSensFire8x = 0.0f;
+    RecoilDebugInfo debugRecoil;
 };
 
 // 自瞄控制器
@@ -81,13 +154,14 @@ private:
     AutoAimConfig config;
     TargetState targetState;
 
-    bool SelectTarget(uint64_t& outActorAddr, int& outBoneID, Vec2& outScreenPos);
+    bool SelectTarget(const Vec2& screenCenter, uint64_t& outActorAddr, int& outBoneID, Vec2& outScreenPos);
     Vec2 ComputePDOutput(const Vec2& targetPos, const Vec2& screenCenter,
                          const Vec2& feedforward, float deltaTime, float fovRatio);
     float DistanceToScreenCenter(const Vec2& pos, const Vec2& center) const;
     bool IsInFOV(const Vec2& pos, const Vec2& center) const;
     bool ShouldSwitchTarget(const Vec2& currentPos, const Vec2& newPos, const Vec2& center) const;
     void DrawDebugVisuals(const Vec2& targetPos, const Vec2& screenCenter);
+    void DrawRecoilSpeedDebugWindow();
     bool IsLocalPlayerFiring();
 };
 

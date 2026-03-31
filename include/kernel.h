@@ -91,9 +91,7 @@ private:
     pid_t pid;
 
 public:
-    c_driver() {
-
-    }
+    c_driver() : fd(-1), pid(-1) {}
 
     ~c_driver() {
         if (fd > 0)
@@ -163,6 +161,10 @@ public:
     
 
 int add_breakpoint(uintptr_t addr, int type, int len) {
+    if (this->pid <= 0) {
+        return ENODEV;
+    }
+
     HW_BREAKPOINT_CTL req;
     req.action = HW_BP_ADD;
     req.pid = this->pid;
@@ -179,6 +181,10 @@ int add_breakpoint(uintptr_t addr, int type, int len) {
 
     
     bool remove_breakpoint(uintptr_t addr) {
+        if (this->pid <= 0) {
+            return false;
+        }
+
         HW_BREAKPOINT_CTL req;
         req.action = HW_BP_REMOVE;
         req.pid = this->pid;
@@ -195,20 +201,25 @@ int add_breakpoint(uintptr_t addr, int type, int len) {
     // 返回值: 实际获取到的数量，-1 表示失败
         int get_breakpoint_hits(HW_BREAKPOINT_HIT_INFO *buffer, size_t max_count) {
         if (!buffer || max_count == 0) return 0;
+        if (this->pid <= 0) return -1;
         
         HW_BREAKPOINT_GET_HITS_CTL ctl;
         ctl.count = max_count;
         
         ctl.buffer = (uintptr_t)buffer; 
 
-        // 注意：ioctl 成功返回 0，但我们需要返回 count
-        // 这里假设驱动在成功时会把实际数量写回 ctl.count
         int ret = ioctl(fd, OP_HW_BREAKPOINT_GET_HITS, &ctl);
-        if (ret >= 0) {
-             // 如果内核返回的是处理的条数，直接返回 ret
-             return ret; 
+        if (ret < 0) {
+            return -errno;
         }
-        return -1;
+
+        // 兼容两种协议：
+        // 1. ioctl 返回值就是命中条数
+        // 2. ioctl 成功返回 0，实际命中条数写回 ctl.count
+        if (ret > 0) {
+            return ret;
+        }
+        return static_cast<int>(ctl.count);
     }
     
 };

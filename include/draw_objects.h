@@ -41,6 +41,25 @@ extern bool gDrawSkeleton;   // 绘制骨骼线条
 extern bool gDrawDistance;   // 绘制距离信息
 extern bool gDrawName;       // 绘制名称标签
 extern bool gDrawBox;        // 绘制包围盒（预留）
+extern bool gDrawPhysXGeometry; // 绘制 PhysX 几何体
+extern bool gPhysXDrawMeshes; // 绘制 TriangleMesh / ConvexMesh
+extern bool gPhysXDrawPrimitives; // 绘制 Box / Capsule / Sphere
+extern float gPhysXDrawRadiusMeters; // 最大读取半径
+extern int gPhysXMaxActorsPerFrame; // 每帧最多遍历的 PhysX actor 数
+extern int gPhysXMaxShapesPerActor; // 每个 actor 最多处理的 shape 数
+extern int gPhysXMaxTrianglesPerMesh; // 每个 mesh 最多绘制的三角形数
+extern float gPhysXCenterRegionFovDegrees; // 仅绘制准星附近时的屏幕区域参数
+extern bool gPhysXManualSceneIndexEnabled; // 是否手动指定 PxScene index
+extern int gPhysXManualSceneIndex; // 手动指定的 PxScene index
+extern bool gPhysXUseLocalModelData; // 是否只读取本地导出的模型数据
+extern float gPhysXGeomRefreshInterval; // 几何缓存刷新间隔（秒），大间隔
+
+// 骨骼可视性判断
+extern bool gUseDepthBufferVisibility;  // 使用 CPU raycaster + 本地 BVH 做骨骼可视性
+extern float gDepthBufferBias;          // 光栅化深度偏移
+extern float gDepthBufferTolerance;     // 查询深度容差
+extern int gDepthBufferDownscale;       // 降采样倍率
+extern bool gDrawDepthBuffer;           // 调试：直接绘制深度缓冲
 
 // 读取游戏数据（在 fence wait 前调用）
 GameFrameData ReadGameData();
@@ -59,3 +78,9 @@ void ShutdownDrawObjects();
 
 // 供 auto-aim 访问骨骼缓存（同线程调用，返回 const 引用）
 const std::unordered_map<uint64_t, BoneScreenData>& GetBoneScreenCache();
+bool GetCachedBoneWorldPos(uint64_t actorAddr, int boneID, uint64_t frameCounter, Vec3& outWorldPos);
+bool ExportStablePhysXMeshes();
+const char* GetStablePhysXExportStatus();
+
+// 测试：从内存导出带BVH的mesh
+bool TestExportBVHMesh();

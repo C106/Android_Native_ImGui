@@ -133,6 +133,21 @@ public:
             return paradiseHook->gyro_update(x, y, mask, enable);
         return false;
     }
+
+    int add_breakpoint(uintptr_t addr, int type, int len) {
+        if (currentType != DRIVER_RT_HOOK) return ENOTSUP;
+        return rtHook->add_breakpoint(addr, type, len);
+    }
+
+    bool remove_breakpoint(uintptr_t addr) {
+        if (currentType != DRIVER_RT_HOOK) return false;
+        return rtHook->remove_breakpoint(addr);
+    }
+
+    int get_breakpoint_hits(HW_BREAKPOINT_HIT_INFO* buffer, size_t max_count) {
+        if (currentType != DRIVER_RT_HOOK) return -1;
+        return rtHook->get_breakpoint_hits(buffer, max_count);
+    }
 };
 
 inline DriverManager* Paradise_hook = new DriverManager();

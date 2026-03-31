@@ -6,6 +6,7 @@
 #include <dlfcn.h>
 #include <sys/system_properties.h>
 #include <cstddef>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <unordered_map>
@@ -855,6 +856,55 @@ namespace android
     // LayerStack 监控函数实现
     namespace detail
     {
+        inline bool AddUniqueLayerStack(std::vector<uint32_t>& layerStacks, uint32_t layerStackId)
+        {
+            if (std::find(layerStacks.begin(), layerStacks.end(), layerStackId) != layerStacks.end()) {
+                return false;
+            }
+            layerStacks.push_back(layerStackId);
+            return true;
+        }
+
+        inline bool TryExtractLayerStackValue(const char* text, uint32_t& outLayerStackId)
+        {
+            if (!text) {
+                return false;
+            }
+
+            const char* keys[] = {"LayerStack=", "layerStack="};
+            for (const char* key : keys) {
+                const char* pos = strstr(text, key);
+                if (!pos) {
+                    continue;
+                }
+
+                pos += strlen(key);
+                while (*pos != '\0' && isspace(static_cast<unsigned char>(*pos))) {
+                    ++pos;
+                }
+
+                if (!isdigit(static_cast<unsigned char>(*pos))) {
+                    continue;
+                }
+
+                char* end = nullptr;
+                unsigned long value = strtoul(pos, &end, 10);
+                if (end != pos) {
+                    outLayerStackId = static_cast<uint32_t>(value);
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        inline bool IsVirtualDisplayHeader(const char* text)
+        {
+            return text != nullptr &&
+                   strstr(text, "Display ") != nullptr &&
+                   strstr(text, "(virtual,") != nullptr;
+        }
+
         // 通过 dumpsys 获取所有 LayerStack ID
         inline std::vector<uint32_t> GetAllLayerStacks()
         {
@@ -868,15 +918,25 @@ namespace android
             }
 
             char buffer[256];
+            bool insideVirtualDisplay = false;
             while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-                // 查找 "LayerStack=" 行
-                if (strstr(buffer, "LayerStack=") != nullptr) {
-                    uint32_t layerStackId = 0;
-                    if (sscanf(buffer, "LayerStack=%u", &layerStackId) == 1) {
-                        // 去重
-                        if (std::find(layerStacks.begin(), layerStacks.end(), layerStackId) == layerStacks.end()) {
-                            layerStacks.push_back(layerStackId);
-                        }
+                if (IsVirtualDisplayHeader(buffer)) {
+                    insideVirtualDisplay = true;
+                    __android_log_print(ANDROID_LOG_INFO, "ANativeWindowCreator",
+                        "[*] Found virtual display header: %s", buffer);
+                } else if (insideVirtualDisplay &&
+                           strncmp(buffer, "Display ", 8) == 0 &&
+                           !IsVirtualDisplayHeader(buffer)) {
+                    insideVirtualDisplay = false;
+                }
+
+                uint32_t layerStackId = 0;
+                if (TryExtractLayerStackValue(buffer, layerStackId)) {
+                    if (AddUniqueLayerStack(layerStacks, layerStackId)) {
+                        __android_log_print(ANDROID_LOG_INFO, "ANativeWindowCreator",
+                            "[*] Parsed %s layerStack: %u",
+                            insideVirtualDisplay ? "virtual-display" : "generic",
+                            layerStackId);
                     }
                 }
             }

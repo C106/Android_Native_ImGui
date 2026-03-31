@@ -32,6 +32,144 @@ Addresses address;
 
 // UI 线程持有的 libUE4（仅 mem 按钮初始化时写入）
 static uint64_t libUE4 = 0;
+static bool gShowPhysXDebugWindow = false;
+
+struct PhysXSceneMapEntryDebug {
+    uint16_t key;
+    uint16_t pad0;
+    uint32_t pad1;
+    uint64_t scenePtr;
+    int32_t next;
+    int32_t pad2;
+};
+
+static uint64_t LookupPhysXSceneDebug(uint64_t libBase, uint16_t sceneIndex) {
+    if (libBase == 0) return 0;
+
+    const uint32_t hashSize = Paradise_hook->read<uint32_t>(libBase + offset.GPhysXSceneMapHashSize);
+    if (hashSize == 0) return 0;
+
+    const uint64_t entryArray = Paradise_hook->read<uint64_t>(libBase + offset.GPhysXSceneMap);
+    if (entryArray == 0) return 0;
+
+    uint64_t bucketBase = Paradise_hook->read<uint64_t>(libBase + offset.GPhysXSceneMapBucketPtr);
+    if (bucketBase == 0) {
+        bucketBase = libBase + offset.GPhysXSceneMapBuckets;
+    }
+
+    int32_t bucket = Paradise_hook->read<int32_t>(
+        bucketBase + 4ULL * ((hashSize - 1u) & static_cast<uint32_t>(sceneIndex)));
+    while (bucket != -1) {
+        PhysXSceneMapEntryDebug entry{};
+        if (!Paradise_hook->read(entryArray + static_cast<uint64_t>(bucket) * sizeof(entry), &entry, sizeof(entry))) {
+            return 0;
+        }
+        if (entry.key == sceneIndex) {
+            return entry.scenePtr;
+        }
+        bucket = entry.next;
+    }
+    return 0;
+}
+
+static void DrawPhysXDebugWindow() {
+    if (!gShowPhysXDebugWindow) return;
+
+    ImGui::SetNextWindowSize(ImVec2(860.0f, 620.0f), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("PhysX Debug", &gShowPhysXDebugWindow)) {
+        ImGui::End();
+        return;
+    }
+
+    ImGui::Text("PhysX offset/runtime debug");
+    ImGui::Separator();
+
+    const uint64_t libBase = address.libUE4;
+    const uint64_t uworldPtrAddr = libBase ? libBase + offset.Gworld : 0;
+    const uint64_t uworld = uworldPtrAddr ? Paradise_hook->read<uint64_t>(uworldPtrAddr) : 0;
+    const uint64_t physSceneAddr = uworld ? uworld + offset.PhysicsScene : 0;
+    const uint64_t physScene = physSceneAddr ? Paradise_hook->read<uint64_t>(physSceneAddr) : 0;
+    const uint32_t sceneCount = physScene ? Paradise_hook->read<uint32_t>(physScene + offset.PhysSceneSceneCount) : 0;
+    const uint16_t syncSceneIndex = physScene ? Paradise_hook->read<uint16_t>(physScene + offset.PhysSceneSceneIndexArray) : 0;
+    const uint16_t activeSceneIndex = gPhysXManualSceneIndexEnabled
+        ? static_cast<uint16_t>(std::max(gPhysXManualSceneIndex, 0) & 0xFFFF)
+        : syncSceneIndex;
+    const uint64_t pxScene = LookupPhysXSceneDebug(libBase, activeSceneIndex);
+    const uint64_t pxActorsAddr = pxScene ? Paradise_hook->read<uint64_t>(pxScene + offset.PxSceneActors) : 0;
+    const uint32_t pxActorCount = pxScene ? Paradise_hook->read<uint32_t>(pxScene + offset.PxSceneActorCount) : 0;
+    const uint64_t bucketPtrAddr = libBase ? libBase + offset.GPhysXSceneMapBucketPtr : 0;
+    const uint64_t bucketPtrValue = bucketPtrAddr ? Paradise_hook->read<uint64_t>(bucketPtrAddr) : 0;
+    const uint64_t bucketBase = bucketPtrValue ? bucketPtrValue : (libBase ? libBase + offset.GPhysXSceneMapBuckets : 0);
+    const uint32_t hashSize = libBase ? Paradise_hook->read<uint32_t>(libBase + offset.GPhysXSceneMapHashSize) : 0;
+    const uint64_t entryArrayPtr = libBase ? Paradise_hook->read<uint64_t>(libBase + offset.GPhysXSceneMap) : 0;
+    const int32_t bucketValue = (bucketBase && hashSize)
+        ? Paradise_hook->read<int32_t>(bucketBase + 4ULL * ((hashSize - 1u) & static_cast<uint32_t>(activeSceneIndex)))
+        : -1;
+
+    auto draw_row = [](const char* label, uint64_t addr, uint64_t value) {
+        ImGui::SeparatorText(label);
+        ImGui::TextWrapped("addr : 0x%llX", static_cast<unsigned long long>(addr));
+        ImGui::TextWrapped("value: 0x%llX", static_cast<unsigned long long>(value));
+    };
+
+    draw_row("libUE4", 0, libBase);
+    draw_row("GWorld ptr", uworldPtrAddr, uworld);
+    draw_row("UWorld->PhysicsScene", physSceneAddr, physScene);
+    draw_row("PhysXSceneMap ptr", libBase ? libBase + offset.GPhysXSceneMap : 0, entryArrayPtr);
+    draw_row("PhysX bucket ptr", bucketPtrAddr, bucketPtrValue);
+    draw_row("PhysX bucket base", 0, bucketBase);
+    draw_row("PxScene", 0, pxScene);
+    draw_row("PxScene->Actors", pxScene ? pxScene + offset.PxSceneActors : 0, pxActorsAddr);
+
+    ImGui::Separator();
+    ImGui::Text("sceneCount: %u", sceneCount);
+    ImGui::Text("syncSceneIndex: %u (0x%X)", static_cast<unsigned>(syncSceneIndex), static_cast<unsigned>(syncSceneIndex));
+    ImGui::Text("activeSceneIndex: %u (0x%X)%s",
+                static_cast<unsigned>(activeSceneIndex),
+                static_cast<unsigned>(activeSceneIndex),
+                gPhysXManualSceneIndexEnabled ? " [manual]" : " [auto]");
+    ImGui::Text("hashSize: %u", hashSize);
+    ImGui::Text("bucketValue: %d", bucketValue);
+    ImGui::Text("pxActorCount: %u", pxActorCount);
+
+    if (pxActorsAddr != 0 && pxActorCount > 0) {
+        uint64_t firstActor = Paradise_hook->read<uint64_t>(pxActorsAddr);
+        uint16_t firstActorType = firstActor ? Paradise_hook->read<uint16_t>(firstActor + offset.PxActorType) : 0;
+        uint16_t firstShapeCount = firstActor ? Paradise_hook->read<uint16_t>(firstActor + offset.PxActorShapeCount) : 0;
+        uint64_t firstShapePtr = 0;
+        if (firstActor != 0 && firstShapeCount > 0) {
+            if (firstShapeCount == 1) {
+                firstShapePtr = Paradise_hook->read<uint64_t>(firstActor + offset.PxActorShapes);
+            } else {
+                uint64_t arr = Paradise_hook->read<uint64_t>(firstActor + offset.PxActorShapes);
+                if (arr != 0) {
+                    firstShapePtr = Paradise_hook->read<uint64_t>(arr);
+                }
+            }
+        }
+        uint32_t npShapeFlags = firstShapePtr ? Paradise_hook->read<uint32_t>(firstShapePtr + offset.PxShapeFlags) : 0;
+        uint64_t shapeCore = firstShapePtr ? Paradise_hook->read<uint64_t>(firstShapePtr + offset.PxShapeCorePtr) : 0;
+        uint64_t geomAddr = 0;
+        if (firstShapePtr != 0) {
+            geomAddr = ((npShapeFlags & 1u) != 0 && shapeCore != 0)
+                ? shapeCore + offset.PxShapeCoreGeometry
+                : firstShapePtr + offset.PxShapeGeometryInline;
+        }
+        uint32_t geomType = geomAddr ? Paradise_hook->read<uint32_t>(geomAddr) : 0;
+
+        ImGui::Separator();
+        ImGui::Text("firstActor: 0x%llX", static_cast<unsigned long long>(firstActor));
+        ImGui::Text("firstActorType: %u", static_cast<unsigned>(firstActorType));
+        ImGui::Text("firstShapeCount: %u", static_cast<unsigned>(firstShapeCount));
+        ImGui::Text("firstShape: 0x%llX", static_cast<unsigned long long>(firstShapePtr));
+        ImGui::Text("firstShapeFlags(raw): 0x%X", npShapeFlags);
+        ImGui::Text("firstShapeCore: 0x%llX", static_cast<unsigned long long>(shapeCore));
+        ImGui::Text("firstGeomAddr: 0x%llX", static_cast<unsigned long long>(geomAddr));
+        ImGui::Text("firstGeomType: %u", geomType);
+    }
+
+    ImGui::End();
+}
 
 void Draw_Menu_ResetTextures() {
     gLogoTexture = (ImTextureID)0;
@@ -169,6 +307,7 @@ void Draw_Menu() {
     ImGui::PopStyleVar();
     ImGui::PopStyleVar(4);
     ImGui::End();
+    DrawPhysXDebugWindow();
 }
 
 // Camera Tab
@@ -232,6 +371,13 @@ void DrawCameraTab() {
     ImGui::SliderFloat("X 输出倍率", &cfg.outputScaleX, 0.5f, 1.8f, "%.2f");
     ImGui::SliderFloat("Y 输出倍率", &cfg.outputScaleY, 0.5f, 1.8f, "%.2f");
 
+    ImGui::Separator();
+    ImGui::Text("后座控制参数:");
+    ImGui::SliderFloat("基础抬升倍率", &cfg.recoilBaseOffsetScale, 0.0f, 1.5f, "%.2f");
+    ImGui::SliderFloat("枪口上跳幅度", &cfg.recoilKickOffsetScale, 0.0f, 400.0f, "%.1f");
+    ImGui::SliderFloat("回正速度倍率", &cfg.recoilRecoveryReturnScale, 0.0f, 1.5f, "%.2f");
+    ImGui::SliderFloat("最大镜心偏移", &cfg.maxRecoilOffsetFraction, 0.05f, 0.50f, "%.2f");
+
     ImGui::SliderFloat("目标切换阈值 (像素)", &cfg.hysteresisThreshold, 10.0f, 200.0f, "%.0f");
     ImGui::Checkbox("过滤队友", &cfg.filterTeammates);
     ImGui::Checkbox("显示调试信息", &cfg.drawDebug);
@@ -269,12 +415,34 @@ void DrawObjViewTab() {
     ImGui::Separator();
     ImGui::Text("绘制模块:");
     ImGui::Checkbox("骨骼 (Skeleton)", &gDrawSkeleton);
+    ImGui::Checkbox("骨骼可视性射线检测", &gUseDepthBufferVisibility);
     ImGui::Checkbox("骨骼平滑", &gEnableBoneSmoothing);
     ImGui::Checkbox("名称 (Name)", &gDrawName);
     ImGui::Checkbox("距离 (Distance)", &gDrawDistance);
     ImGui::Checkbox("包围盒 (Box)", &gDrawBox);
     ImGui::SameLine();
     ImGui::TextDisabled("(预留)");
+    ImGui::Separator();
+    ImGui::Text("PhysX 几何体:");
+    ImGui::Checkbox("显示 PhysX 几何", &gDrawPhysXGeometry);
+    ImGui::Checkbox("显示 PhysX 调试窗口", &gShowPhysXDebugWindow);
+    ImGui::Checkbox("绘制 Mesh", &gPhysXDrawMeshes);
+    ImGui::Checkbox("绘制基础体", &gPhysXDrawPrimitives);
+    ImGui::Checkbox("读取本地模型数据", &gPhysXUseLocalModelData);
+    ImGui::Checkbox("手动 SceneIndex", &gPhysXManualSceneIndexEnabled);
+    if (gPhysXManualSceneIndexEnabled) {
+        ImGui::SliderInt("PxScene Index", &gPhysXManualSceneIndex, 0, 255);
+    }
+    ImGui::SliderFloat("PhysX 半径 (米)", &gPhysXDrawRadiusMeters, 20.0f, 300.0f, "%.0f");
+    ImGui::SliderFloat("几何缓存刷新间隔 (秒)", &gPhysXGeomRefreshInterval, 5.0f, 120.0f, "%.0f");
+    ImGui::SliderFloat("准星区域", &gPhysXCenterRegionFovDegrees, 5.0f, 60.0f, "%.0f");
+    ImGui::SliderInt("最大 Actor", &gPhysXMaxActorsPerFrame, 16, 512);
+    ImGui::SliderInt("每 Actor 最大 Shape", &gPhysXMaxShapesPerActor, 1, 64);
+    ImGui::SliderInt("每 Mesh 最大三角形", &gPhysXMaxTrianglesPerMesh, 64, 8000);
+    if (ImGui::Button("导出稳定 OBJ")) {
+        ExportStablePhysXMeshes();
+    }
+    ImGui::TextWrapped("%s", GetStablePhysXExportStatus());
 }
 
 // Config Tab — 纯绘制

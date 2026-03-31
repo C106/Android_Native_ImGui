@@ -341,6 +341,19 @@ inline bool WorldToScreen(Vec3 World, const FMatrix& VP, float SW, float SH, Vec
     return true;
 }
 
+// 扩展版：同时输出 NDC 深度分量 Z/W，用于 compute shader 深度缓冲比较
+inline bool WorldToScreenDepth(Vec3 World, const FMatrix& VP, float SW, float SH, Vec2& Out, float& outDepth) {
+    float W = World.X * VP.M[0][3] + World.Y * VP.M[1][3] + World.Z * VP.M[2][3] + VP.M[3][3];
+    if (W <= 0.0f) { outDepth = -1.0f; return false; }
+    float X = World.X * VP.M[0][0] + World.Y * VP.M[1][0] + World.Z * VP.M[2][0] + VP.M[3][0];
+    float Y = World.X * VP.M[0][1] + World.Y * VP.M[1][1] + World.Z * VP.M[2][1] + VP.M[3][1];
+    float Z = World.X * VP.M[0][2] + World.Y * VP.M[1][2] + World.Z * VP.M[2][2] + VP.M[3][2];
+    Out.x = (SW / 2.0f) + (X / W) * (SW / 2.0f);
+    Out.y = (SH / 2.0f) - (Y / W) * (SH / 2.0f);
+    outDepth = Z / W;  // NDC depth，与 compute shader 深度缓冲一致
+    return true;
+}
+
 inline Vec3 QuatRotateVector(const D4DVector& q, const Vec3& v)
 {
     float tx = 2.0f * (q.Y * v.Z - q.Z * v.Y);
@@ -427,7 +440,91 @@ struct Offsets{
     uintptr_t PersistentLevel = 0xB0;
     uintptr_t TArray = 0xA0;
     uintptr_t NetDriver = 0xb8;
+    uintptr_t PhysicsScene = 0xD88; //UWorld -> PhysicsScene (verified live via ceserver)
+    uintptr_t PhysSceneSceneCount = 0x4; // FPhysScene -> scene count / upper bound
+    uintptr_t PhysSceneSceneIndexArray = 0x56; // FPhysScene -> uint16 SceneIndex[SceneType]
+    uintptr_t GPhysXSceneMap = 0x1496E918; // libUE4 + offset -> entry array pointer, 0x18 bytes per entry
+    uintptr_t GPhysXSceneMapBuckets = 0x1496E950; // inline hash bucket storage for SceneIndex -> PxScene*
+    uintptr_t GPhysXSceneMapBucketPtr = 0x1496E958; // libUE4 + offset -> heap bucket pointer override
+    uintptr_t GPhysXSceneMapHashSize = 0x1496E960; // libUE4 + offset -> hash bucket count
+    uintptr_t NpSceneQueriesSceneQueryManager = 0x2430; // physx::NpSceneQueries -> Sq::SceneQueryManager
+    uintptr_t SceneQueryManagerPrunerExtStride = 0x30; // Sq::SceneQueryManager::mPrunerExt[i] stride
+    uintptr_t PrunerExtPruner = 0x0; // Sq::PrunerExt -> Sq::Pruner*
+    uintptr_t PrunerExtType = 0x28; // Sq::PrunerExt -> PxPruningStructureType::Enum
+    uintptr_t AABBPrunerPool = 0x1F90; // Sq::AABBPruner -> Sq::PruningPool
+    uintptr_t BucketPrunerPool = 0x1EA0; // Sq::BucketPruner -> Sq::PruningPool
+    uintptr_t PruningPoolNbObjects = 0x0; // Sq::PruningPool -> uint32 active object count
+    uintptr_t PruningPoolWorldBoxes = 0x8; // Sq::PruningPool -> PxBounds3* world boxes
+    uintptr_t PruningPoolObjects = 0x10; // Sq::PruningPool -> PrunerPayload* objects
+    uintptr_t ScbBaseControlState = 0x8; // Scb::Base packed control/state flags, scbType in bits 24..27
+    uintptr_t ScbBaseStreamPtr = 0x10; // Scb::Base -> buffered stream pointer
+    uintptr_t ScbShapeCore = 0x30; // Scb::Shape -> Sc::ShapeCore
+    uintptr_t ScbShapeCoreTransform = 0x40; // Scb::Shape -> inline shape2Actor transform
+    uintptr_t ScbShapeCoreShapeFlags = 0x64; // Scb::Shape -> inline PxShapeFlags in Sc::ShapeCore
+    uintptr_t ScbShapeCoreGeometry = 0x68; // Scb::Shape -> inline Gu::GeometryUnion in Sc::ShapeCore
+    uintptr_t ScbRigidStaticActor2World = 0x30; // Scb::RigidStatic -> inline actor2World
+    uintptr_t ScbRigidStaticBufferedActor2World = 0xB0; // buffered Sc::StaticCore -> actor2World
+    uintptr_t PxSceneActors = 0x2568; // physx::NpScene -> actor pointer array
+    uintptr_t PxSceneActorCount = 0x2570; // physx::NpScene -> actor count for the main actor list
+    uintptr_t PxSceneFlags = 0x1124; // physx::NpScene -> inline flags when external scene desc flag is not set
+    uintptr_t PxSceneFlagsExternal = 0x2408; // physx::NpScene -> external flags storage selected by bit0x4 at 0x2428
+    uintptr_t PxSceneFlagsSelector = 0x2428; // physx::NpScene selector flags, bit0x4 chooses external scene flags
+    uintptr_t PxActorType = 0x8; // physx actor header -> type id used by NpScene::getActors
+    uintptr_t PxActorShapes = 0x28; // physx PxActor -> inline shape pointer or shape pointer array
+    uintptr_t PxActorShapeCount = 0x30; // physx PxActor -> uint16 shape count
+    uintptr_t PxShapeFlags = 0x38; // physx::NpShape flags, bit0 selects external geometry storage
+    uintptr_t PxShapeCorePtr = 0x40; // physx::NpShape -> shape core pointer when geometry is external
+    uintptr_t PxShapeLocalPose = 0x70; // physx::NpShape -> inline local pose
+    uintptr_t PxShapeLocalPoseExternal = 0x0; // shape core -> local pose when flags bit0x4 is set
+    uintptr_t PxShapeSimulationFilterData = 0x60; // physx::NpShape -> inline simulation filter data when flags bit0x8 is not set
+    uintptr_t PxShapeCoreSimulationFilterData = 0x1C; // shape core -> simulation filter data when flags bit0x8 is set
+    uintptr_t PxShapeShapeFlags = 0x90; // physx::NpShape -> inline PxShapeFlags when flags bit0x40 is not set
+    uintptr_t PxShapeCoreShapeFlags = 0x34; // shape core -> PxShapeFlags when flags bit0x40 is set
+    uintptr_t PxShapeGeometryInline = 0x98; // physx::NpShape -> inline geometry block (0x30 bytes)
+    uintptr_t PxShapeCoreGeometry = 0x38; // shape core -> geometry block (0x30 bytes)
+    uintptr_t PxShapeGeometryType = 0x98; // physx::NpShape::getGeometryType reads the first dword of the geometry block
+    uintptr_t PxRigidDynamicBodyToWorld = 0xB0; // physx::NpRigidDynamic -> inline body-to-world pose
+    uintptr_t PxRigidDynamicFlags = 0x17C; // physx::NpRigidDynamic flags, bit0x200 selects external pose storage
+    uintptr_t PxRigidDynamicCorePtr = 0x70; // physx::NpRigidDynamic -> core pointer when pose is external
+    uintptr_t PxRigidDynamicCoreBodyToWorld = 0xD0; // dynamic core -> body-to-world pose
+    uintptr_t PxRigidStaticGlobalPose = 0x90; // physx::NpRigidStatic -> inline global pose
+    uintptr_t PxRigidStaticFlags = 0x68; // physx::NpRigidStatic flags, bit0x40 selects external pose storage
+    uintptr_t PxRigidStaticCorePtr = 0x70; // physx::NpRigidStatic -> core pointer when pose is external
+    uintptr_t PxRigidStaticCoreGlobalPose = 0xB0; // static core -> global pose
     uintptr_t ServerConnection = 0x88;
+    uintptr_t PxTriangleMeshGeometryTriangleMesh = 0x28; // PxTriangleMeshGeometry -> PxTriangleMesh*
+    uintptr_t PxTriangleMeshGeometryScale = 0x4; // PxTriangleMeshGeometry -> PxMeshScale (7 dwords)
+    uintptr_t PxSphereGeometryRadius = 0x4; // PxSphereGeometry -> float radius
+    uintptr_t PxCapsuleGeometryHalfHeight = 0x4; // PxCapsuleGeometry -> float halfHeight
+    uintptr_t PxCapsuleGeometryRadius = 0x8; // PxCapsuleGeometry -> float radius
+    uintptr_t PxBoxGeometryHalfExtents = 0x4; // PxBoxGeometry -> PxVec3 halfExtents
+    uintptr_t PxTriangleMeshVertices = 0x28; // physx::Gu::TriangleMesh -> PxVec3* vertices
+    uintptr_t PxTriangleMeshVertexCount = 0x1C; // physx::Gu::TriangleMesh -> uint32 vertex count
+    uintptr_t PxTriangleMeshTriangles = 0x30; // physx::Gu::TriangleMesh -> triangle index buffer
+    uintptr_t PxTriangleMeshTriangleCount = 0x20; // physx::Gu::TriangleMesh -> uint32 triangle count
+    uintptr_t PxTriangleMeshFlags = 0x5C; // physx::Gu::TriangleMesh -> PxTriangleMeshFlags
+    uintptr_t PxConvexMeshGeometryConvexMesh = 0x20; // PxConvexMeshGeometry -> PxConvexMesh*
+    uintptr_t PxConvexMeshGeometryScale = 0x4; // PxConvexMeshGeometry -> PxMeshScale (7 dwords)
+    uintptr_t PxConvexMeshHullData = 0x48; // physx::Gu::ConvexMesh -> hull data base
+    uintptr_t PxConvexMeshEdgeCount = 0x44; // physx::Gu::ConvexMesh -> uint16 edge count (low 15 bits)
+    uintptr_t PxConvexMeshVertexCount = 0x46; // physx::Gu::ConvexMesh -> uint8 vertex count
+    uintptr_t PxConvexMeshPolygonCount = 0x47; // physx::Gu::ConvexMesh -> uint8 polygon count
+    uintptr_t PxConvexMeshVertices = 0x48; // physx::Gu::ConvexMesh::getVertices uses hull data base + 20 * polygonCount
+    uintptr_t PxConvexMeshIndexBuffer = 0x48; // physx::Gu::ConvexMesh::getIndexBuffer uses hull data base + derived offsets
+    uintptr_t PxConvexMeshPolygonData = 0x48; // physx::Gu::ConvexMesh polygon records start at hull data base
+    uintptr_t PxConvexMeshPolygonStride = 0x14; // bytes per polygon record
+    uintptr_t PxHeightFieldGeometryHeightField = 0x8; // PxHeightFieldGeometry -> PxHeightField*
+    uintptr_t PxHeightFieldGeometryHeightScale = 0x10; // PxHeightFieldGeometry -> float heightScale (verified live)
+    uintptr_t PxHeightFieldGeometryRowScale = 0x14; // PxHeightFieldGeometry -> float rowScale (verified live)
+    uintptr_t PxHeightFieldGeometryColumnScale = 0x18; // PxHeightFieldGeometry -> float columnScale (verified live)
+    uintptr_t PxHeightFieldData = 0x20; // physx::Gu::HeightField -> Gu::HeightFieldData
+    uintptr_t PxHeightFieldSampleBuffer = 0x50; // physx::Gu::HeightField -> PxHeightFieldSample*
+    uintptr_t PxHeightFieldRows = 0x38; // physx::Gu::HeightField::getNbRows() -> ldr w0, [x0,#56]
+    uintptr_t PxHeightFieldColumns = 0x3C; // physx::Gu::HeightField::getNbColumns() -> ldr w0, [x0,#60]
+    uintptr_t PxHeightFieldThickness = 0x58; // physx::Gu::HeightField::getThickness() -> ldr s0, [x0,#88]
+    uintptr_t PxHeightFieldSampleStride = 0x60; // physx::Gu::HeightField -> uint32_t mSampleStride
+    uintptr_t PxHeightFieldSampleCount = 0x64; // physx::Gu::HeightField -> uint32_t mNbSamples
+    uintptr_t PxHeightFieldModifyCount = 0x70; // physx::Gu::HeightField::getTimestamp() -> uint32_t mModifyCount
     uintptr_t PlayerController = 0x30;
     uintptr_t AcknowledgedPawn = 0x638;  // PlayerController->AcknowledgedPawn
     uintptr_t PlayerCameraManager = 0x658;

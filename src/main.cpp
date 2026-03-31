@@ -64,6 +64,10 @@ void reinitializeAll() {
     Draw_Menu_ResetTextures();
     LOGD("Reinit: Step 2 done\n");
 
+    LOGD("Reinit: Step 2.5 - Shutting down draw object caches...\n");
+    ShutdownDrawObjects();
+    LOGD("Reinit: Step 2.5 done\n");
+
     // 3. 清理 Vulkan
     LOGD("Reinit: Step 3 - Cleaning up Vulkan...\n");
     gApp.cleanup();

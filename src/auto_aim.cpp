@@ -61,11 +61,120 @@ constexpr uintptr_t kReplicatedMovementOffset = 0x170;       // Actor → Replic
 constexpr uintptr_t kCurrentWeaponOffset = 0x10e8;          // actor → CurrentUsingWeaponSafety
 constexpr uintptr_t kShootWeaponEntityCompOffset = 0x1d08;  // STExtraShootWeapon → ShootWeaponEntityComp*
 constexpr uintptr_t kBulletFireSpeedOffset = 0x159c;        // ShootWeaponEntity → BulletFireSpeed (float, cm/s)
+constexpr uintptr_t kRecoilInfoOffset = 0x1dd0;             // ShootWeaponEntity → SRecoilInfo
+constexpr uintptr_t kAccessoriesVRecoilFactorOffset = 0x1e98;
+constexpr uintptr_t kAccessoriesVRecoilFactorModifierOffset = 0x1e9c;
+constexpr uintptr_t kVerticalRecoilFactorModifierOffset = 0x1ea0;
+constexpr uintptr_t kAccessoriesHRecoilFactorOffset = 0x1ea4;
+constexpr uintptr_t kAccessoriesHRecoilFactorModifierOffset = 0x1ea8;
+constexpr uintptr_t kHorizontalRecoilFactorModifierOffset = 0x1eac;
+constexpr uintptr_t kAccessoriesAllRecoilFactorModifierOffset = 0x1eb0;
+constexpr uintptr_t kAccessoriesRecoveryFactorOffset = 0x1eb4;
 
 // 默认值
 constexpr float kDefaultBulletSpeed = 80000.0f;  // 默认子弹速度 cm/s (800 m/s)
 constexpr float kMaxLeadTime = 1.5f;             // 最大预判时间（秒）
 constexpr float kFeedforwardGain = 0.5f;         // 前馈增益（归一化屏幕速率 → 陀螺仪输出）
+
+struct RecoilArrayHeader {
+    uint64_t data = 0;
+    int32_t num = 0;
+    int32_t max = 0;
+};
+
+struct LocalRecoilInfo {
+    float verticalRecoilMin;              // 0x00
+    float verticalRecoilMax;              // 0x04
+    float verticalRecoilVariation;        // 0x08
+    float verticalRecoveryModifier;       // 0x0c
+    float verticalRecoveryClamp;          // 0x10
+    float verticalRecoveryMax;            // 0x14
+    float leftMax;                        // 0x18
+    float rightMax;                       // 0x1c
+    float horizontalTendency;             // 0x20
+    uint32_t pad24;                       // 0x24
+    uint64_t recoilCurve;                 // 0x28
+    uint64_t recoilCurveOneBurst;         // 0x30
+    uint64_t recoilCurveMultiBurst;       // 0x38
+    int32_t bulletPerSwitch;              // 0x40
+    float timePerSwitch;                  // 0x44
+    uint8_t switchOnTime;                 // 0x48
+    uint8_t pad49[3];                     // 0x49
+    float recoilSpeedVertical;            // 0x4c
+    float recoilSpeedHorizontal;          // 0x50
+    float recoverySpeedVertical;          // 0x54
+    float recoilValueClimb;               // 0x58
+    float recoilValueFail;                // 0x5c
+    float recoilModifierStand;            // 0x60
+    float recoilModifierCrouch;           // 0x64
+    float recoilModifierProne;            // 0x68
+    float recoilHorizontalMinScalar;      // 0x6c
+    float burstEmptyDelay;                // 0x70
+    uint8_t shootSightReturn;             // 0x74
+    uint8_t pad75[3];                     // 0x75
+    float shootSightReturnSpeed;          // 0x78
+    float recoilCurveStart;               // 0x7c
+    float recoilCurveEnd;                 // 0x80
+    float recoilCurveOneBurstStart;       // 0x84
+    float recoilCurveOneBurstEnd;         // 0x88
+    float recoilCurveMultiBurstStart;     // 0x8c
+    float recoilCurveMultiBurstEnd;       // 0x90
+    float recoilCurveSamplingInterval;    // 0x94
+    RecoilArrayHeader recoilCurveArray;   // 0x98
+    RecoilArrayHeader recoilCurveOneBurstArray; // 0xa8
+    RecoilArrayHeader recoilCurveMultiBurstArray; // 0xb8
+};
+
+static_assert(sizeof(RecoilArrayHeader) == 0x10, "RecoilArrayHeader size mismatch");
+static_assert(sizeof(LocalRecoilInfo) == 0xc8, "LocalRecoilInfo size mismatch");
+
+static float SanitizeRecoilFactor(float value) {
+    if (!std::isfinite(value)) return 1.0f;
+    return value;
+}
+
+static Vec2 UpdateRecoilCenterOffset(const AutoAimConfig& config, TargetState& state, const RecoilDebugInfo& recoil,
+                                     bool isFiring, float deltaTime, float fovRatio,
+                                     float screenHeight) {
+    if (deltaTime <= 0.0f) {
+        return Vec2(0.0f, -(state.recoilBaseLiftOffset + state.recoilKickOffset));
+    }
+
+    if (!recoil.valid) {
+        const float fallbackRecover = screenHeight * 1.5f * deltaTime;
+        state.recoilKickOffset = std::max(0.0f, state.recoilKickOffset - fallbackRecover);
+        state.recoilBaseLiftOffset = std::max(0.0f, state.recoilBaseLiftOffset - fallbackRecover);
+        return Vec2(0.0f, -(state.recoilBaseLiftOffset + state.recoilKickOffset));
+    }
+
+    const float zoomScale = 1.0f / std::max(fovRatio, 0.20f);
+    const float maxOffset = screenHeight * config.maxRecoilOffsetFraction;
+    const float baseRiseStep =
+        recoil.realtimeVerticalRecoilSpeed * config.recoilBaseOffsetScale * deltaTime * zoomScale;
+    const float recoverStep =
+        recoil.realtimeRecoverySpeed * config.recoilRecoveryReturnScale * deltaTime * zoomScale;
+    const float sightReturnStep = recoil.shootSightReturn
+        ? (recoil.shootSightReturnSpeed * 0.18f * deltaTime * zoomScale)
+        : 0.0f;
+    const float kickTarget = isFiring
+        ? std::clamp((config.recoilKickOffsetScale / std::max(recoil.realtimeRecoverySpeed, 1.0f)) * zoomScale,
+                     0.0f, maxOffset * 0.45f)
+        : 0.0f;
+    const float kickFollow = std::clamp((recoil.realtimeRecoverySpeed * 0.02f + 8.0f) * deltaTime, 0.0f, 1.0f);
+
+    if (isFiring) {
+        state.recoilBaseLiftOffset = std::clamp(state.recoilBaseLiftOffset + baseRiseStep, 0.0f, maxOffset);
+    }
+
+    const float totalRecover = std::max(recoverStep + sightReturnStep, 0.0f);
+    state.recoilBaseLiftOffset = std::max(0.0f, state.recoilBaseLiftOffset - totalRecover);
+    state.recoilKickOffset += (kickTarget - state.recoilKickOffset) * kickFollow;
+    if (!isFiring && state.recoilKickOffset < 0.01f) {
+        state.recoilKickOffset = 0.0f;
+    }
+
+    return Vec2(0.0f, -(state.recoilBaseLiftOffset + state.recoilKickOffset));
+}
 
 struct UserGyroSensitivity {
     float hipfire = kDefaultGyroSensitivity;
@@ -252,12 +361,120 @@ static float ReadBulletFireSpeed() {
     return speed;
 }
 
+static uint64_t ReadCurrentShootWeaponEntityComp() {
+    if (address.LocalPlayerActor == 0 || !Paradise_hook) return 0;
+    uint64_t weapon = Paradise_hook->read<uint64_t>(address.LocalPlayerActor + kCurrentWeaponOffset);
+    if (weapon == 0) return 0;
+    return Paradise_hook->read<uint64_t>(weapon + kShootWeaponEntityCompOffset);
+}
+
+static RecoilDebugInfo ReadCurrentRecoilDebugInfo() {
+    RecoilDebugInfo info;
+    if (!Paradise_hook) return info;
+
+    const uint64_t entityComp = ReadCurrentShootWeaponEntityComp();
+    if (entityComp == 0) return info;
+
+    LocalRecoilInfo recoil{};
+    Paradise_hook->read(entityComp + kRecoilInfoOffset, &recoil, sizeof(recoil));
+
+    info.entityComp = entityComp;
+    info.valid = true;
+    info.verticalRecoilMin = recoil.verticalRecoilMin;
+    info.verticalRecoilMax = recoil.verticalRecoilMax;
+    info.verticalRecoilVariation = recoil.verticalRecoilVariation;
+    info.verticalRecoveryModifier = recoil.verticalRecoveryModifier;
+    info.verticalRecoveryClamp = recoil.verticalRecoveryClamp;
+    info.verticalRecoveryMax = recoil.verticalRecoveryMax;
+    info.leftMax = recoil.leftMax;
+    info.rightMax = recoil.rightMax;
+    info.horizontalTendency = recoil.horizontalTendency;
+    info.bulletPerSwitch = recoil.bulletPerSwitch;
+    info.timePerSwitch = recoil.timePerSwitch;
+    info.switchOnTime = recoil.switchOnTime != 0;
+    info.recoilSpeedVertical = recoil.recoilSpeedVertical;
+    info.recoilSpeedHorizontal = recoil.recoilSpeedHorizontal;
+    info.recoverySpeedVertical = recoil.recoverySpeedVertical;
+    info.recoilValueClimb = recoil.recoilValueClimb;
+    info.recoilValueFail = recoil.recoilValueFail;
+    info.recoilModifierStand = recoil.recoilModifierStand;
+    info.recoilModifierCrouch = recoil.recoilModifierCrouch;
+    info.recoilModifierProne = recoil.recoilModifierProne;
+    info.recoilHorizontalMinScalar = recoil.recoilHorizontalMinScalar;
+    info.burstEmptyDelay = recoil.burstEmptyDelay;
+    info.shootSightReturn = recoil.shootSightReturn != 0;
+    info.shootSightReturnSpeed = recoil.shootSightReturnSpeed;
+    info.recoilCurveStart = recoil.recoilCurveStart;
+    info.recoilCurveEnd = recoil.recoilCurveEnd;
+    info.recoilCurveOneBurstStart = recoil.recoilCurveOneBurstStart;
+    info.recoilCurveOneBurstEnd = recoil.recoilCurveOneBurstEnd;
+    info.recoilCurveMultiBurstStart = recoil.recoilCurveMultiBurstStart;
+    info.recoilCurveMultiBurstEnd = recoil.recoilCurveMultiBurstEnd;
+    info.recoilCurveSamplingInterval = recoil.recoilCurveSamplingInterval;
+    info.recoilCurve = recoil.recoilCurve;
+    info.recoilCurveOneBurst = recoil.recoilCurveOneBurst;
+    info.recoilCurveMultiBurst = recoil.recoilCurveMultiBurst;
+    info.recoilCurveArrayNum = recoil.recoilCurveArray.num;
+    info.recoilCurveOneBurstArrayNum = recoil.recoilCurveOneBurstArray.num;
+    info.recoilCurveMultiBurstArrayNum = recoil.recoilCurveMultiBurstArray.num;
+
+    info.accessoriesVRecoilFactor = Paradise_hook->read<float>(entityComp + kAccessoriesVRecoilFactorOffset);
+    info.accessoriesVRecoilFactorModifier = Paradise_hook->read<float>(entityComp + kAccessoriesVRecoilFactorModifierOffset);
+    info.verticalRecoilFactorModifier = Paradise_hook->read<float>(entityComp + kVerticalRecoilFactorModifierOffset);
+    info.accessoriesHRecoilFactor = Paradise_hook->read<float>(entityComp + kAccessoriesHRecoilFactorOffset);
+    info.accessoriesHRecoilFactorModifier = Paradise_hook->read<float>(entityComp + kAccessoriesHRecoilFactorModifierOffset);
+    info.horizontalRecoilFactorModifier = Paradise_hook->read<float>(entityComp + kHorizontalRecoilFactorModifierOffset);
+    info.accessoriesAllRecoilFactorModifier = Paradise_hook->read<float>(entityComp + kAccessoriesAllRecoilFactorModifierOffset);
+    info.accessoriesRecoveryFactor = Paradise_hook->read<float>(entityComp + kAccessoriesRecoveryFactorOffset);
+
+    const float allRecoilFactor = SanitizeRecoilFactor(info.accessoriesAllRecoilFactorModifier);
+    const float verticalFactor =
+        SanitizeRecoilFactor(info.accessoriesVRecoilFactor) *
+        SanitizeRecoilFactor(info.accessoriesVRecoilFactorModifier) *
+        SanitizeRecoilFactor(info.verticalRecoilFactorModifier) *
+        allRecoilFactor;
+    const float horizontalFactor =
+        SanitizeRecoilFactor(info.accessoriesHRecoilFactor) *
+        SanitizeRecoilFactor(info.accessoriesHRecoilFactorModifier) *
+        SanitizeRecoilFactor(info.horizontalRecoilFactorModifier) *
+        allRecoilFactor;
+    const float recoveryFactor = SanitizeRecoilFactor(info.accessoriesRecoveryFactor);
+
+    // 推导值：以 SRecoilInfo 基础速度乘以当前附件/全局修正，得到实时后坐速度。
+    info.realtimeVerticalRecoilSpeed = info.recoilSpeedVertical * verticalFactor;
+    info.realtimeHorizontalRecoilSpeed = info.recoilSpeedHorizontal * horizontalFactor;
+    info.realtimeRecoverySpeed = info.recoverySpeedVertical * recoveryFactor;
+    return info;
+}
+
 static Vec3 ReadActorRootWorldPos(uint64_t actorAddr) {
     if (actorAddr == 0 || !Paradise_hook) return Vec3::Zero();
     uint64_t rootComp = Paradise_hook->read<uint64_t>(actorAddr + offset.RootComponent);
     if (rootComp == 0) return Vec3::Zero();
     FTransform transform = Paradise_hook->read<FTransform>(rootComp + offset.ComponentToWorld);
     return transform.Translation;
+}
+
+static Vec3 ReadCameraWorldPos() {
+    if (!Paradise_hook || address.libUE4 == 0) return ReadActorRootWorldPos(address.LocalPlayerActor);
+
+    uint64_t uworld = Paradise_hook->read<uint64_t>(address.libUE4 + offset.Gworld);
+    if (uworld == 0) return ReadActorRootWorldPos(address.LocalPlayerActor);
+
+    uint64_t netDriver = Paradise_hook->read<uint64_t>(uworld + offset.NetDriver);
+    if (netDriver == 0) return ReadActorRootWorldPos(address.LocalPlayerActor);
+    uint64_t serverConn = Paradise_hook->read<uint64_t>(netDriver + offset.ServerConnection);
+    if (serverConn == 0) return ReadActorRootWorldPos(address.LocalPlayerActor);
+    uint64_t playerController = Paradise_hook->read<uint64_t>(serverConn + offset.PlayerController);
+    if (playerController == 0) return ReadActorRootWorldPos(address.LocalPlayerActor);
+    uint64_t pcm = Paradise_hook->read<uint64_t>(playerController + offset.PlayerCameraManager);
+    if (pcm == 0) return ReadActorRootWorldPos(address.LocalPlayerActor);
+
+    Vec3 cameraWorldPos = Paradise_hook->read<Vec3>(pcm + offset.CameraCache + offset.POV);
+    if (!std::isfinite(cameraWorldPos.X) || !std::isfinite(cameraWorldPos.Y) || !std::isfinite(cameraWorldPos.Z)) {
+        return ReadActorRootWorldPos(address.LocalPlayerActor);
+    }
+    return cameraWorldPos;
 }
 
 static void HoltUpdate(HoltState& state, const Vec2& observation, float alpha, float beta) {
@@ -315,6 +532,9 @@ void AutoAimController::ResetTarget() {
     targetState.lastScreenPos = Vec2(0, 0);
     targetState.lastError = Vec2(0, 0);
     targetState.lastOutput = Vec2(0, 0);
+    targetState.debugRawScreenCenter = Vec2(0, 0);
+    targetState.debugEffectiveScreenCenter = Vec2(0, 0);
+    targetState.debugRecoilCenterOffset = Vec2(0, 0);
     targetState.valid = false;
     targetState.holt.initialized = false;
     targetState.holt.level = Vec2(0, 0);
@@ -346,13 +566,11 @@ bool AutoAimController::ShouldSwitchTarget(const Vec2& currentPos, const Vec2& n
     return (currentDist - newDist) > config.hysteresisThreshold;
 }
 
-bool AutoAimController::SelectTarget(uint64_t& outActorAddr, int& outBoneID, Vec2& outScreenPos) {
+bool AutoAimController::SelectTarget(const Vec2& screenCenter, uint64_t& outActorAddr, int& outBoneID, Vec2& outScreenPos) {
     const auto& boneCache = GetBoneScreenCache();
     if (boneCache.empty()) return false;
-
-    ImGuiIO& io = ImGui::GetIO();
-    Vec2 screenCenter(io.DisplaySize.x / 2.0f, io.DisplaySize.y / 2.0f);
     uint64_t currentFrame = ReadFrameCounter();
+    const Vec3 cameraWorldPos = ReadCameraWorldPos();
 
     uint64_t bestActor = 0;
     int bestBone = -1;
@@ -396,6 +614,11 @@ bool AutoAimController::SelectTarget(uint64_t& outActorAddr, int& outBoneID, Vec
 
         // FOV 过滤
         if (!IsInFOV(targetPos, screenCenter)) continue;
+
+        Vec3 targetWorldPos;
+        if (!GetCachedBoneWorldPos(bsd.actorAddr, candidateBone, currentFrame, targetWorldPos)) {
+            targetWorldPos = ReadActorRootWorldPos(bsd.actorAddr);
+        }
 
         float distToCenter = DistanceToScreenCenter(targetPos, screenCenter);
 
@@ -490,8 +713,10 @@ Vec2 AutoAimController::ComputePDOutput(const Vec2& aimPos, const Vec2& screenCe
 
 void AutoAimController::DrawDebugVisuals(const Vec2& targetPos, const Vec2& screenCenter) {
     ImDrawList* draw_list = ImGui::GetBackgroundDrawList();
+    ImGuiIO& io = ImGui::GetIO();
+    const Vec2 rawCenter(io.DisplaySize.x / 2.0f, io.DisplaySize.y / 2.0f);
 
-    // 绘制屏幕中心十字准星（白色）
+    // 绘制实际镜心（白色）
     float crossSize = 20.0f;
     draw_list->AddLine(
         ImVec2(screenCenter.x - crossSize, screenCenter.y),
@@ -501,6 +726,16 @@ void AutoAimController::DrawDebugVisuals(const Vec2& targetPos, const Vec2& scre
         ImVec2(screenCenter.x, screenCenter.y - crossSize),
         ImVec2(screenCenter.x, screenCenter.y + crossSize),
         IM_COL32(255, 255, 255, 255), 2.0f);
+
+    // 绘制原始屏幕中心（灰色），便于观察枪口上跳带来的偏移
+    draw_list->AddLine(
+        ImVec2(rawCenter.x - crossSize * 0.6f, rawCenter.y),
+        ImVec2(rawCenter.x + crossSize * 0.6f, rawCenter.y),
+        IM_COL32(160, 160, 160, 180), 1.0f);
+    draw_list->AddLine(
+        ImVec2(rawCenter.x, rawCenter.y - crossSize * 0.6f),
+        ImVec2(rawCenter.x, rawCenter.y + crossSize * 0.6f),
+        IM_COL32(160, 160, 160, 180), 1.0f);
 
     // 绘制目标指示器（红色圆圈 = 当前骨骼位置）
     draw_list->AddCircle(
@@ -523,7 +758,6 @@ void AutoAimController::DrawDebugVisuals(const Vec2& targetPos, const Vec2& scre
         IM_COL32(255, 255, 0, 128), 1.0f);
 
     // 绘制 FOV 圆圈（绿色）
-    ImGuiIO& io = ImGui::GetIO();
     float screenDiagonal = sqrtf(io.DisplaySize.x * io.DisplaySize.x +
                                   io.DisplaySize.y * io.DisplaySize.y);
     float fovRadiusPixels = tanf(config.fovLimit * M_PI / 180.0f) * screenDiagonal / 2.0f;
@@ -550,7 +784,12 @@ void AutoAimController::DrawDebugVisuals(const Vec2& targetPos, const Vec2& scre
         ImGui::Text("Target Actor: 0x%llX", (unsigned long long)targetState.actorAddr);
         ImGui::Text("Target Bone: %d", targetState.boneID);
         ImGui::Text("Aim Pos: %.1f, %.1f", targetPos.x, targetPos.y);
-        ImGui::Text("Screen Center: %.1f, %.1f", screenCenter.x, screenCenter.y);
+        ImGui::Text("Screen Center: %.1f, %.1f", rawCenter.x, rawCenter.y);
+        ImGui::Text("Effective Center: %.1f, %.1f", screenCenter.x, screenCenter.y);
+        ImGui::Text("Recoil Offset: %.1f, %.1f",
+            targetState.debugRecoilCenterOffset.x, targetState.debugRecoilCenterOffset.y);
+        ImGui::Text("Recoil Lift/Kick: %.1f / %.1f",
+            targetState.recoilBaseLiftOffset, targetState.recoilKickOffset);
         ImGui::Text("Error: %.1f, %.1f", targetState.lastError.x, targetState.lastError.y);
         ImGui::Text("Output: %.2f, %.2f", targetState.lastOutput.x, targetState.lastOutput.y);
         ImGui::Separator();
@@ -573,30 +812,49 @@ void AutoAimController::DrawDebugVisuals(const Vec2& targetPos, const Vec2& scre
         ImGui::Text("SwitchThresh: %.1f", config.hysteresisThreshold);
     }
     ImGui::End();
+}
 
-    // 灵敏度独立窗口
+void AutoAimController::DrawRecoilSpeedDebugWindow() {
+    ImGuiIO& io = ImGui::GetIO();
     ImGui::SetNextWindowBgAlpha(0.35f);
-    ImGui::SetNextWindowPos(ImVec2(12.0f, 12.0f), ImGuiCond_Always, ImVec2(0.0f, 0.0f));
-    if (ImGui::Begin("##GyroSensDebug", nullptr, windowFlags)) {
-        ImGui::Text("Gyro Sensitivity");
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 12.0f, 230.0f), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+
+    ImGuiWindowFlags windowFlags =
+        ImGuiWindowFlags_NoDecoration |
+        ImGuiWindowFlags_AlwaysAutoResize |
+        ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoFocusOnAppearing |
+        ImGuiWindowFlags_NoNav |
+        ImGuiWindowFlags_NoMove;
+
+    if (ImGui::Begin("##RecoilSpeedDebug", nullptr, windowFlags)) {
+        const RecoilDebugInfo& recoil = targetState.debugRecoil;
+        ImGui::Text("Recoil Speed");
         ImGui::Separator();
-        ImGui::Text("Hipfire: %.2f", targetState.debugSensHipfire);
-        ImGui::Text("RedDot:  %.2f", targetState.debugSensRedDot);
-        ImGui::Text("2X: %.2f", targetState.debugSens2x);
-        ImGui::Text("3X: %.2f", targetState.debugSens3x);
-        ImGui::Text("4X: %.2f", targetState.debugSens4x);
-        ImGui::Text("6X: %.2f", targetState.debugSens6x);
-        ImGui::Text("8X: %.2f", targetState.debugSens8x);
-        ImGui::Separator();
-        ImGui::Text("Fire Gyro Sensitivity");
-        ImGui::Separator();
-        ImGui::Text("Hipfire: %.2f", targetState.debugSensFireHipfire);
-        ImGui::Text("RedDot:  %.2f", targetState.debugSensFireRedDot);
-        ImGui::Text("2X: %.2f", targetState.debugSensFire2x);
-        ImGui::Text("3X: %.2f", targetState.debugSensFire3x);
-        ImGui::Text("4X: %.2f", targetState.debugSensFire4x);
-        ImGui::Text("6X: %.2f", targetState.debugSensFire6x);
-        ImGui::Text("8X: %.2f", targetState.debugSensFire8x);
+        ImGui::Text("Weapon Entity: 0x%llX", (unsigned long long)recoil.entityComp);
+        ImGui::Text("Valid: %s", recoil.valid ? "true" : "false");
+        if (recoil.valid) {
+            ImGui::Separator();
+            ImGui::Text("Base Recoil V/H: %.3f / %.3f",
+                recoil.recoilSpeedVertical, recoil.recoilSpeedHorizontal);
+            ImGui::Text("Base Recovery V: %.3f", recoil.recoverySpeedVertical);
+            ImGui::Separator();
+            ImGui::Text("Realtime Recoil V/H: %.3f / %.3f",
+                recoil.realtimeVerticalRecoilSpeed, recoil.realtimeHorizontalRecoilSpeed);
+            ImGui::Text("Realtime Recovery V: %.3f", recoil.realtimeRecoverySpeed);
+            ImGui::Separator();
+            ImGui::Text("V Factors: %.3f * %.3f * %.3f * %.3f",
+                recoil.accessoriesVRecoilFactor,
+                recoil.accessoriesVRecoilFactorModifier,
+                recoil.verticalRecoilFactorModifier,
+                recoil.accessoriesAllRecoilFactorModifier);
+            ImGui::Text("H Factors: %.3f * %.3f * %.3f * %.3f",
+                recoil.accessoriesHRecoilFactor,
+                recoil.accessoriesHRecoilFactorModifier,
+                recoil.horizontalRecoilFactorModifier,
+                recoil.accessoriesAllRecoilFactorModifier);
+            ImGui::Text("Recovery Factor: %.3f", recoil.accessoriesRecoveryFactor);
+        }
     }
     ImGui::End();
 }
@@ -614,24 +872,58 @@ void AutoAimController::Update(float deltaTime) {
     if (!config.enabled) return;
     if (!Gyro_Controller || !Gyro_Controller->bGyroConnect()) return;
 
+    targetState.debugRecoil = ReadCurrentRecoilDebugInfo();
+
     const bool isFiring = IsLocalPlayerFiring();
     const bool isADS = IsLocalPlayerADS();
+    const float cameraFOV = ReadCameraFOV();
+    const UserGyroSensitivity gyroSens = ReadUserGyroSensitivity();
+    const float gyroScale = SelectGyroSensitivityScale(gyroSens, isFiring, isADS, cameraFOV);
+    const float sensCompensate = 1.0f / std::max(gyroScale, 0.1f);
+
+    targetState.debugCameraFOV = cameraFOV;
+    targetState.debugGyroScale = gyroScale;
+    targetState.debugSensCompensate = sensCompensate;
+    targetState.debugSensHipfire = gyroSens.hipfire;
+    targetState.debugSensRedDot = gyroSens.redDot;
+    targetState.debugSens2x = gyroSens.scope2x;
+    targetState.debugSens3x = gyroSens.scope3x;
+    targetState.debugSens4x = gyroSens.scope4x;
+    targetState.debugSens6x = gyroSens.scope6x;
+    targetState.debugSens8x = gyroSens.scope8x;
+    targetState.debugSensFireHipfire = gyroSens.firingHipfire;
+    targetState.debugSensFireRedDot = gyroSens.firingRedDot;
+    targetState.debugSensFire2x = gyroSens.firing2x;
+    targetState.debugSensFire3x = gyroSens.firing3x;
+    targetState.debugSensFire4x = gyroSens.firing4x;
+    targetState.debugSensFire6x = gyroSens.firing6x;
+    targetState.debugSensFire8x = gyroSens.firing8x;
 
     // 如果启用了"仅开火时自瞄"，检查开火状态
     if (config.onlyWhenFiring && !isFiring) {
+        if (config.drawDebug) {
+            DrawRecoilSpeedDebugWindow();
+        }
         ResetTarget();
         Gyro_Controller->update(0, 0);
         return;
     }
 
     ImGuiIO& io = ImGui::GetIO();
-    Vec2 screenCenter(io.DisplaySize.x / 2.0f, io.DisplaySize.y / 2.0f);
+    Vec2 rawScreenCenter(io.DisplaySize.x / 2.0f, io.DisplaySize.y / 2.0f);
+    const float fovRatio = cameraFOV / kDefaultFOV;  // <1 表示放大（高倍镜）
+    const Vec2 recoilCenterOffset = UpdateRecoilCenterOffset(
+        config, targetState, targetState.debugRecoil, isFiring, deltaTime, fovRatio, io.DisplaySize.y);
+    Vec2 screenCenter = rawScreenCenter + recoilCenterOffset;
+    targetState.debugRawScreenCenter = rawScreenCenter;
+    targetState.debugEffectiveScreenCenter = screenCenter;
+    targetState.debugRecoilCenterOffset = recoilCenterOffset;
 
     uint64_t targetActor;
     int targetBone;
     Vec2 targetScreenPos;
 
-    if (SelectTarget(targetActor, targetBone, targetScreenPos)) {
+    if (SelectTarget(screenCenter, targetActor, targetBone, targetScreenPos)) {
         // 目标切换时重置 Holt
         if (targetState.valid && targetState.actorAddr != targetActor) {
             targetState.holt.initialized = false;
@@ -720,10 +1012,6 @@ void AutoAimController::Update(float deltaTime) {
             }
         }
 
-        // 读取当前相机 FOV，计算缩放比
-        float cameraFOV = ReadCameraFOV();
-        float fovRatio = cameraFOV / kDefaultFOV;  // <1 表示放大（高倍镜）
-
         // 存储 debug 信息
         targetState.debugBulletSpeed = bulletSpeed;
         targetState.debugLeadTime = leadTime;
@@ -735,27 +1023,8 @@ void AutoAimController::Update(float deltaTime) {
         // l) 前馈 + PD 控制器
         Vec2 gyroAdjust = ComputePDOutput(aimPos, screenCenter, feedforward, deltaTime, fovRatio);
 
-        UserGyroSensitivity gyroSens = ReadUserGyroSensitivity();
-        float gyroScale = SelectGyroSensitivityScale(gyroSens, isFiring, isADS, cameraFOV);
         // 灵敏度补偿：灵敏度越高，同样陀螺仪值转角越大，需要缩小输出
         // FOV 补偿已在 ComputePDOutput 内部对 PD 分量单独处理
-        float sensCompensate = 1.0f / std::max(gyroScale, 0.1f);
-        targetState.debugGyroScale = gyroScale;
-        targetState.debugSensCompensate = sensCompensate;
-        targetState.debugSensHipfire = gyroSens.hipfire;
-        targetState.debugSensRedDot = gyroSens.redDot;
-        targetState.debugSens2x = gyroSens.scope2x;
-        targetState.debugSens3x = gyroSens.scope3x;
-        targetState.debugSens4x = gyroSens.scope4x;
-        targetState.debugSens6x = gyroSens.scope6x;
-        targetState.debugSens8x = gyroSens.scope8x;
-        targetState.debugSensFireHipfire = gyroSens.firingHipfire;
-        targetState.debugSensFireRedDot = gyroSens.firingRedDot;
-        targetState.debugSensFire2x = gyroSens.firing2x;
-        targetState.debugSensFire3x = gyroSens.firing3x;
-        targetState.debugSensFire4x = gyroSens.firing4x;
-        targetState.debugSensFire6x = gyroSens.firing6x;
-        targetState.debugSensFire8x = gyroSens.firing8x;
         Vec2 finalAdjust = ClampGyroStrength(gyroAdjust * sensCompensate * kAutoAimBoost);
         finalAdjust.x = ApplyGyroFloor(finalAdjust.x);
         finalAdjust.y = ApplyVerticalGyroFloor(finalAdjust.y);
@@ -774,8 +1043,12 @@ void AutoAimController::Update(float deltaTime) {
 
         if (config.drawDebug) {
             DrawDebugVisuals(aimPos, screenCenter);
+            DrawRecoilSpeedDebugWindow();
         }
     } else {
+        if (config.drawDebug) {
+            DrawRecoilSpeedDebugWindow();
+        }
         ResetTarget();
         Gyro_Controller->update(0, 0);
     }

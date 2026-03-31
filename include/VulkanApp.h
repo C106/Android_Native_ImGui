@@ -3,6 +3,7 @@
 #include <vulkan/vulkan.h>
 #include <android/native_window.h>
 #include "vk-bootstrap/VkBootstrap.h"
+
 struct FrameData {
     VkCommandPool   cmdPool{};
     VkCommandBuffer cmd{};
@@ -42,7 +43,6 @@ struct VulkanApp {
     std::vector<VkSemaphore> renderFinishedSemaphores;
     std::vector<VkFence> inFlightFences;
     uint32_t maxFramesInFlight = 1; // 降低 pipeline 深度，减少延迟
-
     bool swapchainRebuildRequired = false;
 
     size_t currentFrame = 0;
