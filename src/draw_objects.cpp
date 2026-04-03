@@ -1,5 +1,6 @@
 #include "draw_objects.h"
 #include "read_mem.h"
+#include "auto_aim.h"
 #include "ImGuiLayer.h"
 #include "VulkanApp.h"
 #include "driver_manager.h"
@@ -57,12 +58,81 @@ static const std::pair<int, int> kBoneConnections[] = {
     {BONE_R_KNEE, BONE_R_FOOT},
 };
 
+namespace {
+
+constexpr uintptr_t kMinimalViewInfoLocationOffset = 0x0;
+constexpr uintptr_t kMinimalViewInfoRotationOffset = 0x18;
+constexpr uintptr_t kMinimalViewInfoFOVOffset = 0x30;
+constexpr uintptr_t kMinimalViewInfoAspectRatioOffset = 0x58;
+constexpr uintptr_t kClientConnectionsArrayOffset = 0x90;
+
+static uint64_t ReadLocalPlayerControllerFromWorld(uint64_t uworld) {
+    if (uworld == 0) return 0;
+
+    uint64_t netDriver = Paradise_hook->read<uint64_t>(uworld + offset.NetDriver);
+    if (netDriver == 0) return 0;
+
+    uint64_t connection = Paradise_hook->read<uint64_t>(netDriver + offset.ServerConnection);
+    if (connection == 0) {
+        uint64_t clientConnectionsArray = netDriver + kClientConnectionsArrayOffset;
+        uint64_t clientConnectionsData = Paradise_hook->read<uint64_t>(clientConnectionsArray);
+        int clientConnectionsCount = Paradise_hook->read<int>(clientConnectionsArray + 0x8);
+        if (clientConnectionsData == 0 || clientConnectionsCount <= 0) {
+            return 0;
+        }
+        connection = Paradise_hook->read<uint64_t>(clientConnectionsData);
+    }
+
+    if (connection == 0) return 0;
+    return Paradise_hook->read<uint64_t>(connection + offset.PlayerController);
+}
+
+static bool BuildViewProjectionMatrixFromCameraCache(uint64_t uworld, FMatrix& outVP) {
+    if (!Paradise_hook || uworld == 0) return false;
+
+    uint64_t playerController = ReadLocalPlayerControllerFromWorld(uworld);
+    if (playerController == 0) return false;
+
+    uint64_t playerCameraManager = Paradise_hook->read<uint64_t>(playerController + offset.PlayerCameraManager);
+    if (playerCameraManager == 0) return false;
+
+    uint64_t povAddr = playerCameraManager + offset.CameraCache + offset.POV;
+
+    Vec3 location = Paradise_hook->read<Vec3>(povAddr + kMinimalViewInfoLocationOffset);
+    FRotator rotation = Paradise_hook->read<FRotator>(povAddr + kMinimalViewInfoRotationOffset);
+    float fov = Paradise_hook->read<float>(povAddr + kMinimalViewInfoFOVOffset);
+    float aspectRatio = Paradise_hook->read<float>(povAddr + kMinimalViewInfoAspectRatioOffset);
+
+    const bool validLocation = std::isfinite(location.X) && std::isfinite(location.Y) && std::isfinite(location.Z);
+    const bool validRotation = std::isfinite(rotation.Pitch) && std::isfinite(rotation.Yaw) && std::isfinite(rotation.Roll);
+    if (!validLocation || !validRotation) return false;
+
+    if (!(fov > 1.0f && fov < 179.0f)) return false;
+
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.DisplaySize.x > 1.0f && io.DisplaySize.y > 1.0f) {
+        aspectRatio = io.DisplaySize.x / io.DisplaySize.y;
+    }
+
+    if (!(aspectRatio > 0.1f && aspectRatio < 5.0f)) {
+        aspectRatio = 16.0f / 9.0f;
+    }
+
+    FMatrix view = BuildViewMatrix(location, rotation);
+    FMatrix projection = BuildProjectionMatrix(fov, aspectRatio);
+    outVP = MatrixMultiply(view, projection);
+    return true;
+}
+
+} // namespace
+
 bool gShowObjects = true;
 bool gShowAllClassNames = false;
 bool gUseBatchBoneRead = true;  // 默认使用批量读取（优化模式）
 bool gEnableBoneSmoothing = false;  // 默认关闭，避免骨骼视觉上慢半拍
+bool gUseCameraCacheVPMatrix = false;  // 默认仍使用原矩阵地址，按需手动切换
 int gBoneCount = 0;
-float gMaxSkeletonDistance = 200.0f;  // 默认 200 米，超过不绘制骨骼
+float gMaxSkeletonDistance = 230.0f;  // 默认 200 米，超过不绘制骨骼
 
 // 分类显示开关（默认全部显示）
 bool gShowPlayers = true;
@@ -110,6 +180,24 @@ static std::unordered_map<uint64_t, BoneWorldCache> gBoneWorldCache;
 
 // 上一帧引擎帧号（用于检测引擎是否推进了新帧）
 static uint64_t gLastEngineFrame = 0;
+
+static void DrawLabelBackground(ImDrawList* drawList, const ImVec2& min, const ImVec2& max, ImU32 fillColor) {
+    drawList->AddRectFilled(min, max, fillColor, 6.0f);
+}
+
+static void DrawHealthBar(ImDrawList* drawList, const ImVec2& anchor, float width, float height, float ratio) {
+    ratio = std::clamp(ratio, 0.0f, 1.0f);
+    ImVec2 min(anchor.x - width * 0.5f, anchor.y);
+    ImVec2 max(anchor.x + width * 0.5f, anchor.y + height);
+
+    drawList->AddRectFilled(min, max, IM_COL32(0, 0, 0, 150), 3.0f);
+
+    ImVec2 fillMax(min.x + width * ratio, max.y);
+    const int r = static_cast<int>((1.0f - ratio) * 255.0f);
+    const int g = static_cast<int>(ratio * 220.0f + 35.0f);
+    drawList->AddRectFilled(min, fillMax, IM_COL32(r, g, 40, 220), 3.0f);
+    drawList->AddRect(min, max, IM_COL32(255, 255, 255, 120), 3.0f);
+}
 
 struct PxTransformData;
 
@@ -1027,7 +1115,7 @@ static void DrawObjectsWithDataInternal(
     const FMatrix& VPMat,
     const Vec3& localPlayerPos,
     uint64_t engineFrame,
-    float renderDeltaTime);
+    float gameStepDeltaTime);
 static void DrawPhysXGeometry(
     const FMatrix& vpMat,
     const Vec3& localPlayerPos,
@@ -1566,9 +1654,9 @@ static float GetLabelTextScaleByDistance(float distanceMeters) {
     if (distanceMeters <= 20.0f) return 1.00f;
     if (distanceMeters <= 40.0f) return 0.92f;
     if (distanceMeters <= 60.0f) return 0.84f;
-    if (distanceMeters <= 90.0f) return 0.76f;
-    if (distanceMeters <= 130.0f) return 0.68f;
-    return 0.60f;
+    if (distanceMeters <= 90.0f) return 0.68f;
+    if (distanceMeters <= 130.0f) return 0.60f;
+    return 0.50f;
 }
 
 static bool BuildTriangleMeshReadCandidate(const std::vector<Vec3>& vertices, std::vector<uint32_t> indices,
@@ -4090,10 +4178,16 @@ GameFrameData ReadGameData() {
     data.frameCounter = 0;
 
     if (driver_stat.load(std::memory_order_relaxed) <= 0) return data;
-    if (address.Matrix == 0) return data;
+    if (!gUseCameraCacheVPMatrix && address.Matrix == 0) return data;
 
-    // 读取 VP 矩阵（1 ioctl）
-    if (!Paradise_hook->read(address.Matrix, &data.VPMat, sizeof(FMatrix))) {
+    const uint64_t uworld = Paradise_hook->read<uint64_t>(address.libUE4 + offset.Gworld);
+    bool hasViewProjection = false;
+    if (gUseCameraCacheVPMatrix) {
+        hasViewProjection = BuildViewProjectionMatrixFromCameraCache(uworld, data.VPMat);
+    } else if (address.Matrix != 0) {
+        hasViewProjection = Paradise_hook->read(address.Matrix, &data.VPMat, sizeof(FMatrix));
+    }
+    if (!hasViewProjection) {
         return data;
     }
 
@@ -4143,7 +4237,7 @@ uint64_t ReadFrameCounter() {
 }
 
 // 使用预读数据绘制（在 fence wait 后调用）
-void DrawObjectsWithData(const GameFrameData& data, float renderDeltaTime) {
+void DrawObjectsWithData(const GameFrameData& data, float gameStepDeltaTime) {
     if (!gShowObjects) return;
     if (!data.valid) return;
 
@@ -4191,7 +4285,7 @@ void DrawObjectsWithData(const GameFrameData& data, float renderDeltaTime) {
         auto allActors = GetCachedActors();
         if (!allActors || allActors->empty()) { return; }
         DrawObjectsWithDataInternal(*allActors, vpToUse, data.localPlayerPos,
-                                    data.frameCounter, renderDeltaTime);
+                                    data.frameCounter, gameStepDeltaTime);
         return;
     }
 
@@ -4202,15 +4296,15 @@ void DrawObjectsWithData(const GameFrameData& data, float renderDeltaTime) {
     // 按类型分别绘制（根据开关控制，直接传引用避免拷贝）
     if (gShowPlayers && !classified->players.empty()) {
         DrawObjectsWithDataInternal(classified->players, vpToUse, data.localPlayerPos,
-                                    data.frameCounter, renderDeltaTime);
+                                    data.frameCounter, gameStepDeltaTime);
     }
     if (gShowVehicles && !classified->vehicles.empty()) {
         DrawObjectsWithDataInternal(classified->vehicles, vpToUse, data.localPlayerPos,
-                                    data.frameCounter, renderDeltaTime);
+                                    data.frameCounter, gameStepDeltaTime);
     }
     if (gShowOthers && !classified->others.empty()) {
         DrawObjectsWithDataInternal(classified->others, vpToUse, data.localPlayerPos,
-                                    data.frameCounter, renderDeltaTime);
+                                    data.frameCounter, gameStepDeltaTime);
     }
 
 }
@@ -4459,7 +4553,7 @@ static void DrawObjectsWithDataInternal(
     const FMatrix& VPMat,
     const Vec3& localPlayerPos,
     uint64_t engineFrame,
-    float renderDeltaTime)
+    float gameStepDeltaTime)
 {
     // 绘制有映射的 actor
     ImGuiIO& io = ImGui::GetIO();
@@ -4541,7 +4635,11 @@ static void DrawObjectsWithDataInternal(
 
         // 无骨骼对象也给一个基于 actor 原点的文本锚点，确保“显示所有类名”能覆盖整个 actor 数组。
         topLabelWorldPos = actorPos;
-        topLabelWorldPos.Z += 10.0f;
+        if (ca.actorType == ActorType::PLAYER) {
+            topLabelWorldPos.Z += 18.0f;
+        } else {
+            topLabelWorldPos.Z -= 8.0f;
+        }
         hasTopLabel = true;
 
         if (drawSkeleton) {
@@ -4620,7 +4718,12 @@ static void DrawObjectsWithDataInternal(
                         bool boneOnScreen[BONE_COUNT] = {false};
                         bool boneVisible[BONE_COUNT];
                         std::fill(std::begin(boneVisible), std::end(boneVisible), true);
-                        const bool needVisibility = gUseDepthBufferVisibility;
+                        const bool autoAimNeedsVisibility =
+                            (gAutoAim != nullptr) &&
+                            gAutoAim->GetConfig().enabled &&
+                            gAutoAim->GetConfig().visibilityCheck;
+                        const bool needVisibility =
+                            gUseDepthBufferVisibility && (gDrawSkeleton || autoAimNeedsVisibility);
                         const Vec3 cameraWorldPos = needVisibility ? ReadCameraWorldPosForPhysX() : Vec3::Zero();
                         const bool useVisibilityCheck = needVisibility &&
                                                         (cameraWorldPos.X != 0.0f || cameraWorldPos.Y != 0.0f || cameraWorldPos.Z != 0.0f);
@@ -4631,7 +4734,7 @@ static void DrawObjectsWithDataInternal(
                         float lerpFactor = 1.0f;
                         if (gEnableBoneSmoothing) {
                             // lerpFactor 越小越平滑，越大越跟手。
-                            lerpFactor = std::min(1.0f, renderDeltaTime * 35.0f);
+                            lerpFactor = std::min(1.0f, gameStepDeltaTime * 35.0f);
                         }
 
                         // 收集所有骨骼世界坐标
@@ -4670,7 +4773,7 @@ static void DrawObjectsWithDataInternal(
                             // 保存标签位置
                             if (boneID == BONE_HEAD) {
                                 topLabelWorldPos = worldPos;
-                                topLabelWorldPos.Z += 7.0f;  // 头部上方 7 单位
+                                topLabelWorldPos.Z += 15.0f;  // 人物标签整体上移，给血条留空间
                                 hasTopLabel = true;
                             } else if (boneID == BONE_ROOT) {  // 根骨骼（用于 bottom label）
                                 bottomLabelWorldPos = worldPos;
@@ -4714,6 +4817,7 @@ static void DrawObjectsWithDataInternal(
                         BoneScreenData bsd;
                         std::copy(std::begin(boneScreenPos), std::end(boneScreenPos), std::begin(bsd.screenPos));
                         std::copy(std::begin(boneOnScreen), std::end(boneOnScreen), std::begin(bsd.onScreen));
+                        std::copy(std::begin(boneVisible), std::end(boneVisible), std::begin(bsd.visible));
                         bsd.distance = distance;
                         bsd.teamID = ca.teamID;
                         bsd.actorAddr = ca.actorAddr;
@@ -4732,6 +4836,12 @@ static void DrawObjectsWithDataInternal(
             if (WorldToScreen(topLabelWorldPos, VPMat, io.DisplaySize.x, io.DisplaySize.y, topLabelScreenPos)) {
                 ImVec2 labelPos(topLabelScreenPos.x, topLabelScreenPos.y);
                 ImU32 teamColor = GetTeamColor(ca.teamID);
+                float health = -1.0f;
+                float healthMax = -1.0f;
+                if (ca.actorType == ActorType::PLAYER) {
+                    health = Paradise_hook->read<float>(ca.actorAddr + offset.Health);
+                    healthMax = Paradise_hook->read<float>(ca.actorAddr + offset.HealthMax);
+                }
 
                 char displayName[256];
                 if (!ca.playerName.empty() && ca.teamID >= 0) {
@@ -4746,9 +4856,23 @@ static void DrawObjectsWithDataInternal(
                 float originalFontSize = font->LegacySize;
                 float scaledFontSize = originalFontSize * textScale;
                 ImVec2 textSize = font->CalcTextSizeA(scaledFontSize, FLT_MAX, 0.0f, displayName);
-                ImVec2 textPos(labelPos.x - textSize.x * 0.5f, labelPos.y - textSize.y - 5.0f);
+                const float labelYOffset = (ca.actorType == ActorType::PLAYER) ? 18.0f : 2.0f;
+                ImVec2 textPos(labelPos.x - textSize.x * 0.5f, labelPos.y - textSize.y - labelYOffset);
+                ImVec2 bgMin(textPos.x - 6.0f, textPos.y - 3.0f);
+                ImVec2 bgMax(textPos.x + textSize.x + 6.0f, textPos.y + textSize.y + 3.0f);
+
+                DrawLabelBackground(draw_list, bgMin, bgMax, IM_COL32(0, 0, 0, 140));
+                draw_list->AddRect(bgMin, bgMax, IM_COL32(255, 255, 255, 32), 6.0f);
 
                 draw_list->AddText(font, scaledFontSize, textPos, teamColor, displayName);
+
+                if (health > 0.0f && healthMax > 1.0f && std::isfinite(health) && std::isfinite(healthMax)) {
+                    const float healthRatio = std::clamp(health / healthMax, 0.0f, 1.0f);
+                    const float barWidth = std::max(36.0f, textSize.x);
+                    const float barHeight = std::max(4.0f, scaledFontSize * 0.18f);
+                    ImVec2 barAnchor(labelPos.x, bgMin.y - barHeight - 7.0f);
+                    DrawHealthBar(draw_list, barAnchor, barWidth, barHeight, healthRatio);
+                }
             }
         }
 

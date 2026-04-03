@@ -18,6 +18,7 @@ struct AutoAimConfig {
     float outputScaleX = 1.0f;       // X 轴输出倍率
     float outputScaleY = 1.0f;       // Y 轴输出倍率
     bool filterTeammates = true;     // 过滤队友
+    bool visibilityCheck = false;    // 仅锁定可见目标
     float hysteresisThreshold = 50.0f; // 目标切换阈值（像素）
     bool drawDebug = false;          // 绘制调试信息
     float holtAlpha = 0.7f;          // Holt 位置平滑系数 (越高越灵敏)

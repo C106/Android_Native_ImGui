@@ -8,7 +8,9 @@
 #include "ANativeWindowCreator.h"  // 用于 LayerStack 监控
 #include "game_fps_monitor.h"
 #include "auto_aim.h"
+#include "arm64_hwbp_debugger_compat.h"
 #include "TouchScrollable.h"
+#include <cstring>
 
 
 // From Main
@@ -33,6 +35,8 @@ Addresses address;
 // UI 线程持有的 libUE4（仅 mem 按钮初始化时写入）
 static uint64_t libUE4 = 0;
 static bool gShowPhysXDebugWindow = false;
+static bool gShowBulletSpreadDebugWindow = false;
+static int gBulletBreakpointTargetUi = 0;
 
 struct PhysXSceneMapEntryDebug {
     uint16_t key;
@@ -171,6 +175,74 @@ static void DrawPhysXDebugWindow() {
     ImGui::End();
 }
 
+static void DrawBulletSpreadDebugWindow() {
+    if (!gShowBulletSpreadDebugWindow) return;
+
+    const BulletSpreadDebugState state = GetBulletSpreadDebugState();
+
+    ImGui::SetNextWindowSize(ImVec2(520.0f, 280.0f), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Bullet Spread Debug", &gShowBulletSpreadDebugWindow)) {
+        ImGui::End();
+        return;
+    }
+
+    ImGui::Text("arm64_hwbp_debugger uprobe probe");
+    ImGui::Separator();
+    ImGui::Text("Target: %s",
+                state.target == BulletBreakpointTarget::EngineLoopProbe
+                    ? "EngineLoopProbe"
+                    : "BulletSpreadFuncEntry");
+    ImGui::Text("Requested: %s", state.requestedEnabled ? "true" : "false");
+    ImGui::Text("Thread: %s", state.threadRunning ? "running" : "stopped");
+    ImGui::Text("Session: %s", state.sessionOpen ? "open" : "closed");
+    ImGui::Text("Probe: %s", state.breakpointArmed ? "registered" : "not registered");
+    ImGui::Text("Valid Hit: %s", state.valid ? "true" : "false");
+    if (ImGui::Button("GET_STATUS ioctl")) {
+        RequestBulletSpreadDriverStatus();
+    }
+    if (state.statusValid) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("status ok");
+    } else if (state.lastStatusError != 0) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "status err=%d", state.lastStatusError);
+    }
+    ImGui::Text("PID/TID: %d / %d", state.pid, state.tid);
+    ImGui::Text("Hits: %llu", static_cast<unsigned long long>(state.hitCount));
+    ImGui::Text("BP Addr: 0x%llX", static_cast<unsigned long long>(state.breakpointAddr));
+    ImGui::Text("PC: 0x%llX", static_cast<unsigned long long>(state.pc));
+    ImGui::Text("this: 0x%llX", static_cast<unsigned long long>(state.thisPtr));
+    ImGui::Separator();
+    ImGui::Text("Driver Status Addr: 0x%llX", static_cast<unsigned long long>(state.driverStatusAddr));
+    ImGui::Text("Driver Status Hits: %llu", static_cast<unsigned long long>(state.driverStatusHitCount));
+    ImGui::Text("Driver Status Registrations: %u", state.driverStatusThreadCount);
+    ImGui::Text("Driver Status Flags: 0x%X", state.driverStatusFlags);
+    ImGui::Text("Driver Active/Ready/Disabled: %s / %s / %s",
+                (state.driverStatusFlags & ARM64_HWBP_STATUS_ACTIVE) ? "yes" : "no",
+                (state.driverStatusFlags & ARM64_HWBP_STATUS_HIT_READY) ? "yes" : "no",
+                (state.driverStatusFlags & ARM64_HWBP_STATUS_DISABLED) ? "yes" : "no");
+    ImGui::Text("Last Status (monotonic ms): %llu",
+                static_cast<unsigned long long>(state.lastStatusMonotonicMs));
+    ImGui::Separator();
+    ImGui::TextDisabled("uprobe backend probes one file offset for the target process, not per-thread HW slots");
+    ImGui::Text("Spread: %.5f, %.5f, %.5f", state.spread.X, state.spread.Y, state.spread.Z);
+    ImGui::Text("Deviation: %.5f", state.deviation);
+    ImGui::Text("Deviation Yaw/Pitch: %.5f / %.5f", state.deviationYaw, state.deviationPitch);
+    ImGui::Text("Last Hit (monotonic ms): %llu",
+                static_cast<unsigned long long>(state.lastHitMonotonicMs));
+
+    if (state.lastError != 0) {
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
+                           "Error: %d (%s)", state.lastError, strerror(state.lastError));
+    } else if (state.requestedEnabled && state.hitCount == 0) {
+        ImGui::Separator();
+        ImGui::TextDisabled("Waiting for breakpoint hit...");
+    }
+
+    ImGui::End();
+}
+
 void Draw_Menu_ResetTextures() {
     gLogoTexture = (ImTextureID)0;
     gLogoWidth = 0;
@@ -180,6 +252,8 @@ void Draw_Menu_ResetTextures() {
 void Draw_Menu() {
     //Gyro_Controller->update(gyro_x, gyro_y);
     ImGuiIO& io = ImGui::GetIO();
+    SetBulletBreakpointTarget(static_cast<BulletBreakpointTarget>(gBulletBreakpointTargetUi));
+    SetBulletSpreadMonitorEnabled(gShowBulletSpreadDebugWindow);
 
     // 在函数开始就保存原始鼠标状态（在任何控件修改之前）
     static bool was_mouse_down = false;
@@ -308,6 +382,7 @@ void Draw_Menu() {
     ImGui::PopStyleVar(4);
     ImGui::End();
     DrawPhysXDebugWindow();
+    DrawBulletSpreadDebugWindow();
 }
 
 // Camera Tab
@@ -380,6 +455,7 @@ void DrawCameraTab() {
 
     ImGui::SliderFloat("目标切换阈值 (像素)", &cfg.hysteresisThreshold, 10.0f, 200.0f, "%.0f");
     ImGui::Checkbox("过滤队友", &cfg.filterTeammates);
+    ImGui::Checkbox("可视性限制", &cfg.visibilityCheck);
     ImGui::Checkbox("显示调试信息", &cfg.drawDebug);
 
     const TargetState& state = gAutoAim->GetTargetState();
@@ -417,6 +493,8 @@ void DrawObjViewTab() {
     ImGui::Checkbox("骨骼 (Skeleton)", &gDrawSkeleton);
     ImGui::Checkbox("骨骼可视性射线检测", &gUseDepthBufferVisibility);
     ImGui::Checkbox("骨骼平滑", &gEnableBoneSmoothing);
+    ImGui::Checkbox("使用 CameraCache VP 矩阵", &gUseCameraCacheVPMatrix);
+    ImGui::TextDisabled("切换主矩阵来源: CanvasMap 或 CameraCache->MinimalViewInfo");
     ImGui::Checkbox("名称 (Name)", &gDrawName);
     ImGui::Checkbox("距离 (Distance)", &gDrawDistance);
     ImGui::Checkbox("包围盒 (Box)", &gDrawBox);
@@ -425,7 +503,14 @@ void DrawObjViewTab() {
     ImGui::Separator();
     ImGui::Text("PhysX 几何体:");
     ImGui::Checkbox("显示 PhysX 几何", &gDrawPhysXGeometry);
-    ImGui::Checkbox("显示 PhysX 调试窗口", &gShowPhysXDebugWindow);
+        ImGui::Checkbox("显示 PhysX 调试窗口", &gShowPhysXDebugWindow);
+        if (ImGui::Checkbox("显示子弹扩散调试窗口", &gShowBulletSpreadDebugWindow)) {
+            SetBulletSpreadMonitorEnabled(gShowBulletSpreadDebugWindow);
+        }
+        const char* bpTargets[] = {"BulletSpreadFuncEntry", "EngineLoopProbe"};
+        if (ImGui::Combo("子弹断点目标", &gBulletBreakpointTargetUi, bpTargets, 2)) {
+            SetBulletBreakpointTarget(static_cast<BulletBreakpointTarget>(gBulletBreakpointTargetUi));
+        }
     ImGui::Checkbox("绘制 Mesh", &gPhysXDrawMeshes);
     ImGui::Checkbox("绘制基础体", &gPhysXDrawPrimitives);
     ImGui::Checkbox("读取本地模型数据", &gPhysXUseLocalModelData);
@@ -468,16 +553,10 @@ void DrawConfigTab() {
     }
 
     ImGui::Separator();
-    ImGui::Text("Overlay 帧率:");
-    ImGui::SliderInt("Target FPS", &gTargetFPS, 0, 144);
-    ImGui::SameLine();
-    if (gTargetFPS == 0) {
-        ImGui::Text("无限制 (最低延迟)");
-    } else {
-        ImGui::Text("%d FPS", gTargetFPS);
-    }
-    ImGui::TextDisabled("提示: 会自动匹配游戏 FPS 设置，也可手动调整");
-    ImGui::TextDisabled("设为 0 可获得最低延迟，但会增加 CPU 占用");
+    ImGui::Text("Overlay 帧同步:");
+    ImGui::Text("跟随游戏帧率: %d FPS", gTargetFPS);
+    ImGui::TextDisabled("Overlay 现在只在检测到游戏新帧时推进");
+    ImGui::TextDisabled("该值由游戏 FPS 设置自动同步，不再单独限速");
 
     // 骨骼绘制距离限制
     ImGui::Separator();

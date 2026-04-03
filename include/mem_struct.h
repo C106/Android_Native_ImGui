@@ -544,6 +544,8 @@ struct Offsets{
     // UAECharacter (Character.Pawn.Actor.Object)
     uintptr_t PlayerName = 0xae8;           // FString PlayerName
     uintptr_t TeamID = 0xb68;              // int TeamID
+    uintptr_t Health = 0xfd8;              // STExtraCharacter -> float Health
+    uintptr_t HealthMax = 0xfe0;           // STExtraCharacter -> float HealthMax
     uintptr_t bIsWeaponFiring = 0x2598;    // bool (ByteOffset: 0, ByteMask: 1, FieldMask: 255)
     // FApp::DeltaTime (GOT 表，需要两次解引用)
     uintptr_t FAppDeltaTimeGOT = 0x14012220;  // libUE4 + offset -> ptr -> double*

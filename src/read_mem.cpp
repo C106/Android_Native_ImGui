@@ -30,109 +30,6 @@ static std::thread gReadThread;
 static std::atomic<bool> gReadThreadRunning{false};
 static uint64_t sLibUE4 = 0; // 读取线程用的 libUE4 副本
 static std::atomic<int> gGameFPSLevel{6}; // 游戏 FPS Level (默认 6=60fps)
-static std::thread gBreakpointThread;
-static std::atomic<bool> gBreakpointThreadRunning{false};
-static std::atomic<uint64_t> gBreakpointHitCount{0};
-static std::atomic<uintptr_t> gBreakpointAddress{0};
-static std::atomic<int> gBreakpointPollError{0};
-
-static constexpr uintptr_t kRtHookExecBreakpointOffset = 0x8087F88ULL;
-static constexpr size_t kBreakpointPollBatchSize = 64;
-
-static void breakpointThreadFunc() {
-    SetThreadAffinity(CoreTier::LITTLE);
-
-    HW_BREAKPOINT_HIT_INFO hits[kBreakpointPollBatchSize]{};
-    int lastError = 0;
-    while (gBreakpointThreadRunning.load(std::memory_order_relaxed)) {
-        if (!Paradise_hook || Paradise_hook->getType() != DRIVER_RT_HOOK ||
-            driver_stat.load(std::memory_order_acquire) <= 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            continue;
-        }
-
-        const int hitCount = Paradise_hook->get_breakpoint_hits(hits, kBreakpointPollBatchSize);
-        if (hitCount > 0) {
-            const uint64_t totalHits =
-                gBreakpointHitCount.fetch_add(static_cast<uint64_t>(hitCount), std::memory_order_relaxed) +
-                static_cast<uint64_t>(hitCount);
-            const uintptr_t breakpointAddr = gBreakpointAddress.load(std::memory_order_relaxed);
-            const uintptr_t lastPc = hits[hitCount - 1].regs.pc;
-
-            printf("[RT Hook BP] addr=0x%llx hit +%d total=%llu last_pc=0x%llx\n",
-                   static_cast<unsigned long long>(breakpointAddr),
-                   hitCount,
-                   static_cast<unsigned long long>(totalHits),
-                   static_cast<unsigned long long>(lastPc));
-            fflush(stdout);
-            continue;
-        }
-
-        if (hitCount < 0) {
-            if (hitCount != lastError) {
-                const uintptr_t breakpointAddr = gBreakpointAddress.load(std::memory_order_relaxed);
-                gBreakpointPollError.store(hitCount, std::memory_order_relaxed);
-                printf("[RT Hook BP] poll failed addr=0x%llx err=%d (%s)\n",
-                       static_cast<unsigned long long>(breakpointAddr),
-                       -hitCount,
-                       strerror(-hitCount));
-                fflush(stdout);
-                lastError = hitCount;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            continue;
-        }
-
-        if (lastError != 0) {
-            gBreakpointPollError.store(0, std::memory_order_relaxed);
-            printf("[RT Hook BP] poll recovered\n");
-            fflush(stdout);
-            lastError = 0;
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-}
-
-static void StopRtHookBreakpointMonitor() {
-    gBreakpointThreadRunning.store(false, std::memory_order_release);
-    if (gBreakpointThread.joinable()) {
-        gBreakpointThread.join();
-    }
-
-    const uintptr_t breakpointAddr = gBreakpointAddress.exchange(0, std::memory_order_acq_rel);
-    if (breakpointAddr != 0 && Paradise_hook && Paradise_hook->getType() == DRIVER_RT_HOOK) {
-        Paradise_hook->remove_breakpoint(breakpointAddr);
-    }
-}
-
-static void StartRtHookBreakpointMonitor(uint64_t libUE4Base) {
-    StopRtHookBreakpointMonitor();
-
-    if (!Paradise_hook || Paradise_hook->getType() != DRIVER_RT_HOOK || libUE4Base == 0) {
-        return;
-    }
-
-    const uintptr_t breakpointAddr = libUE4Base + kRtHookExecBreakpointOffset;
-    const int ret = Paradise_hook->add_breakpoint(breakpointAddr, HW_BP_TYPE_EXECUTE, 4);
-    if (ret != 0) {
-        printf("[RT Hook BP] add failed addr=0x%llx errno=%d\n",
-               static_cast<unsigned long long>(breakpointAddr), ret);
-        fflush(stdout);
-        return;
-    }
-
-    gBreakpointHitCount.store(0, std::memory_order_relaxed);
-    gBreakpointPollError.store(0, std::memory_order_relaxed);
-    gBreakpointAddress.store(breakpointAddr, std::memory_order_release);
-    gBreakpointThreadRunning.store(true, std::memory_order_release);
-    gBreakpointThread = std::thread(breakpointThreadFunc);
-
-    printf("[RT Hook BP] armed addr=0x%llx (libUE4 + 0x%llx)\n",
-           static_cast<unsigned long long>(breakpointAddr),
-           static_cast<unsigned long long>(kRtHookExecBreakpointOffset));
-    fflush(stdout);
-}
 
 // ═══════════════════════════════════════════
 //  名称缓存
@@ -306,8 +203,7 @@ void InitDriver(const char* packageName, uint64_t& libUE4Out) {
 
         address.Matrix = Paradise_hook->read<uint64_t>(
             Paradise_hook->read<uint64_t>(libUE4Out + offset.CanvasMap) + 0x20) + 0x270;
-
-        StartRtHookBreakpointMonitor(libUE4Out);
+        ConfigureBulletSpreadMonitor(pid, libUE4Out);
 
         // LocalPlayerActor 由读取线程定期刷新（每 ~10 次扫描）
 
@@ -684,7 +580,7 @@ void StopReadThread() {
     gReadThreadRunning.store(false);
     if (gReadThread.joinable())
         gReadThread.join();
-    StopRtHookBreakpointMonitor();
+    ShutdownBulletSpreadMonitor();
 }
 
 // ═══════════════════════════════════════════

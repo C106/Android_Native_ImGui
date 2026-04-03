@@ -6,6 +6,8 @@
 #include "draw_objects.h"
 #include "read_mem.h"
 #include "auto_aim.h"
+#include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <atomic>
 #include <thread>
@@ -39,8 +41,71 @@ int gTargetFPS = 120;
 // FPS 统计
 static int gFrameCount = 0;
 static float gCurrentFPS = 0.0f;
-static int gEffectiveFPS = 0;  // 实际生效的帧率（自适应后）
+static int gEffectiveFPS = 0;  // 实际同步到的绘制 FPS
 static auto gLastFPSUpdateTime = std::chrono::steady_clock::now();
+static float gLastSyncedDeltaTime = 1.0f / 60.0f;
+static auto gLastUiRenderTime = std::chrono::steady_clock::now();
+static GameFrameData gLastRenderedGameData{};
+static bool gHasLastRenderedGameData = false;
+
+static float GetFallbackGameDeltaTime();
+static float GetRenderStepDeltaTime();
+
+static void ResetSynchronizedTiming() {
+    gLastSyncedDeltaTime = 1.0f / 60.0f;
+}
+
+static bool ShouldRenderUnsyncedUiFrame() {
+    float fallbackDeltaTime = GetRenderStepDeltaTime();
+    auto kUiFallbackInterval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<float>(fallbackDeltaTime));
+    auto now = std::chrono::steady_clock::now();
+    if (now - gLastUiRenderTime < kUiFallbackInterval) {
+        return false;
+    }
+    gLastUiRenderTime = now;
+    return true;
+}
+
+static void MarkUiFrameRendered() {
+    gLastUiRenderTime = std::chrono::steady_clock::now();
+}
+
+static float GetFallbackGameDeltaTime() {
+    int targetFPS = GetGameTargetFPS();
+    if (targetFPS <= 0) {
+        targetFPS = (gTargetFPS > 0) ? gTargetFPS : 60;
+    }
+    targetFPS = std::clamp(targetFPS, 1, 240);
+    return 1.0f / static_cast<float>(targetFPS);
+}
+
+static float GetRenderStepDeltaTime() {
+    int targetFPS = GetGameTargetFPS();
+    if (targetFPS <= 0) {
+        targetFPS = (gTargetFPS > 0) ? gTargetFPS : 60;
+    }
+    targetFPS = std::clamp(targetFPS, 20, 144);
+    return 1.0f / static_cast<float>(targetFPS);
+}
+
+static float ResolveSynchronizedDeltaTime(const GameFrameData& gameData) {
+    constexpr float kMinDeltaTime = 1.0f / 240.0f;
+    constexpr float kMaxDeltaTime = 0.25f;
+
+    float deltaTime = gameData.gameDeltaTime;
+    if (deltaTime >= kMinDeltaTime && deltaTime <= kMaxDeltaTime) {
+        gLastSyncedDeltaTime = deltaTime;
+        return deltaTime;
+    }
+
+    if (gLastSyncedDeltaTime >= kMinDeltaTime && gLastSyncedDeltaTime <= kMaxDeltaTime) {
+        return gLastSyncedDeltaTime;
+    }
+
+    gLastSyncedDeltaTime = GetFallbackGameDeltaTime();
+    return gLastSyncedDeltaTime;
+}
 
 
 // 重新初始化所有组件（用于屏幕旋转后）
@@ -145,10 +210,10 @@ static void DrawFPSCounter(const game_fps_monitor::GameFPSStats& gameStats) {
         // 显示 FPS（绿色文字）
         ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "FPS: %.1f", gCurrentFPS);
 
-        // 显示目标 FPS（灰色小字），如果自适应降低了则显示实际值
+        // 显示同步后的 Overlay FPS 与游戏目标 FPS
         ImGui::SameLine();
         if (gEffectiveFPS > 0 && gEffectiveFPS < gTargetFPS) {
-            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "(Limit: %d/%d)", gEffectiveFPS, gTargetFPS);
+            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "(Sync: %d/%d)", gEffectiveFPS, gTargetFPS);
         } else {
             ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "(Target: %d)", gTargetFPS);
         }
@@ -212,16 +277,15 @@ int main() {
     int lastOrientation = displayInfo.orientation;
     int frameCounter = 0;
     bool firstFrame = true; // 首帧无上一帧需要等待
-
-    // 帧率控制：固定时间步进，避免累积误差
-    auto nextFrameTime = std::chrono::steady_clock::now();
+    uint64_t lastSyncedGameFrame = 0;
+    bool previousMenuOpen = IsMenuOpen.load(std::memory_order_relaxed);
 
     //Paradise_hook = new c_driver();
     StartReadThread();
     InitAutoAim();
-
-    // 帧时间跟踪
-    auto lastFrameTime = std::chrono::steady_clock::now();
+    ResetSynchronizedTiming();
+    gLastUiRenderTime = std::chrono::steady_clock::now();
+    gHasLastRenderedGameData = false;
 
     // ── 主循环 ──
     while (IsToolActive == 1) {
@@ -248,6 +312,10 @@ int main() {
 
             LOGD("Main loop: skipping this frame after reinit\n");
             firstFrame = true; // reinit 后无上一帧需要等待
+            lastSyncedGameFrame = 0;
+            ResetSynchronizedTiming();
+            gLastUiRenderTime = std::chrono::steady_clock::now();
+            gHasLastRenderedGameData = false;
             continue; // 跳过本帧渲染，下帧用新管线
         }
 
@@ -272,8 +340,36 @@ int main() {
             }
         }
 
-        // 4. 在 fence wait 前读取游戏数据（减少 8-16ms 延迟）
-        GameFrameData gameData = ReadGameData();
+        const bool menuOpen = IsMenuOpen.load(std::memory_order_relaxed);
+        const bool menuStateChanged = (menuOpen != previousMenuOpen);
+        uint64_t currentGameFrame = ReadFrameCounter();
+
+        if (lastSyncedGameFrame != 0 && currentGameFrame < lastSyncedGameFrame) {
+            lastSyncedGameFrame = 0;
+            ResetSynchronizedTiming();
+            firstFrame = true;
+        }
+
+        const bool hasNewGameFrame = currentGameFrame != 0 && currentGameFrame != lastSyncedGameFrame;
+        if (!hasNewGameFrame && !menuOpen && !menuStateChanged) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+        }
+
+        if (!hasNewGameFrame && !menuStateChanged && !ShouldRenderUnsyncedUiFrame()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+        }
+
+        GameFrameData gameData = gLastRenderedGameData;
+        bool haveRenderableGameFrame = false;
+        float syncedDeltaTime = GetFallbackGameDeltaTime();
+        const float renderStepDeltaTime = GetRenderStepDeltaTime();
+
+        if (!haveRenderableGameFrame && !gHasLastRenderedGameData && !menuOpen && !menuStateChanged) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+        }
 
         // 5. 等待 GPU pipeline 清空（首帧跳过，无上一帧需要等待）
         if (!firstFrame) {
@@ -281,9 +377,24 @@ int main() {
         }
         firstFrame = false;
 
+        if (hasNewGameFrame) {
+            // GPU 可提交后再抓取游戏快照，减少数据在 fence wait 期间变旧。
+            gameData = ReadGameData();
+            if (gameData.valid) {
+                if (gameData.frameCounter == 0) {
+                    gameData.frameCounter = currentGameFrame;
+                }
+
+                if (lastSyncedGameFrame == 0 || gameData.frameCounter > lastSyncedGameFrame) {
+                    syncedDeltaTime = ResolveSynchronizedDeltaTime(gameData);
+                    haveRenderableGameFrame = true;
+                }
+            }
+        }
+
         // 6. fence 释放后使用预读数据渲染
         ImGui_ProcessPendingTextureLoads();
-        gImGui.beginFrame(gWindow, displayInfo.width, displayInfo.height);
+        gImGui.beginFrame(gWindow, displayInfo.width, displayInfo.height, renderStepDeltaTime);
 
         // 统计 FPS（每秒更新一次）
         gFrameCount++;
@@ -291,26 +402,26 @@ int main() {
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - gLastFPSUpdateTime).count();
         if (elapsed >= 1000) {  // 每 1000ms 更新一次
             gCurrentFPS = gFrameCount * 1000.0f / elapsed;
+            gEffectiveFPS = static_cast<int>(std::lround(gCurrentFPS));
             gFrameCount = 0;
             gLastFPSUpdateTime = now;
         }
 
-        // 计算帧时间
-        auto currentFrameTime = std::chrono::steady_clock::now();
-        float frameDeltaTime = std::chrono::duration<float>(currentFrameTime - lastFrameTime).count();
-        lastFrameTime = currentFrameTime;
-
-        DrawObjectsWithData(gameData, frameDeltaTime);  // 使用预读数据 + 插值平滑
+        if (haveRenderableGameFrame) {
+            DrawObjectsWithData(gameData, renderStepDeltaTime);  // 绘制侧使用固定步长，避免受真实 DeltaTime 波动影响
+        } else if (gHasLastRenderedGameData) {
+            DrawObjectsWithData(gLastRenderedGameData, renderStepDeltaTime);
+        }
 
         // 缓存游戏 FPS 统计（每帧一次，避免重复加锁）
         auto gameStats = GetGameFPSStats();
 
         // 自瞄更新
-        if (gAutoAim) {
-            gAutoAim->Update(frameDeltaTime);
+        if (haveRenderableGameFrame && gAutoAim) {
+            gAutoAim->Update(syncedDeltaTime);
         }
 
-        if (IsMenuOpen == 1)
+        if (menuOpen)
             Draw_Menu();
 
         DrawFPSCounter(gameStats);  // 显示 FPS 计数器（左下角）
@@ -323,16 +434,13 @@ int main() {
 
         gImGui.endFrame();
         gImGui.submitAndPresent(gApp);  // MAILBOX 模式非阻塞，降低延迟
-
-        // 7. targetFPS 限速
-        gEffectiveFPS = gTargetFPS;  // 保存供 FPS counter 显示
-        if (gTargetFPS > 0) {
-            auto targetDuration = std::chrono::microseconds(1000000 / gTargetFPS);
-            nextFrameTime += targetDuration;
-            auto nowTime = std::chrono::steady_clock::now();
-            if (nextFrameTime <= nowTime) nextFrameTime = nowTime + targetDuration;
-            else std::this_thread::sleep_for(nextFrameTime - nowTime);
+        MarkUiFrameRendered();
+        if (haveRenderableGameFrame) {
+            lastSyncedGameFrame = gameData.frameCounter;
+            gLastRenderedGameData = gameData;
+            gHasLastRenderedGameData = true;
         }
+        previousMenuOpen = menuOpen;
     }
 
     // ── 清理 ──

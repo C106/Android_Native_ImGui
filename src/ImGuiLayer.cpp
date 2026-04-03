@@ -162,7 +162,7 @@ void ImGuiLayer::shutdown(VulkanApp& app)
 }
 
 
-void ImGuiLayer::beginFrame(ANativeWindow* window, int width, int height) {
+void ImGuiLayer::beginFrame(ANativeWindow* window, int width, int height, float deltaTime) {
     if (!initialized) {
         LOGI( "ImGui not initialized, skipping beginFrame");
         return;
@@ -174,6 +174,9 @@ void ImGuiLayer::beginFrame(ANativeWindow* window, int width, int height) {
 
     ImGui_ImplVulkan_NewFrame();
     ImGui_ImplAndroid_NewFrame();
+    if (deltaTime > 0.0f) {
+        io.DeltaTime = deltaTime;
+    }
     ImGui::NewFrame();
 }
 

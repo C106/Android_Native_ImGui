@@ -24,7 +24,7 @@ public:
 
     void init(ANativeWindow* window, VulkanApp& app);
     void shutdown(VulkanApp& app);
-    void beginFrame(ANativeWindow* window, int width, int height);
+    void beginFrame(ANativeWindow* window, int width, int height, float deltaTime);
     void frame_render(VulkanApp& app);
     void endFrame();
     void uploadFonts(VulkanApp& app);

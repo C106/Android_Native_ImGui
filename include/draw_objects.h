@@ -17,6 +17,7 @@ struct GameFrameData {
 struct BoneScreenData {
     Vec2 screenPos[BONE_COUNT];
     bool onScreen[BONE_COUNT];
+    bool visible[BONE_COUNT];
     float distance;
     int teamID;
     uint64_t actorAddr;
@@ -28,6 +29,7 @@ extern bool gShowObjects;
 extern bool gShowAllClassNames;
 extern bool gUseBatchBoneRead;  // true=批量读取（优化），false=逐个读取（调试）
 extern bool gEnableBoneSmoothing;  // true=骨骼插值平滑，false=低延迟直出
+extern bool gUseCameraCacheVPMatrix;  // true=使用 CameraCache/MinimalViewInfo 构建 VP，false=使用现有矩阵地址
 extern int gBoneCount;
 extern float gMaxSkeletonDistance;  // 超过此距离不绘制骨骼（米）
 
@@ -68,8 +70,8 @@ GameFrameData ReadGameData();
 uint64_t ReadFrameCounter();
 
 // 使用预读数据绘制（在 fence wait 后调用）
-// renderDeltaTime: 渲染帧间隔（秒），用于骨骼插值
-void DrawObjectsWithData(const GameFrameData& data, float renderDeltaTime);
+// gameStepDeltaTime: 与游戏帧同步的时间步（秒），用于骨骼插值
+void DrawObjectsWithData(const GameFrameData& data, float gameStepDeltaTime);
 
 // 旧接口（保留兼容性）
 void DrawObjects();

@@ -520,6 +520,7 @@ AutoAimController::AutoAimController() {
     config.outputScaleX = 1.00f;
     config.outputScaleY = 1.00f;
     config.filterTeammates = true;
+    config.visibilityCheck = false;
     config.hysteresisThreshold = 35.0f;
     config.drawDebug = false;
 
@@ -595,13 +596,18 @@ bool AutoAimController::SelectTarget(const Vec2& screenCenter, uint64_t& outActo
         if (bsd.distance > config.maxDistance) continue;
 
         int candidateBone = config.targetBone;
-        if (!bsd.onScreen[candidateBone]) {
+        const bool requireVisibility = gUseDepthBufferVisibility && config.visibilityCheck;
+        auto boneUsable = [&](int boneID) -> bool {
+            return bsd.onScreen[boneID] && (!requireVisibility || bsd.visible[boneID]);
+        };
+
+        if (!boneUsable(candidateBone)) {
             static const int kFallbackBones[] = {
                 BONE_CHEST, BONE_NECK, BONE_PELVIS, BONE_HEAD
             };
             bool foundFallback = false;
             for (int boneID : kFallbackBones) {
-                if (bsd.onScreen[boneID]) {
+                if (boneUsable(boneID)) {
                     candidateBone = boneID;
                     foundFallback = true;
                     break;
