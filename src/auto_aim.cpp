@@ -2,6 +2,7 @@
 #include "ImGuiLayer.h"
 #include "Gyro.h"
 #include "driver_manager.h"
+#include "game_frame_reader.h"
 #include "hook_touch_event.h"
 #include <cmath>
 #include <algorithm>
@@ -781,8 +782,8 @@ bool AutoAimController::ShouldSwitchTarget(const Vec2& currentPos, const Vec2& n
 
 bool AutoAimController::SelectTarget(const Vec2& screenCenter, bool requireVisibility,
                                      uint64_t& outActorAddr, int& outBoneID, Vec2& outScreenPos) {
-    const auto boneCache = GetBoneScreenCache();
-    if (boneCache.empty()) return false;
+    const auto boneCache = GetBoneScreenCacheSnapshot();
+    if (!boneCache || boneCache->empty()) return false;
     uint64_t currentFrame = ReadFrameCounter();
     const Vec3 cameraWorldPos = ReadCameraWorldPos();
 
@@ -791,7 +792,7 @@ bool AutoAimController::SelectTarget(const Vec2& screenCenter, bool requireVisib
     Vec2 bestPos;
     float bestDistance = FLT_MAX;
 
-    for (const auto& pair : boneCache) {
+    for (const auto& pair : *boneCache) {
         const BoneScreenData& bsd = pair.second;
         if (!bsd.valid) continue;
         if (currentFrame != 0 && bsd.frameCounter != 0 && currentFrame > bsd.frameCounter + 2) continue;
@@ -912,12 +913,14 @@ void AutoAimController::UpdateTriggerBot(const Vec2& rawScreenCenter) {
     BoneScreenData targetBoneDataCopy;
     bool foundBoneData = false;
     {
-        const auto boneCache = GetBoneScreenCache();
-        auto it = boneCache.find(targetActor);
-        if (it != boneCache.end()) {
-            targetDistance = it->second.distance;
-            targetBoneDataCopy = it->second;
-            foundBoneData = true;
+        const auto boneCache = GetBoneScreenCacheSnapshot();
+        if (boneCache != nullptr) {
+            auto it = boneCache->find(targetActor);
+            if (it != boneCache->end()) {
+                targetDistance = it->second.distance;
+                targetBoneDataCopy = it->second;
+                foundBoneData = true;
+            }
         }
     }
     if (!foundBoneData) {
@@ -1341,15 +1344,17 @@ void AutoAimController::Update(float deltaTime) {
         // 查找目标距离，并用最新 VP 矩阵直接投影骨骼世界坐标（消除 cache 延迟导致的拉扯）
         float targetDistance = 0.0f;
         {
-            const auto boneCache = GetBoneScreenCache();
-            auto it = boneCache.find(targetActor);
-            if (it != boneCache.end()) {
-                targetDistance = it->second.distance;
-                Vec3 freshWorldPos;
-                Vec2 freshScreenPos;
-                if (ReadFreshBoneWorldPos(it->second, targetBone, freshWorldPos) &&
-                    WorldToScreen(freshWorldPos, vpMat, SW, SH, freshScreenPos)) {
-                    targetScreenPos = freshScreenPos;
+            const auto boneCache = GetBoneScreenCacheSnapshot();
+            if (boneCache != nullptr) {
+                auto it = boneCache->find(targetActor);
+                if (it != boneCache->end()) {
+                    targetDistance = it->second.distance;
+                    Vec3 freshWorldPos;
+                    Vec2 freshScreenPos;
+                    if (ReadFreshBoneWorldPos(it->second, targetBone, freshWorldPos) &&
+                        WorldToScreen(freshWorldPos, vpMat, SW, SH, freshScreenPos)) {
+                        targetScreenPos = freshScreenPos;
+                    }
                 }
             }
         }

@@ -4,6 +4,7 @@
 #include "ANativeWindowCreator.h"
 #include "draw_menu.h"
 #include "draw_objects.h"
+#include "game_frame_reader.h"
 #include "read_mem.h"
 #include "auto_aim.h"
 #include <algorithm>

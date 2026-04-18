@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <vector>
 #include <memory>
+#include <functional>
 
 // 共享状态（draw_menu.cpp 中定义）
 extern std::atomic<int> driver_stat;
@@ -101,8 +102,11 @@ struct ClassifiedActors {
     std::vector<CachedActor> others;    // 其他列表
 };
 
-std::shared_ptr<ClassifiedActors> GetClassifiedActors();
-std::shared_ptr<std::vector<CachedActor>> GetCachedActors();  // 兼容接口（合并三个列表）
+using ClassifiedActorsSnapshot = std::shared_ptr<const ClassifiedActors>;
+
+ClassifiedActorsSnapshot GetClassifiedActorsSnapshot();
+void ForEachCachedActor(const ClassifiedActors& actors,
+                        const std::function<void(const CachedActor&)>& visitor);
 
 // 内存读取工具函数
 std::string GetNameByIndex(int32_t index, uint64_t libUE4);

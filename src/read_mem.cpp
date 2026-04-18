@@ -522,20 +522,20 @@ void DumpTArray(){
 //  Dump Bones
 // ═══════════════════════════════════════════
 void DumpBones() {
-    auto actors = GetCachedActors();
+    auto actors = GetClassifiedActorsSnapshot();
     if (!actors) return;
 
-    for (const auto& ca : *actors) {
-        if (ca.className != "BP_TrainPlayerPawn_C") continue;
+    ForEachCachedActor(*actors, [&](const CachedActor& ca) {
+        if (ca.className != "BP_TrainPlayerPawn_C") return;
 
         uint64_t skelMeshComp = GetDriverManager().read<uint64_t>(ca.actorAddr + offset.SkeletalMeshComponent);
-        if (skelMeshComp == 0) { printf("SkeletalMeshComponent is null\n"); continue; }
+        if (skelMeshComp == 0) { printf("SkeletalMeshComponent is null\n"); return; }
 
         int boneCount = GetDriverManager().read<int>(skelMeshComp + offset.ComponentSpaceTransforms + 0x8);
-        if (boneCount != 66) continue;
+        if (boneCount != 66) return;
 
         uint64_t skelMesh = GetDriverManager().read<uint64_t>(skelMeshComp + offset.SkeletalMesh);
-        if (skelMesh == 0) { printf("SkeletalMesh is null\n"); continue; }
+        if (skelMesh == 0) { printf("SkeletalMesh is null\n"); return; }
 
         // FReferenceSkeleton.RawRefBoneInfo at SkeletalMesh+0x238
         // FMeshBoneInfo: FName(8) + ParentIndex(4) + padding(4) = 0x10 stride
@@ -582,7 +582,7 @@ void DumpBones() {
                    bone.Translation.X, bone.Translation.Y, bone.Translation.Z,
                    bone.Scale3D.X, bone.Scale3D.Y, bone.Scale3D.Z, tag);
         }
-    }
+    });
 }
 
 // ═══════════════════════════════════════════
@@ -643,43 +643,26 @@ int GetGameTargetFPS() {
 // FPS Level → 读取间隔（已废弃，读取线程固定 500ms）
 // GetReadIntervalFromFPSLevel 不再使用
 
-static std::mutex gActorListMtx;
-static std::shared_ptr<ClassifiedActors> gClassifiedActors =
+static ClassifiedActorsSnapshot gClassifiedActors =
     std::make_shared<ClassifiedActors>();
 
-// 新接口：获取分类后的 actor 列表
-std::shared_ptr<ClassifiedActors> GetClassifiedActors() {
-    std::lock_guard<std::mutex> lock(gActorListMtx);
-    return gClassifiedActors;
+ClassifiedActorsSnapshot GetClassifiedActorsSnapshot() {
+    return std::atomic_load_explicit(&gClassifiedActors, std::memory_order_acquire);
 }
 
-// 旧接口：保留兼容性，返回所有 actor（合并三个列表）
-std::shared_ptr<std::vector<CachedActor>> GetCachedActors() {
-    std::lock_guard<std::mutex> lock(gActorListMtx);
-    auto all = std::make_shared<std::vector<CachedActor>>();
-    all->reserve(gClassifiedActors->players.size() +
-                 gClassifiedActors->bots.size() +
-                 gClassifiedActors->npcs.size() +
-                 gClassifiedActors->monsters.size() +
-                 gClassifiedActors->tombBoxes.size() +
-                 gClassifiedActors->otherBoxes.size() +
-                 gClassifiedActors->escapeBoxes.size() +
-                 gClassifiedActors->escapeInnerBoxes.size() +
-                 gClassifiedActors->containers.size() +
-                 gClassifiedActors->vehicles.size() +
-                 gClassifiedActors->others.size());
-    all->insert(all->end(), gClassifiedActors->players.begin(), gClassifiedActors->players.end());
-    all->insert(all->end(), gClassifiedActors->bots.begin(), gClassifiedActors->bots.end());
-    all->insert(all->end(), gClassifiedActors->npcs.begin(), gClassifiedActors->npcs.end());
-    all->insert(all->end(), gClassifiedActors->monsters.begin(), gClassifiedActors->monsters.end());
-    all->insert(all->end(), gClassifiedActors->tombBoxes.begin(), gClassifiedActors->tombBoxes.end());
-    all->insert(all->end(), gClassifiedActors->otherBoxes.begin(), gClassifiedActors->otherBoxes.end());
-    all->insert(all->end(), gClassifiedActors->escapeBoxes.begin(), gClassifiedActors->escapeBoxes.end());
-    all->insert(all->end(), gClassifiedActors->escapeInnerBoxes.begin(), gClassifiedActors->escapeInnerBoxes.end());
-    all->insert(all->end(), gClassifiedActors->containers.begin(), gClassifiedActors->containers.end());
-    all->insert(all->end(), gClassifiedActors->vehicles.begin(), gClassifiedActors->vehicles.end());
-    all->insert(all->end(), gClassifiedActors->others.begin(), gClassifiedActors->others.end());
-    return all;
+void ForEachCachedActor(const ClassifiedActors& actors,
+                        const std::function<void(const CachedActor&)>& visitor) {
+    const std::vector<const std::vector<CachedActor>*> groups = {
+        &actors.players, &actors.bots, &actors.npcs, &actors.monsters,
+        &actors.tombBoxes, &actors.otherBoxes, &actors.escapeBoxes,
+        &actors.escapeInnerBoxes, &actors.containers, &actors.vehicles,
+        &actors.others,
+    };
+    for (const std::vector<CachedActor>* group : groups) {
+        for (const CachedActor& actor : *group) {
+            visitor(actor);
+        }
+    }
 }
 
 static void readThreadFunc() {
@@ -989,10 +972,9 @@ static void readThreadFunc() {
             }
         }
 
-        {
-            std::lock_guard<std::mutex> lock(gActorListMtx);
-            gClassifiedActors = classified;
-        }
+        std::atomic_store_explicit(&gClassifiedActors,
+                                   ClassifiedActorsSnapshot(classified),
+                                   std::memory_order_release);
 
         frame.valid = true;
         gFrameSync.submit(frame);

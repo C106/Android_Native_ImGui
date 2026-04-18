@@ -3,6 +3,7 @@
 #include "mem_struct.h"
 #include "read_mem.h"
 #include <unordered_map>
+#include <memory>
 
 // 单帧游戏数据快照（在 fence wait 前读取）
 struct GameFrameData {
@@ -30,6 +31,9 @@ struct BoneScreenData {
     int boneMap[BONE_COUNT];
     int cachedBoneCount;
 };
+
+using BoneScreenCache = std::unordered_map<uint64_t, BoneScreenData>;
+using BoneScreenCacheSnapshot = std::shared_ptr<const BoneScreenCache>;
 
 extern bool gShowObjects;
 extern bool gShowAllClassNames;
@@ -78,12 +82,6 @@ extern float gDepthBufferTolerance;     // 查询深度容差
 extern int gDepthBufferDownscale;       // 降采样倍率
 extern bool gDrawDepthBuffer;           // 调试：直接绘制深度缓冲
 
-// 读取游戏数据（在 fence wait 前调用）
-GameFrameData ReadGameData();
-
-// 仅读取 GFrameCounter（轻量，用于帧同步轮询）
-uint64_t ReadFrameCounter();
-
 // 使用预读数据绘制（在 fence wait 后调用）
 // gameStepDeltaTime: 与游戏帧同步的时间步（秒），用于骨骼插值
 void DrawObjectsWithData(const GameFrameData& data, float gameStepDeltaTime);
@@ -94,7 +92,7 @@ void DrawObjects();
 void ShutdownDrawObjects();
 
 // 供 auto-aim 访问骨骼缓存（返回拷贝，线程安全）
-const std::unordered_map<uint64_t, BoneScreenData> GetBoneScreenCache();
+BoneScreenCacheSnapshot GetBoneScreenCacheSnapshot();
 bool GetCachedBoneWorldPos(uint64_t actorAddr, int boneID, uint64_t frameCounter, Vec3& outWorldPos);
 bool ExportStablePhysXMeshes();
 const char* GetStablePhysXExportStatus();

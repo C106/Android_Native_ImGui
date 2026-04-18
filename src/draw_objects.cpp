@@ -4,6 +4,7 @@
 #include "ImGuiLayer.h"
 #include "VulkanApp.h"
 #include "driver_manager.h"
+#include "game_frame_reader.h"
 #include "game_fps_monitor.h"
 #include "visibility_scene.h"
 #include "visibility_depth_comp_spv.h"
@@ -60,74 +61,6 @@ static const std::pair<int, int> kBoneConnections[] = {
     {BONE_R_KNEE, BONE_R_FOOT},
 };
 
-namespace {
-
-constexpr uintptr_t kMinimalViewInfoLocationOffset = 0x0;
-constexpr uintptr_t kMinimalViewInfoRotationOffset = 0x18;
-constexpr uintptr_t kMinimalViewInfoFOVOffset = 0x30;
-constexpr uintptr_t kMinimalViewInfoAspectRatioOffset = 0x58;
-constexpr uintptr_t kClientConnectionsArrayOffset = 0x90;
-
-static uint64_t ReadLocalPlayerControllerFromWorld(uint64_t uworld) {
-    if (uworld == 0) return 0;
-
-    uint64_t netDriver = GetDriverManager().read<uint64_t>(uworld + offset.NetDriver);
-    if (netDriver == 0) return 0;
-
-    uint64_t connection = GetDriverManager().read<uint64_t>(netDriver + offset.ServerConnection);
-    if (connection == 0) {
-        uint64_t clientConnectionsArray = netDriver + kClientConnectionsArrayOffset;
-        uint64_t clientConnectionsData = GetDriverManager().read<uint64_t>(clientConnectionsArray);
-        int clientConnectionsCount = GetDriverManager().read<int>(clientConnectionsArray + 0x8);
-        if (clientConnectionsData == 0 || clientConnectionsCount <= 0) {
-            return 0;
-        }
-        connection = GetDriverManager().read<uint64_t>(clientConnectionsData);
-    }
-
-    if (connection == 0) return 0;
-    return GetDriverManager().read<uint64_t>(connection + offset.PlayerController);
-}
-
-static bool BuildViewProjectionMatrixFromCameraCache(uint64_t uworld, FMatrix& outVP) {
-    if (uworld == 0) return false;
-
-    uint64_t playerController = ReadLocalPlayerControllerFromWorld(uworld);
-    if (playerController == 0) return false;
-
-    uint64_t playerCameraManager = GetDriverManager().read<uint64_t>(playerController + offset.PlayerCameraManager);
-    if (playerCameraManager == 0) return false;
-
-    uint64_t povAddr = playerCameraManager + offset.CameraCache + offset.POV;
-
-    Vec3 location = GetDriverManager().read<Vec3>(povAddr + kMinimalViewInfoLocationOffset);
-    FRotator rotation = GetDriverManager().read<FRotator>(povAddr + kMinimalViewInfoRotationOffset);
-    float fov = GetDriverManager().read<float>(povAddr + kMinimalViewInfoFOVOffset);
-    float aspectRatio = GetDriverManager().read<float>(povAddr + kMinimalViewInfoAspectRatioOffset);
-
-    const bool validLocation = std::isfinite(location.X) && std::isfinite(location.Y) && std::isfinite(location.Z);
-    const bool validRotation = std::isfinite(rotation.Pitch) && std::isfinite(rotation.Yaw) && std::isfinite(rotation.Roll);
-    if (!validLocation || !validRotation) return false;
-
-    if (!(fov > 1.0f && fov < 179.0f)) return false;
-
-    ImGuiIO& io = ImGui::GetIO();
-    if (io.DisplaySize.x > 1.0f && io.DisplaySize.y > 1.0f) {
-        aspectRatio = io.DisplaySize.x / io.DisplaySize.y;
-    }
-
-    if (!(aspectRatio > 0.1f && aspectRatio < 5.0f)) {
-        aspectRatio = 16.0f / 9.0f;
-    }
-
-    FMatrix view = BuildViewMatrix(location, rotation);
-    FMatrix projection = BuildProjectionMatrix(fov, aspectRatio);
-    outVP = MatrixMultiply(view, projection);
-    return true;
-}
-
-} // namespace
-
 bool gShowObjects = true;
 bool gShowAllClassNames = false;
 bool gUseBatchBoneRead = true;  // 默认使用批量读取（优化模式）
@@ -175,9 +108,9 @@ float gDepthBufferTolerance = 0.005f;    // 深度容差（骨骼 vs 场景）
 int gDepthBufferDownscale = 4;           // 降采样倍率（1/4 分辨率）
 bool gDrawDepthBuffer = false;           // 调试：直接绘制深度缓冲
 
-// 骨骼屏幕坐标缓存（主线程写入，auto-aim 线程读取——需要 mutex 保护）
-static std::unordered_map<uint64_t, BoneScreenData> gBoneScreenCache;
-static std::mutex gBoneScreenCacheMutex;
+// 骨骼屏幕坐标缓存（主线程整帧发布只读快照，auto-aim 线程无锁读取）
+static BoneScreenCacheSnapshot gBoneScreenCacheSnapshot =
+    std::make_shared<BoneScreenCache>();
 static std::unordered_map<uint64_t, float> gPredictedAimHoverTimes;
 extern VulkanApp gApp;
 
@@ -1194,7 +1127,8 @@ static void DrawObjectsWithDataInternal(
     const FMatrix& VPMat,
     const Vec3& localPlayerPos,
     uint64_t engineFrame,
-    float gameStepDeltaTime);
+    float gameStepDeltaTime,
+    BoneScreenCache* boneScreenCache);
 static void DrawPhysXGeometry(
     const FMatrix& vpMat,
     const Vec3& localPlayerPos,
@@ -4569,72 +4503,6 @@ static void DrawPhysXStaticPrunerGeometry(const FMatrix& vpMat, const Vec3& loca
     }
 }
 
-// 读取游戏数据（在 fence wait 前调用，减少延迟）
-GameFrameData ReadGameData() {
-    GameFrameData data;
-    data.valid = false;
-    data.gameDeltaTime = 0.0f;
-    data.frameCounter = 0;
-
-    if (driver_stat.load(std::memory_order_relaxed) <= 0) return data;
-    if (!gUseCameraCacheVPMatrix && address.Matrix == 0) return data;
-
-    const uint64_t uworld = GetDriverManager().read<uint64_t>(address.libUE4 + offset.Gworld);
-    bool hasViewProjection = false;
-    if (gUseCameraCacheVPMatrix) {
-        hasViewProjection = BuildViewProjectionMatrixFromCameraCache(uworld, data.VPMat);
-    } else if (address.Matrix != 0) {
-        hasViewProjection = GetDriverManager().read(address.Matrix, &data.VPMat, sizeof(FMatrix));
-    }
-    if (!hasViewProjection) {
-        return data;
-    }
-
-    // 读取本地玩家位置（2 ioctl）
-    data.localPlayerPos = Vec3::Zero();
-    if (address.LocalPlayerActor != 0) {
-        uint64_t localRootComponent = GetDriverManager().read<uint64_t>(
-            address.LocalPlayerActor + offset.RootComponent);
-        if (localRootComponent != 0) {
-            FTransform localTransform = GetDriverManager().read<FTransform>(
-                localRootComponent + offset.ComponentToWorld);
-            data.localPlayerPos = localTransform.Translation;
-        }
-    }
-
-    // 读取 FApp::DeltaTime（GOT 表，两次解引用）
-    if (address.libUE4 != 0 && offset.FAppDeltaTimeGOT != 0) {
-        uint64_t gotEntry = GetDriverManager().read<uint64_t>(address.libUE4 + offset.FAppDeltaTimeGOT);
-        if (gotEntry != 0) {
-            double deltaTime = GetDriverManager().read<double>(gotEntry);
-            if (deltaTime > 0.0 && deltaTime < 1.0) {
-                PushGameDeltaTime(deltaTime);
-                data.gameDeltaTime = (float)deltaTime;
-            }
-        }
-    }
-
-    // 读取 GFrameCounter（与 DeltaTime 同步）
-    if (address.libUE4 != 0 && offset.GFrameCounterGOT != 0) {
-        uint64_t gotEntry = GetDriverManager().read<uint64_t>(address.libUE4 + offset.GFrameCounterGOT);
-        if (gotEntry != 0) {
-            data.frameCounter = GetDriverManager().read<uint64_t>(gotEntry);
-        }
-    }
-
-    data.valid = true;
-    return data;
-}
-
-// 仅读取 GFrameCounter（轻量，用于帧同步轮询）
-uint64_t ReadFrameCounter() {
-    if (driver_stat.load(std::memory_order_relaxed) <= 0) return 0;
-    if (address.libUE4 == 0 || offset.GFrameCounterGOT == 0) return 0;
-    uint64_t gotEntry = GetDriverManager().read<uint64_t>(address.libUE4 + offset.GFrameCounterGOT);
-    if (gotEntry == 0) return 0;
-    return GetDriverManager().read<uint64_t>(gotEntry);
-}
-
 // 使用预读数据绘制（在 fence wait 后调用）
 void DrawObjectsWithData(const GameFrameData& data, float gameStepDeltaTime) {
     if (!gShowObjects) return;
@@ -4653,11 +4521,7 @@ void DrawObjectsWithData(const GameFrameData& data, float gameStepDeltaTime) {
     // 按大间隔定期清空几何缓存（三角面/凸包/高度场），触发下次按需重读
     MaybeFlushGeomCaches();
 
-    // 每帧重建屏幕骨骼缓存，避免 auto-aim 读取到上一帧残留坐标。
-    {
-        std::lock_guard<std::mutex> lock(gBoneScreenCacheMutex);
-        gBoneScreenCache.clear();
-    }
+    auto nextBoneScreenCache = std::make_shared<BoneScreenCache>();
 
     // 定期清理缓存（每 2 秒，假设 60 FPS）
     static int cleanupCounter = 0;
@@ -4687,54 +4551,77 @@ void DrawObjectsWithData(const GameFrameData& data, float gameStepDeltaTime) {
     }
 
     if (gShowAllClassNames) {
-        auto allActors = GetCachedActors();
-        if (!allActors || allActors->empty()) { return; }
-        DrawObjectsWithDataInternal(*allActors, vpToUse, data.localPlayerPos,
-                                    data.frameCounter, gameStepDeltaTime);
+        auto classified = GetClassifiedActorsSnapshot();
+        if (!classified) { return; }
+        std::vector<CachedActor> singleActor;
+        singleActor.reserve(1);
+        ForEachCachedActor(*classified, [&](const CachedActor& actor) {
+            singleActor.clear();
+            singleActor.push_back(actor);
+            DrawObjectsWithDataInternal(singleActor, vpToUse, data.localPlayerPos,
+                                        data.frameCounter, gameStepDeltaTime,
+                                        nextBoneScreenCache.get());
+        });
+        std::atomic_store_explicit(&gBoneScreenCacheSnapshot,
+                                   BoneScreenCacheSnapshot(nextBoneScreenCache),
+                                   std::memory_order_release);
         return;
     }
 
     // 获取分类后的 actor 列表
-    auto classified = GetClassifiedActors();
+    auto classified = GetClassifiedActorsSnapshot();
     if (!classified) return;
 
     // 按类型分别绘制（根据开关控制，直接传引用避免拷贝）
     if (gShowPlayers && !classified->players.empty()) {
         DrawObjectsWithDataInternal(classified->players, vpToUse, data.localPlayerPos,
-                                    data.frameCounter, gameStepDeltaTime);
+                                    data.frameCounter, gameStepDeltaTime,
+                                    nextBoneScreenCache.get());
     }
     if (gShowBots && !classified->bots.empty()) {
         DrawObjectsWithDataInternal(classified->bots, vpToUse, data.localPlayerPos,
-                                    data.frameCounter, gameStepDeltaTime);
+                                    data.frameCounter, gameStepDeltaTime,
+                                    nextBoneScreenCache.get());
     }
     if (gShowNPCs && !classified->npcs.empty()) {
         DrawObjectsWithDataInternal(classified->npcs, vpToUse, data.localPlayerPos,
-                                    data.frameCounter, gameStepDeltaTime);
+                                    data.frameCounter, gameStepDeltaTime,
+                                    nextBoneScreenCache.get());
     }
     if (gShowMonsters && !classified->monsters.empty()) {
         DrawObjectsWithDataInternal(classified->monsters, vpToUse, data.localPlayerPos,
-                                    data.frameCounter, gameStepDeltaTime);
+                                    data.frameCounter, gameStepDeltaTime,
+                                    nextBoneScreenCache.get());
     }
     if (gShowTombBoxes && !classified->tombBoxes.empty()) {
         DrawObjectsWithDataInternal(classified->tombBoxes, vpToUse, data.localPlayerPos,
-                                    data.frameCounter, gameStepDeltaTime);
+                                    data.frameCounter, gameStepDeltaTime,
+                                    nextBoneScreenCache.get());
     }
     if (gShowOtherBoxes && !classified->otherBoxes.empty()) {
         DrawObjectsWithDataInternal(classified->otherBoxes, vpToUse, data.localPlayerPos,
-                                    data.frameCounter, gameStepDeltaTime);
+                                    data.frameCounter, gameStepDeltaTime,
+                                    nextBoneScreenCache.get());
     }
     if (gShowEscapeBoxes && !classified->escapeBoxes.empty()) {
         DrawObjectsWithDataInternal(classified->escapeBoxes, vpToUse, data.localPlayerPos,
-                                    data.frameCounter, gameStepDeltaTime);
+                                    data.frameCounter, gameStepDeltaTime,
+                                    nextBoneScreenCache.get());
     }
     if (gShowVehicles && !classified->vehicles.empty()) {
         DrawObjectsWithDataInternal(classified->vehicles, vpToUse, data.localPlayerPos,
-                                    data.frameCounter, gameStepDeltaTime);
+                                    data.frameCounter, gameStepDeltaTime,
+                                    nextBoneScreenCache.get());
     }
     if (gShowOthers && !classified->others.empty()) {
         DrawObjectsWithDataInternal(classified->others, vpToUse, data.localPlayerPos,
-                                    data.frameCounter, gameStepDeltaTime);
+                                    data.frameCounter, gameStepDeltaTime,
+                                    nextBoneScreenCache.get());
     }
+
+    std::atomic_store_explicit(&gBoneScreenCacheSnapshot,
+                               BoneScreenCacheSnapshot(nextBoneScreenCache),
+                               std::memory_order_release);
 
 }
 
@@ -4965,7 +4852,8 @@ static void DrawObjectsWithDataInternal(
     const FMatrix& VPMat,
     const Vec3& localPlayerPos,
     uint64_t engineFrame,
-    float gameStepDeltaTime)
+    float gameStepDeltaTime,
+    BoneScreenCache* boneScreenCache)
 {
     // 绘制有映射的 actor
     ImGuiIO& io = ImGui::GetIO();
@@ -5297,9 +5185,8 @@ static void DrawObjectsWithDataInternal(
                         std::copy(std::begin(ca.boneMap), std::end(ca.boneMap), std::begin(bsd.boneMap));
                         bsd.cachedBoneCount = ca.cachedBoneCount;
 
-                        {
-                            std::lock_guard<std::mutex> lock(gBoneScreenCacheMutex);
-                            gBoneScreenCache[ca.actorAddr] = bsd;
+                        if (boneScreenCache != nullptr) {
+                            (*boneScreenCache)[ca.actorAddr] = bsd;
                         }
                     }
                 }
@@ -5388,10 +5275,8 @@ static void DrawObjectsWithDataInternal(
     }
 }
 
-// 供 auto-aim 访问骨骼缓存（返回拷贝，避免跨线程引用）
-const std::unordered_map<uint64_t, BoneScreenData> GetBoneScreenCache() {
-    std::lock_guard<std::mutex> lock(gBoneScreenCacheMutex);
-    return gBoneScreenCache;
+BoneScreenCacheSnapshot GetBoneScreenCacheSnapshot() {
+    return std::atomic_load_explicit(&gBoneScreenCacheSnapshot, std::memory_order_acquire);
 }
 
 bool GetCachedBoneWorldPos(uint64_t actorAddr, int boneID, uint64_t frameCounter, Vec3& outWorldPos) {
@@ -7269,10 +7154,9 @@ static void DrawDepthBufferOverlay() {
 void ShutdownDrawObjects() {
     ResetGpuDepthRasterResources();
     ResetGpuDepthQueryResources();
-    {
-        std::lock_guard<std::mutex> lock(gBoneScreenCacheMutex);
-        gBoneScreenCache.clear();
-    }
+    std::atomic_store_explicit(&gBoneScreenCacheSnapshot,
+                               BoneScreenCacheSnapshot(std::make_shared<BoneScreenCache>()),
+                               std::memory_order_release);
     gPredictedAimHoverTimes.clear();
     gBoneWorldCache.clear();
     gGpuSceneCache.Triangles.clear();
