@@ -5,6 +5,7 @@
 extern int gTargetFPS;
 
 void Draw_Menu();
+void Draw_Menu_Overlay();
 void Draw_Menu_ResetTextures();
 
 // Tab 绘制函数

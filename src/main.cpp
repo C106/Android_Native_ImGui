@@ -45,6 +45,7 @@ static int gEffectiveFPS = 0;  // 实际同步到的绘制 FPS
 static auto gLastFPSUpdateTime = std::chrono::steady_clock::now();
 static float gLastSyncedDeltaTime = 1.0f / 60.0f;
 static auto gLastUiRenderTime = std::chrono::steady_clock::now();
+static auto gLastFrameStartTime = std::chrono::steady_clock::now();
 static GameFrameData gLastRenderedGameData{};
 static bool gHasLastRenderedGameData = false;
 
@@ -279,6 +280,7 @@ int main() {
     bool firstFrame = true; // 首帧无上一帧需要等待
     uint64_t lastSyncedGameFrame = 0;
     bool previousMenuOpen = IsMenuOpen.load(std::memory_order_relaxed);
+    bool previousTouchActive = false;
 
     //Paradise_hook = new c_driver();
     StartReadThread();
@@ -342,6 +344,8 @@ int main() {
 
         const bool menuOpen = IsMenuOpen.load(std::memory_order_relaxed);
         const bool menuStateChanged = (menuOpen != previousMenuOpen);
+        const bool touchActive = has_active_touch_points();
+        const bool touchStateChanged = (touchActive != previousTouchActive);
         uint64_t currentGameFrame = ReadFrameCounter();
 
         if (lastSyncedGameFrame != 0 && currentGameFrame < lastSyncedGameFrame) {
@@ -351,12 +355,9 @@ int main() {
         }
 
         const bool hasNewGameFrame = currentGameFrame != 0 && currentGameFrame != lastSyncedGameFrame;
-        if (!hasNewGameFrame && !menuOpen && !menuStateChanged) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            continue;
-        }
 
-        if (!hasNewGameFrame && !menuStateChanged && !ShouldRenderUnsyncedUiFrame()) {
+        // 帧率限制：无新游戏帧时，按目标 FPS 限制渲染
+        if (!ShouldRenderUnsyncedUiFrame() && !hasNewGameFrame) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
         }
@@ -366,10 +367,11 @@ int main() {
         float syncedDeltaTime = GetFallbackGameDeltaTime();
         const float renderStepDeltaTime = GetRenderStepDeltaTime();
 
-        if (!haveRenderableGameFrame && !gHasLastRenderedGameData && !menuOpen && !menuStateChanged) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            continue;
-        }
+        // 完全空闲且无缓存数据时跳过渲染（但保留悬浮球可交互）
+        // if (!haveRenderableGameFrame && !gHasLastRenderedGameData && !menuOpen && !touchActive) {
+        //     std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        //     continue;
+        // }
 
         // 5. 等待 GPU pipeline 清空（首帧跳过，无上一帧需要等待）
         if (!firstFrame) {
@@ -396,8 +398,14 @@ int main() {
         ImGui_ProcessPendingTextureLoads();
         gImGui.beginFrame(gWindow, displayInfo.width, displayInfo.height, renderStepDeltaTime);
 
-        // 统计 FPS（每秒更新一次）
-        gFrameCount++;
+        if (gAutoAim) {
+            gAutoAim->SetDisplaySize(static_cast<float>(displayInfo.width), static_cast<float>(displayInfo.height));
+        }
+
+        // 统计 FPS（每秒更新一次）— 只统计同步到游戏帧的渲染
+        if (hasNewGameFrame) {
+            gFrameCount++;
+        }
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - gLastFPSUpdateTime).count();
         if (elapsed >= 1000) {  // 每 1000ms 更新一次
@@ -416,10 +424,11 @@ int main() {
         // 缓存游戏 FPS 统计（每帧一次，避免重复加锁）
         auto gameStats = GetGameFPSStats();
 
-        // 自瞄更新
-        if (haveRenderableGameFrame && gAutoAim) {
-            gAutoAim->Update(syncedDeltaTime);
-        }
+        // 自瞄更新由独立线程驱动，主线程不再调用
+
+        Draw_Menu_Overlay();
+
+        if (gAutoAim) gAutoAim->DrawDebug();
 
         if (menuOpen)
             Draw_Menu();
@@ -441,6 +450,7 @@ int main() {
             gHasLastRenderedGameData = true;
         }
         previousMenuOpen = menuOpen;
+        previousTouchActive = touchActive;
     }
 
     // ── 清理 ──

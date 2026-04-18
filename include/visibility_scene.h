@@ -5,6 +5,7 @@
 #include <memory>
 #include <shared_mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 struct VisibilityBounds {
@@ -49,6 +50,7 @@ public:
     static VisibilityRaycastQuery BuildRaycastQuery(const Vec3& origin, const Vec3& target);
     VisibilityRaycastHit Raycast(const Vec3& origin, const Vec3& target) const;
     VisibilityRaycastHit Raycast(const VisibilityRaycastQuery& query) const;
+    bool RaycastAny(const VisibilityRaycastQuery& query) const;
     size_t Size() const;
 
     struct TriangleBlock {
@@ -91,7 +93,7 @@ public:
     };
 
     struct SceneSnapshot {
-        std::vector<SceneMesh> Meshes;
+        std::vector<std::shared_ptr<const SceneMesh>> Meshes;
         std::vector<float> MeshMinX;
         std::vector<float> MeshMinY;
         std::vector<float> MeshMinZ;
@@ -101,10 +103,23 @@ public:
     };
 
     static SceneMesh BuildSceneMesh(const VisibilityMeshData& mesh);
-    static std::shared_ptr<SceneSnapshot> BuildSnapshot(const std::unordered_map<uint64_t, SceneMesh>& meshes);
+    static std::shared_ptr<SceneSnapshot> BuildSnapshot(const std::unordered_map<uint64_t, std::shared_ptr<SceneMesh>>& meshes);
+
+    std::shared_ptr<SceneSnapshot> AcquireSnapshot() const;
+    bool RaycastAnyWithSnapshot(const VisibilityRaycastQuery& query,
+                                const std::shared_ptr<SceneSnapshot>& snapshot) const;
+
+    struct PendingMeshRetry {
+        VisibilityMeshData MeshData;
+        int RetryCount = 0;
+        double LastAttemptTime = 0.0;
+    };
 
 private:
+    static constexpr int kMaxRetriesPerMesh = 10;
     mutable std::shared_mutex Mutex_;
-    std::unordered_map<uint64_t, SceneMesh> Meshes_;
+    std::unordered_map<uint64_t, std::shared_ptr<SceneMesh>> Meshes_;
     std::shared_ptr<SceneSnapshot> Snapshot_;
+    std::vector<PendingMeshRetry> PendingRetries_;
+    std::unordered_set<uint64_t> PendingKeys_;
 };

@@ -20,6 +20,8 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <thread>
+#include <future>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -69,39 +71,39 @@ constexpr uintptr_t kClientConnectionsArrayOffset = 0x90;
 static uint64_t ReadLocalPlayerControllerFromWorld(uint64_t uworld) {
     if (uworld == 0) return 0;
 
-    uint64_t netDriver = Paradise_hook->read<uint64_t>(uworld + offset.NetDriver);
+    uint64_t netDriver = GetDriverManager().read<uint64_t>(uworld + offset.NetDriver);
     if (netDriver == 0) return 0;
 
-    uint64_t connection = Paradise_hook->read<uint64_t>(netDriver + offset.ServerConnection);
+    uint64_t connection = GetDriverManager().read<uint64_t>(netDriver + offset.ServerConnection);
     if (connection == 0) {
         uint64_t clientConnectionsArray = netDriver + kClientConnectionsArrayOffset;
-        uint64_t clientConnectionsData = Paradise_hook->read<uint64_t>(clientConnectionsArray);
-        int clientConnectionsCount = Paradise_hook->read<int>(clientConnectionsArray + 0x8);
+        uint64_t clientConnectionsData = GetDriverManager().read<uint64_t>(clientConnectionsArray);
+        int clientConnectionsCount = GetDriverManager().read<int>(clientConnectionsArray + 0x8);
         if (clientConnectionsData == 0 || clientConnectionsCount <= 0) {
             return 0;
         }
-        connection = Paradise_hook->read<uint64_t>(clientConnectionsData);
+        connection = GetDriverManager().read<uint64_t>(clientConnectionsData);
     }
 
     if (connection == 0) return 0;
-    return Paradise_hook->read<uint64_t>(connection + offset.PlayerController);
+    return GetDriverManager().read<uint64_t>(connection + offset.PlayerController);
 }
 
 static bool BuildViewProjectionMatrixFromCameraCache(uint64_t uworld, FMatrix& outVP) {
-    if (!Paradise_hook || uworld == 0) return false;
+    if (uworld == 0) return false;
 
     uint64_t playerController = ReadLocalPlayerControllerFromWorld(uworld);
     if (playerController == 0) return false;
 
-    uint64_t playerCameraManager = Paradise_hook->read<uint64_t>(playerController + offset.PlayerCameraManager);
+    uint64_t playerCameraManager = GetDriverManager().read<uint64_t>(playerController + offset.PlayerCameraManager);
     if (playerCameraManager == 0) return false;
 
     uint64_t povAddr = playerCameraManager + offset.CameraCache + offset.POV;
 
-    Vec3 location = Paradise_hook->read<Vec3>(povAddr + kMinimalViewInfoLocationOffset);
-    FRotator rotation = Paradise_hook->read<FRotator>(povAddr + kMinimalViewInfoRotationOffset);
-    float fov = Paradise_hook->read<float>(povAddr + kMinimalViewInfoFOVOffset);
-    float aspectRatio = Paradise_hook->read<float>(povAddr + kMinimalViewInfoAspectRatioOffset);
+    Vec3 location = GetDriverManager().read<Vec3>(povAddr + kMinimalViewInfoLocationOffset);
+    FRotator rotation = GetDriverManager().read<FRotator>(povAddr + kMinimalViewInfoRotationOffset);
+    float fov = GetDriverManager().read<float>(povAddr + kMinimalViewInfoFOVOffset);
+    float aspectRatio = GetDriverManager().read<float>(povAddr + kMinimalViewInfoAspectRatioOffset);
 
     const bool validLocation = std::isfinite(location.X) && std::isfinite(location.Y) && std::isfinite(location.Z);
     const bool validRotation = std::isfinite(rotation.Pitch) && std::isfinite(rotation.Yaw) && std::isfinite(rotation.Roll);
@@ -132,15 +134,23 @@ bool gUseBatchBoneRead = true;  // 默认使用批量读取（优化模式）
 bool gEnableBoneSmoothing = false;  // 默认关闭，避免骨骼视觉上慢半拍
 bool gUseCameraCacheVPMatrix = false;  // 默认仍使用原矩阵地址，按需手动切换
 int gBoneCount = 0;
-float gMaxSkeletonDistance = 230.0f;  // 默认 200 米，超过不绘制骨骼
+float gMaxSkeletonDistance = 230.0f;  // 默认 230 米，超过不绘制骨骼
 
 // 分类显示开关（默认全部显示）
 bool gShowPlayers = true;
+bool gShowBots = true;
+bool gShowNPCs = true;
+bool gShowMonsters = true;
+bool gShowTombBoxes = true;
+bool gShowOtherBoxes = true;
+bool gShowEscapeBoxes = true;
+bool gShowContainers = true;
 bool gShowVehicles = true;
 bool gShowOthers = true;
 
 // 绘制模块开关（默认全部启用）
 bool gDrawSkeleton = true;   // 绘制骨骼线条
+bool gDrawPredictedAimPoint = false;
 bool gDrawDistance = true;   // 绘制距离信息
 bool gDrawName = true;       // 绘制名称标签
 bool gDrawBox = false;       // 绘制包围盒（预留，默认关闭）
@@ -149,13 +159,14 @@ bool gDrawPhysXGeometry = false;
 bool gPhysXDrawMeshes = true;
 bool gPhysXDrawPrimitives = true;
 float gPhysXDrawRadiusMeters = 80.0f;
-int gPhysXMaxActorsPerFrame = 64;
+int gPhysXMaxActorsPerFrame = 256;
 int gPhysXMaxShapesPerActor = 16;
 int gPhysXMaxTrianglesPerMesh = 4000;
 float gPhysXCenterRegionFovDegrees = 20.0f;
 bool gPhysXManualSceneIndexEnabled = false;
 int gPhysXManualSceneIndex = 0;
 bool gPhysXUseLocalModelData = false;
+bool gPhysXAutoExport = false;          // 自动导出未缓存的模型到磁盘
 
 // 骨骼可视性判断
 bool gUseDepthBufferVisibility = false;  // 默认关闭，需手动开启
@@ -164,9 +175,14 @@ float gDepthBufferTolerance = 0.005f;    // 深度容差（骨骼 vs 场景）
 int gDepthBufferDownscale = 4;           // 降采样倍率（1/4 分辨率）
 bool gDrawDepthBuffer = false;           // 调试：直接绘制深度缓冲
 
-// 骨骼屏幕坐标缓存（渲染线程写入，auto-aim 读取——同一线程，无需 mutex）
+// 骨骼屏幕坐标缓存（主线程写入，auto-aim 线程读取——需要 mutex 保护）
 static std::unordered_map<uint64_t, BoneScreenData> gBoneScreenCache;
+static std::mutex gBoneScreenCacheMutex;
+static std::unordered_map<uint64_t, float> gPredictedAimHoverTimes;
 extern VulkanApp gApp;
+
+constexpr float kPredictedAimShowDelaySeconds = 0.18f;
+constexpr float kPredictedAimCenterRadiusFraction = 0.10f;
 
 // ── 骨骼插值缓存 ──
 // 缓存上一帧每个 actor 的骨骼世界坐标，用于 lerp 平滑
@@ -839,6 +855,15 @@ static std::unordered_map<uint64_t, CachedHeightFieldData> gHeightFieldCache;
 static std::unordered_map<uint64_t, uint64_t> gTriangleMeshSignatures;
 static std::unordered_map<uint64_t, uint64_t> gHeightFieldSignatures;
 
+// 签名去重缓存：相同内容的 mesh 只存一份
+static std::unordered_map<uint64_t, CachedTriangleMeshData> gTriMeshCacheBySig;
+static std::unordered_map<uint64_t, CachedHeightFieldData>  gHfCacheBySig;
+
+// 自动导出状态
+static std::unordered_set<uint64_t> gAutoExportedSigs;
+static int gAutoExportsThisFrame = 0;
+static constexpr int kAutoExportBudgetPerFrame = 8;
+
 struct TriangleMeshSourceInfo {
     uint32_t VertexCount = 0;
     uint32_t TriangleCount = 0;
@@ -1020,7 +1045,9 @@ struct VisibilitySceneCacheState {
 static VisibilitySceneCacheState gStaticVisibilityScene;
 static VisibilitySceneCacheState gHeightFieldVisibilityScene;
 static VisibilitySceneCacheState gDynamicVisibilityScene;
-static bool gVisibilityLastUseLocalModelData = false;
+static std::atomic<bool> gVisibilityLastUseLocalModelData{false};
+static std::future<void> gVisibilityRefreshFuture;
+static std::atomic<bool> gVisibilityRefreshInProgress{false};
 
 struct PhysXDrawDedupKey {
     uint8_t Source = 0;
@@ -1079,6 +1106,7 @@ struct LocalPhysXDrawCacheEntry {
     double LastSeenTime = 0.0;
 };
 static std::unordered_map<uint64_t, LocalPhysXDrawCacheEntry> gLocalPhysXDrawCache;
+static std::unordered_map<uint64_t, std::vector<uint64_t>> gPxSceneActorPointerCache;
 
 struct PhysXActorCandidate {
     uint64_t Actor = 0;
@@ -1107,6 +1135,57 @@ static ImU32 GetTeamColor(int teamID) {
     constexpr int kNumColors = sizeof(kTeamColors) / sizeof(kTeamColors[0]);
     if (teamID < 0) return IM_COL32(200, 200, 200, 255);  // 未知队伍：灰色
     return kTeamColors[teamID % kNumColors];
+}
+
+static ImU32 GetActorColor(const CachedActor& actor) {
+    switch (actor.actorType) {
+        case ActorType::BOT:
+        case ActorType::NPC:
+        case ActorType::MONSTER:
+            return IM_COL32(80, 255, 80, 255);
+        case ActorType::TOMB_BOX:
+            return IM_COL32(255, 210, 90, 255);
+        case ActorType::OTHER_BOX:
+            return IM_COL32(255, 140, 120, 255);
+        case ActorType::ESCAPE_BOX:
+            return IM_COL32(255, 235, 120, 255);
+        case ActorType::CONTAINER:
+            return IM_COL32(110, 255, 150, 255);
+        case ActorType::PLAYER:
+            return GetTeamColor(actor.teamID);
+        case ActorType::VEHICLE:
+            return IM_COL32(120, 210, 255, 255);
+        case ActorType::OTHER:
+        default:
+            return IM_COL32(220, 220, 220, 255);
+    }
+}
+
+static bool UseCategoryLabelOnly(ActorType actorType) {
+    return actorType == ActorType::BOT ||
+           actorType == ActorType::NPC ||
+           actorType == ActorType::MONSTER;
+}
+
+static bool IsCategoryPrefixActorType(ActorType actorType) {
+    return actorType == ActorType::BOT ||
+           actorType == ActorType::NPC ||
+           actorType == ActorType::MONSTER;
+}
+
+static bool IsBoxLikeActorType(ActorType actorType) {
+    return actorType == ActorType::TOMB_BOX ||
+           actorType == ActorType::OTHER_BOX ||
+           actorType == ActorType::ESCAPE_BOX;
+}
+
+static bool ShouldShowBoxContentNearCrosshair(const ImVec2& labelPos, float screenW, float screenH) {
+    const ImVec2 crosshairCenter(screenW * 0.5f, screenH * 0.5f);
+    const float shortSide = std::max(1.0f, std::min(screenW, screenH));
+    const float showRadius = shortSide * 0.14f;
+    const float dx = labelPos.x - crosshairCenter.x;
+    const float dy = labelPos.y - crosshairCenter.y;
+    return dx * dx + dy * dy <= showRadius * showRadius;
 }
 
 // 前向声明
@@ -1325,7 +1404,7 @@ static bool DrawLine3D(ImDrawList* drawList, const FMatrix& vpMat, float screenW
 
 static bool ReadPxTransform(uint64_t addr, PxTransformData& out) {
     float raw[7] = {};
-    if (!Paradise_hook->read(addr, raw, sizeof(raw))) return false;
+    if (!GetDriverManager().read(addr, raw, sizeof(raw))) return false;
     out.Rotation = NormalizeQuat({raw[0], raw[1], raw[2], raw[3]});
     out.Translation = {raw[4], raw[5], raw[6]};
     return true;
@@ -1333,20 +1412,20 @@ static bool ReadPxTransform(uint64_t addr, PxTransformData& out) {
 
 static bool ReadActorGlobalPose(uint64_t actor, uint16_t actorType, PxTransformData& out) {
     if (actorType == PX_ACTOR_RIGID_DYNAMIC) {
-        uint32_t flags = Paradise_hook->read<uint32_t>(actor + offset.PxRigidDynamicFlags);
+        uint32_t flags = GetDriverManager().read<uint32_t>(actor + offset.PxRigidDynamicFlags);
         uint64_t poseAddr = actor + offset.PxRigidDynamicBodyToWorld;
         if ((flags & 0x200u) != 0) {
-            uint64_t core = Paradise_hook->read<uint64_t>(actor + offset.PxRigidDynamicCorePtr);
+            uint64_t core = GetDriverManager().read<uint64_t>(actor + offset.PxRigidDynamicCorePtr);
             if (core == 0) return false;
             poseAddr = core + offset.PxRigidDynamicCoreBodyToWorld;
         }
         return ReadPxTransform(poseAddr, out);
     }
     if (actorType == PX_ACTOR_RIGID_STATIC) {
-        uint32_t flags = Paradise_hook->read<uint32_t>(actor + offset.PxRigidStaticFlags);
+        uint32_t flags = GetDriverManager().read<uint32_t>(actor + offset.PxRigidStaticFlags);
         uint64_t poseAddr = actor + offset.PxRigidStaticGlobalPose;
         if ((flags & 0x40u) != 0) {
-            uint64_t core = Paradise_hook->read<uint64_t>(actor + offset.PxRigidStaticCorePtr);
+            uint64_t core = GetDriverManager().read<uint64_t>(actor + offset.PxRigidStaticCorePtr);
             if (core == 0) return false;
             poseAddr = core + offset.PxRigidStaticCoreGlobalPose;
         }
@@ -1358,7 +1437,7 @@ static bool ReadActorGlobalPose(uint64_t actor, uint16_t actorType, PxTransformD
 static bool ReadShapeLocalPose(uint64_t shape, uint32_t npShapeFlags, PxTransformData& out) {
     uint64_t poseAddr = shape + offset.PxShapeLocalPose;
     if ((npShapeFlags & 0x4u) != 0) {
-        uint64_t core = Paradise_hook->read<uint64_t>(shape + offset.PxShapeCorePtr);
+        uint64_t core = GetDriverManager().read<uint64_t>(shape + offset.PxShapeCorePtr);
         if (core == 0) return false;
         poseAddr = core + offset.PxShapeLocalPoseExternal;
     }
@@ -1367,7 +1446,7 @@ static bool ReadShapeLocalPose(uint64_t shape, uint32_t npShapeFlags, PxTransfor
 
 static bool ReadMeshScale(uint64_t addr, PxMeshScaleData& out) {
     float raw[7] = {};
-    if (!Paradise_hook->read(addr, raw, sizeof(raw))) return false;
+    if (!GetDriverManager().read(addr, raw, sizeof(raw))) return false;
     out.Scale = {raw[0], raw[1], raw[2]};
     out.Rotation = NormalizeQuat({raw[3], raw[4], raw[5], raw[6]});
     return true;
@@ -1376,10 +1455,10 @@ static bool ReadMeshScale(uint64_t addr, PxMeshScaleData& out) {
 static bool ReadRemoteBufferRobust(uint64_t addr, void* buf, size_t size) {
     if (addr == 0 || buf == nullptr || size == 0) return false;
 
-    if (Paradise_hook->read(addr, buf, size)) {
+    if (GetDriverManager().read(addr, buf, size)) {
         return true;
     }
-    if (Paradise_hook->read_safe(addr, buf, size)) {
+    if (GetDriverManager().read_safe(addr, buf, size)) {
         return true;
     }
 
@@ -1391,8 +1470,8 @@ static bool ReadRemoteBufferRobust(uint64_t addr, void* buf, size_t size) {
         size_t chunkSize = std::min(kMaxChunkSize, size - offsetBytes);
         bool chunkRead = false;
         while (chunkSize >= kMinChunkSize) {
-            if (Paradise_hook->read(addr + offsetBytes, out + offsetBytes, chunkSize) ||
-                Paradise_hook->read_safe(addr + offsetBytes, out + offsetBytes, chunkSize)) {
+            if (GetDriverManager().read(addr + offsetBytes, out + offsetBytes, chunkSize) ||
+                GetDriverManager().read_safe(addr + offsetBytes, out + offsetBytes, chunkSize)) {
                 chunkRead = true;
                 offsetBytes += chunkSize;
                 break;
@@ -1409,7 +1488,7 @@ static bool ReadRemoteBufferRobust(uint64_t addr, void* buf, size_t size) {
 template <typename T>
 static bool ReadRemoteArrayElementSafe(uint64_t baseAddr, size_t index, T& out) {
     const uint64_t addr = baseAddr + static_cast<uint64_t>(index) * sizeof(T);
-    return Paradise_hook->read_safe(addr, &out, sizeof(T)) || Paradise_hook->read(addr, &out, sizeof(T));
+    return GetDriverManager().read_safe(addr, &out, sizeof(T)) || GetDriverManager().read(addr, &out, sizeof(T));
 }
 
 static std::filesystem::path GetPhysXExportDir() {
@@ -1419,7 +1498,7 @@ static std::filesystem::path GetPhysXExportDir() {
 static std::string gStablePhysXExportStatus = "未导出";
 
 // 几何缓存刷新间隔（秒）：三角面/凸包/高度场几何数据的重读周期
-float gPhysXGeomRefreshInterval = 30.0f;
+float gPhysXGeomRefreshInterval = 120.0f;
 // 上次清空几何缓存的时间戳（clock_gettime MONOTONIC）
 static double gLastGeomCacheFlushTime = 0.0;
 
@@ -1431,7 +1510,7 @@ static double GetMonotoneSec() {
 
 // 每帧几何缓存未命中预算：防止 cache flush 后单帧读取全部 mesh 导致卡顿
 static int gGeomCacheMissesThisFrame = 0;
-static constexpr int kGeomCacheMissBudgetPerFrame = 16;
+static constexpr int kGeomCacheMissBudgetPerFrame = 512;
 
 // mesh 读取失败冷却：连续读取失败的 mesh 暂时跳过，避免反复浪费预算
 struct GeomCacheMissCooldown {
@@ -1439,6 +1518,51 @@ struct GeomCacheMissCooldown {
     double LastAttemptTime = 0.0;
 };
 static std::unordered_map<uint64_t, GeomCacheMissCooldown> gGeomCacheMissCooldowns;
+
+// 异步文件加载：避免文件 I/O 阻塞绘制线程
+struct AsyncLocalMeshLoad {
+    uint64_t sig = 0;
+    std::future<LocalObjMeshData> future;
+};
+struct AsyncLocalBvhLoad {
+    uint64_t sig = 0;
+    std::future<LocalTriangleMeshBvhData> future;
+};
+static std::vector<AsyncLocalMeshLoad> gPendingMeshLoads;   // tri mesh
+static std::vector<AsyncLocalMeshLoad> gPendingHfLoads;     // height field
+static std::vector<AsyncLocalBvhLoad> gPendingBvhLoads;
+static std::unordered_set<uint64_t> gInFlightMeshSigs;
+static std::unordered_set<uint64_t> gInFlightHfSigs;
+static std::unordered_set<uint64_t> gInFlightBvhSigs;
+
+static void PollAsyncLocalLoads() {
+    for (auto it = gPendingMeshLoads.begin(); it != gPendingMeshLoads.end(); ) {
+        if (it->future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            auto data = it->future.get();
+            if (!data.Vertices.empty())
+                gLocalTriObjCache.emplace(it->sig, std::move(data));
+            gInFlightMeshSigs.erase(it->sig);
+            it = gPendingMeshLoads.erase(it);
+        } else { ++it; }
+    }
+    for (auto it = gPendingHfLoads.begin(); it != gPendingHfLoads.end(); ) {
+        if (it->future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            auto data = it->future.get();
+            if (!data.Vertices.empty())
+                gLocalHfObjCache.emplace(it->sig, std::move(data));
+            gInFlightHfSigs.erase(it->sig);
+            it = gPendingHfLoads.erase(it);
+        } else { ++it; }
+    }
+    for (auto it = gPendingBvhLoads.begin(); it != gPendingBvhLoads.end(); ) {
+        if (it->future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            auto data = it->future.get();
+            gLocalTriBvhCache.emplace(it->sig, std::move(data));
+            gInFlightBvhSigs.erase(it->sig);
+            it = gPendingBvhLoads.erase(it);
+        } else { ++it; }
+    }
+}
 
 // 全局每帧三角形绘制预算：防止大量 mesh 同时绘制导致 ImGui draw list 爆炸
 static int gTrianglesDrawnThisFrame = 0;
@@ -1559,6 +1683,7 @@ static bool BuildTriangleMeshReadCandidate(const std::vector<Vec3>& vertices, st
 static bool IsValidHeightFieldHeader(const PhysXHeightFieldHeaderSnapshot& header);
 static bool ReadHeightFieldHeaderSnapshot(uint64_t heightField, PhysXHeightFieldHeaderSnapshot& out);
 static uint64_t GetSyncPxScene(uint64_t libUE4, uint64_t uworld);
+static bool CollectPxSceneActorPointers(uint64_t pxScene, std::vector<uint64_t>& outActors);
 static bool GetCachedTriangleMesh(uint64_t mesh, uint32_t vertexCount, uint32_t triangleCount, uint8_t flags,
                                   uint64_t verticesAddr, uint64_t trianglesAddr, CachedTriangleMeshData& out);
 static bool GetCachedHeightField(uint64_t heightField, CachedHeightFieldData& out);
@@ -1569,6 +1694,7 @@ static bool GetHeightFieldCellTriangles(const CachedHeightFieldData& cache,
                                         Vec3& t1a, Vec3& t1b, Vec3& t1c, bool& t1Valid);
 static bool EnsurePrunerDataCached();
 static bool EnsureVisibilityOccludersCached(const Vec3& cameraWorldPos);
+static void CollectActivePxScenes(uint64_t libUE4, uint64_t uworld, std::vector<uint64_t>& outScenes);
 
 // --- 帧级 pruner 数据缓存（提前声明，供 DrawPhysXStaticPrunerGeometry 使用）---
 static struct {
@@ -1580,7 +1706,7 @@ static struct {
     bool valid = false;
 } gPrunerCache;
 
-static uint64_t gPrunerCacheGeneration = 0;
+static std::atomic<uint64_t> gPrunerCacheGeneration{0};
 
 static bool WriteTriangleMeshObj(const std::filesystem::path& path, const CachedTriangleMeshData& cache) {
     if (cache.Vertices.empty() || cache.Indices.size() < 3) return false;
@@ -1776,7 +1902,7 @@ static bool ReadTriangleMeshForExportSafe(const TriangleMeshSourceInfo& source, 
             const size_t step = std::max<size_t>(vc / 4, 1);
             for (size_t idx = 0; idx < vc && stable; idx += step) {
                 Vec3 reread{};
-                if (Paradise_hook->read(source.VerticesAddr + idx * sizeof(Vec3),
+                if (GetDriverManager().read(source.VerticesAddr + idx * sizeof(Vec3),
                                        &reread, sizeof(reread))) {
                     const Vec3& orig = snapshot.Vertices[idx];
                     if (reread.X != orig.X || reread.Y != orig.Y || reread.Z != orig.Z)
@@ -1851,7 +1977,7 @@ static bool ReadHeightFieldForExportSafe(const HeightFieldSourceInfo& source, Ca
         const size_t step = std::max<size_t>(sampleCount / 8, 1);
         for (size_t idx = 0; idx < sampleCount && stable; idx += step) {
             PhysXHeightFieldSample reread{};
-            if (Paradise_hook->read(source.SamplesAddr + idx * sizeof(PhysXHeightFieldSample),
+            if (GetDriverManager().read(source.SamplesAddr + idx * sizeof(PhysXHeightFieldSample),
                                    &reread, sizeof(reread))) {
                 if (reread.Height != second[idx].Height ||
                     reread.Material0 != second[idx].Material0 ||
@@ -2198,11 +2324,11 @@ static bool ResolveHeightFieldSignatureFromLocalMeta(uint64_t heightField, uint3
 static const LocalObjMeshData* GetLocalTriangleMeshData(uint64_t mesh) {
     auto sigIt = gTriangleMeshSignatures.find(mesh);
     if (sigIt == gTriangleMeshSignatures.end()) {
-        const uint32_t vertexCount = Paradise_hook->read<uint32_t>(mesh + offset.PxTriangleMeshVertexCount);
-        const uint32_t triangleCount = Paradise_hook->read<uint32_t>(mesh + offset.PxTriangleMeshTriangleCount);
-        const uint64_t verticesAddr = Paradise_hook->read<uint64_t>(mesh + offset.PxTriangleMeshVertices);
-        const uint64_t trianglesAddr = Paradise_hook->read<uint64_t>(mesh + offset.PxTriangleMeshTriangles);
-        const uint8_t flags = Paradise_hook->read<uint8_t>(mesh + offset.PxTriangleMeshFlags);
+        const uint32_t vertexCount = GetDriverManager().read<uint32_t>(mesh + offset.PxTriangleMeshVertexCount);
+        const uint32_t triangleCount = GetDriverManager().read<uint32_t>(mesh + offset.PxTriangleMeshTriangleCount);
+        const uint64_t verticesAddr = GetDriverManager().read<uint64_t>(mesh + offset.PxTriangleMeshVertices);
+        const uint64_t trianglesAddr = GetDriverManager().read<uint64_t>(mesh + offset.PxTriangleMeshTriangles);
+        const uint8_t flags = GetDriverManager().read<uint8_t>(mesh + offset.PxTriangleMeshFlags);
         if (vertexCount == 0 || triangleCount == 0 || verticesAddr == 0 || trianglesAddr == 0) return nullptr;
 
         CachedTriangleMeshData cache;
@@ -2217,13 +2343,26 @@ static const LocalObjMeshData* GetLocalTriangleMeshData(uint64_t mesh) {
     auto cacheIt = gLocalTriObjCache.find(sig);
     if (cacheIt != gLocalTriObjCache.end()) return &cacheIt->second;
 
+    // 如果已在异步加载中，返回 nullptr 等待下一帧
+    if (gInFlightMeshSigs.find(sig) != gInFlightMeshSigs.end()) return nullptr;
+
+    // 启动异步文件加载
     char name[64];
     std::snprintf(name, sizeof(name), "tri_%016llx.obj", static_cast<unsigned long long>(sig));
-    LocalObjMeshData loaded;
-    if (!LoadObjMeshFile(GetPhysXExportDir() / name, loaded)) return nullptr;
-
-    auto [it, _] = gLocalTriObjCache.emplace(sig, std::move(loaded));
-    return &it->second;
+    auto path = GetPhysXExportDir() / name;
+    gInFlightMeshSigs.insert(sig);
+    gPendingMeshLoads.push_back({sig, std::async(std::launch::async, [path, sig]() {
+        LocalObjMeshData loaded;
+        if (!LoadObjMeshFile(path, loaded)) {
+            auto memIt = gTriMeshCacheBySig.find(sig);
+            if (memIt != gTriMeshCacheBySig.end()) {
+                loaded.Vertices = memIt->second.Vertices;
+                loaded.Indices = memIt->second.Indices;
+            }
+        }
+        return loaded;
+    })});
+    return nullptr;
 }
 
 static const LocalObjMeshData* GetLocalTriangleMeshDataStrict(uint64_t mesh) {
@@ -2232,32 +2371,54 @@ static const LocalObjMeshData* GetLocalTriangleMeshDataStrict(uint64_t mesh) {
     if (sigIt != gTriangleMeshSignatures.end()) {
         sig = sigIt->second;
     } else {
-        const uint32_t vertexCount = Paradise_hook->read<uint32_t>(mesh + offset.PxTriangleMeshVertexCount);
-        const uint32_t triangleCount = Paradise_hook->read<uint32_t>(mesh + offset.PxTriangleMeshTriangleCount);
-        const uint8_t flags = Paradise_hook->read<uint8_t>(mesh + offset.PxTriangleMeshFlags);
-        if (!ResolveTriangleMeshSignatureFromLocalMeta(mesh, vertexCount, triangleCount, flags, sig)) return nullptr;
+        const uint32_t vertexCount = GetDriverManager().read<uint32_t>(mesh + offset.PxTriangleMeshVertexCount);
+        const uint32_t triangleCount = GetDriverManager().read<uint32_t>(mesh + offset.PxTriangleMeshTriangleCount);
+        const uint8_t flags = GetDriverManager().read<uint8_t>(mesh + offset.PxTriangleMeshFlags);
+
+        // 先尝试按 count 快速匹配
+        if (!ResolveTriangleMeshSignatureFromLocalMeta(mesh, vertexCount, triangleCount, flags, sig)) {
+            // 快速匹配失败（无匹配或多个匹配），回退到读取内存计算真实内容哈希
+            const uint64_t verticesAddr = GetDriverManager().read<uint64_t>(mesh + offset.PxTriangleMeshVertices);
+            const uint64_t trianglesAddr = GetDriverManager().read<uint64_t>(mesh + offset.PxTriangleMeshTriangles);
+            if (vertexCount == 0 || triangleCount == 0 || verticesAddr == 0 || trianglesAddr == 0) return nullptr;
+
+            CachedTriangleMeshData cache;
+            if (!GetCachedTriangleMesh(mesh, vertexCount, triangleCount, flags, verticesAddr, trianglesAddr, cache)) {
+                return nullptr;
+            }
+            sigIt = gTriangleMeshSignatures.find(mesh);
+            if (sigIt == gTriangleMeshSignatures.end()) return nullptr;
+            sig = sigIt->second;
+        }
     }
 
     auto cacheIt = gLocalTriObjCache.find(sig);
     if (cacheIt != gLocalTriObjCache.end()) return &cacheIt->second;
 
+    // 如果已在异步加载中，返回 nullptr 等待下一帧
+    if (gInFlightMeshSigs.find(sig) != gInFlightMeshSigs.end()) return nullptr;
+
+    // 启动异步文件加载
     char name[64];
     std::snprintf(name, sizeof(name), "tri_%016llx.obj", static_cast<unsigned long long>(sig));
-    LocalObjMeshData loaded;
-    if (!LoadObjMeshFile(GetPhysXExportDir() / name, loaded)) return nullptr;
-
-    auto [it, _] = gLocalTriObjCache.emplace(sig, std::move(loaded));
-    return &it->second;
+    auto path = GetPhysXExportDir() / name;
+    gInFlightMeshSigs.insert(sig);
+    gPendingMeshLoads.push_back({sig, std::async(std::launch::async, [path]() {
+        LocalObjMeshData loaded;
+        LoadObjMeshFile(path, loaded);
+        return loaded;
+    })});
+    return nullptr;
 }
 
 static const LocalTriangleMeshBvhData* GetLocalTriangleMeshBvhData(uint64_t mesh) {
     auto sigIt = gTriangleMeshSignatures.find(mesh);
     if (sigIt == gTriangleMeshSignatures.end()) {
-        const uint32_t vertexCount = Paradise_hook->read<uint32_t>(mesh + offset.PxTriangleMeshVertexCount);
-        const uint32_t triangleCount = Paradise_hook->read<uint32_t>(mesh + offset.PxTriangleMeshTriangleCount);
-        const uint64_t verticesAddr = Paradise_hook->read<uint64_t>(mesh + offset.PxTriangleMeshVertices);
-        const uint64_t trianglesAddr = Paradise_hook->read<uint64_t>(mesh + offset.PxTriangleMeshTriangles);
-        const uint8_t flags = Paradise_hook->read<uint8_t>(mesh + offset.PxTriangleMeshFlags);
+        const uint32_t vertexCount = GetDriverManager().read<uint32_t>(mesh + offset.PxTriangleMeshVertexCount);
+        const uint32_t triangleCount = GetDriverManager().read<uint32_t>(mesh + offset.PxTriangleMeshTriangleCount);
+        const uint64_t verticesAddr = GetDriverManager().read<uint64_t>(mesh + offset.PxTriangleMeshVertices);
+        const uint64_t trianglesAddr = GetDriverManager().read<uint64_t>(mesh + offset.PxTriangleMeshTriangles);
+        const uint8_t flags = GetDriverManager().read<uint8_t>(mesh + offset.PxTriangleMeshFlags);
         if (vertexCount == 0 || triangleCount == 0 || verticesAddr == 0 || trianglesAddr == 0) return nullptr;
 
         CachedTriangleMeshData cache;
@@ -2274,16 +2435,18 @@ static const LocalTriangleMeshBvhData* GetLocalTriangleMeshBvhData(uint64_t mesh
         return cacheIt->second.Valid ? &cacheIt->second : nullptr;
     }
 
+    if (gInFlightBvhSigs.find(sig) != gInFlightBvhSigs.end()) return nullptr;
+
     char name[64];
     std::snprintf(name, sizeof(name), "tri_%016llx.bvh.txt", static_cast<unsigned long long>(sig));
-    LocalTriangleMeshBvhData loaded;
-    if (!LoadBvhFile(GetPhysXExportDir() / name, loaded)) {
-        gLocalTriBvhCache.emplace(sig, LocalTriangleMeshBvhData{});
-        return nullptr;
-    }
-
-    auto [it, _] = gLocalTriBvhCache.emplace(sig, std::move(loaded));
-    return it->second.Valid ? &it->second : nullptr;
+    auto path = GetPhysXExportDir() / name;
+    gInFlightBvhSigs.insert(sig);
+    gPendingBvhLoads.push_back({sig, std::async(std::launch::async, [path]() {
+        LocalTriangleMeshBvhData loaded;
+        LoadBvhFile(path, loaded);
+        return loaded;
+    })});
+    return nullptr;
 }
 
 static const LocalTriangleMeshBvhData* GetLocalTriangleMeshBvhDataStrict(uint64_t mesh) {
@@ -2292,10 +2455,23 @@ static const LocalTriangleMeshBvhData* GetLocalTriangleMeshBvhDataStrict(uint64_
     if (sigIt != gTriangleMeshSignatures.end()) {
         sig = sigIt->second;
     } else {
-        const uint32_t vertexCount = Paradise_hook->read<uint32_t>(mesh + offset.PxTriangleMeshVertexCount);
-        const uint32_t triangleCount = Paradise_hook->read<uint32_t>(mesh + offset.PxTriangleMeshTriangleCount);
-        const uint8_t flags = Paradise_hook->read<uint8_t>(mesh + offset.PxTriangleMeshFlags);
-        if (!ResolveTriangleMeshSignatureFromLocalMeta(mesh, vertexCount, triangleCount, flags, sig)) return nullptr;
+        const uint32_t vertexCount = GetDriverManager().read<uint32_t>(mesh + offset.PxTriangleMeshVertexCount);
+        const uint32_t triangleCount = GetDriverManager().read<uint32_t>(mesh + offset.PxTriangleMeshTriangleCount);
+        const uint8_t flags = GetDriverManager().read<uint8_t>(mesh + offset.PxTriangleMeshFlags);
+
+        if (!ResolveTriangleMeshSignatureFromLocalMeta(mesh, vertexCount, triangleCount, flags, sig)) {
+            const uint64_t verticesAddr = GetDriverManager().read<uint64_t>(mesh + offset.PxTriangleMeshVertices);
+            const uint64_t trianglesAddr = GetDriverManager().read<uint64_t>(mesh + offset.PxTriangleMeshTriangles);
+            if (vertexCount == 0 || triangleCount == 0 || verticesAddr == 0 || trianglesAddr == 0) return nullptr;
+
+            CachedTriangleMeshData cache;
+            if (!GetCachedTriangleMesh(mesh, vertexCount, triangleCount, flags, verticesAddr, trianglesAddr, cache)) {
+                return nullptr;
+            }
+            sigIt = gTriangleMeshSignatures.find(mesh);
+            if (sigIt == gTriangleMeshSignatures.end()) return nullptr;
+            sig = sigIt->second;
+        }
     }
 
     auto cacheIt = gLocalTriBvhCache.find(sig);
@@ -2303,16 +2479,18 @@ static const LocalTriangleMeshBvhData* GetLocalTriangleMeshBvhDataStrict(uint64_
         return cacheIt->second.Valid ? &cacheIt->second : nullptr;
     }
 
+    if (gInFlightBvhSigs.find(sig) != gInFlightBvhSigs.end()) return nullptr;
+
     char name[64];
     std::snprintf(name, sizeof(name), "tri_%016llx.bvh.txt", static_cast<unsigned long long>(sig));
-    LocalTriangleMeshBvhData loaded;
-    if (!LoadBvhFile(GetPhysXExportDir() / name, loaded)) {
-        gLocalTriBvhCache.emplace(sig, LocalTriangleMeshBvhData{});
-        return nullptr;
-    }
-
-    auto [it, _] = gLocalTriBvhCache.emplace(sig, std::move(loaded));
-    return it->second.Valid ? &it->second : nullptr;
+    auto path = GetPhysXExportDir() / name;
+    gInFlightBvhSigs.insert(sig);
+    gPendingBvhLoads.push_back({sig, std::async(std::launch::async, [path]() {
+        LocalTriangleMeshBvhData loaded;
+        LoadBvhFile(path, loaded);
+        return loaded;
+    })});
+    return nullptr;
 }
 
 static const LocalObjMeshData* GetLocalHeightFieldData(uint64_t heightField) {
@@ -2328,13 +2506,18 @@ static const LocalObjMeshData* GetLocalHeightFieldData(uint64_t heightField) {
     auto cacheIt = gLocalHfObjCache.find(sig);
     if (cacheIt != gLocalHfObjCache.end()) return &cacheIt->second;
 
+    if (gInFlightHfSigs.find(sig) != gInFlightHfSigs.end()) return nullptr;
+
     char name[64];
     std::snprintf(name, sizeof(name), "hf_%016llx.obj", static_cast<unsigned long long>(sig));
-    LocalObjMeshData loaded;
-    if (!LoadObjMeshFile(GetPhysXExportDir() / name, loaded)) return nullptr;
-
-    auto [it, _] = gLocalHfObjCache.emplace(sig, std::move(loaded));
-    return &it->second;
+    auto path = GetPhysXExportDir() / name;
+    gInFlightHfSigs.insert(sig);
+    gPendingHfLoads.push_back({sig, std::async(std::launch::async, [path]() {
+        LocalObjMeshData loaded;
+        LoadObjMeshFile(path, loaded);
+        return loaded;
+    })});
+    return nullptr;
 }
 
 static const LocalObjMeshData* GetLocalHeightFieldDataStrict(uint64_t heightField) {
@@ -2343,21 +2526,33 @@ static const LocalObjMeshData* GetLocalHeightFieldDataStrict(uint64_t heightFiel
     if (sigIt != gHeightFieldSignatures.end()) {
         sig = sigIt->second;
     } else {
-        const uint32_t rows = Paradise_hook->read<uint32_t>(heightField + offset.PxHeightFieldRows);
-        const uint32_t columns = Paradise_hook->read<uint32_t>(heightField + offset.PxHeightFieldColumns);
-        if (!ResolveHeightFieldSignatureFromLocalMeta(heightField, rows, columns, sig)) return nullptr;
+        const uint32_t rows = GetDriverManager().read<uint32_t>(heightField + offset.PxHeightFieldRows);
+        const uint32_t columns = GetDriverManager().read<uint32_t>(heightField + offset.PxHeightFieldColumns);
+
+        if (!ResolveHeightFieldSignatureFromLocalMeta(heightField, rows, columns, sig)) {
+            CachedHeightFieldData cache;
+            if (!GetCachedHeightField(heightField, cache)) return nullptr;
+            sigIt = gHeightFieldSignatures.find(heightField);
+            if (sigIt == gHeightFieldSignatures.end()) return nullptr;
+            sig = sigIt->second;
+        }
     }
 
     auto cacheIt = gLocalHfObjCache.find(sig);
     if (cacheIt != gLocalHfObjCache.end()) return &cacheIt->second;
 
+    if (gInFlightHfSigs.find(sig) != gInFlightHfSigs.end()) return nullptr;
+
     char name[64];
     std::snprintf(name, sizeof(name), "hf_%016llx.obj", static_cast<unsigned long long>(sig));
-    LocalObjMeshData loaded;
-    if (!LoadObjMeshFile(GetPhysXExportDir() / name, loaded)) return nullptr;
-
-    auto [it, _] = gLocalHfObjCache.emplace(sig, std::move(loaded));
-    return &it->second;
+    auto path = GetPhysXExportDir() / name;
+    gInFlightHfSigs.insert(sig);
+    gPendingHfLoads.push_back({sig, std::async(std::launch::async, [path]() {
+        LocalObjMeshData loaded;
+        LoadObjMeshFile(path, loaded);
+        return loaded;
+    })});
+    return nullptr;
 }
 
 static bool LoadBvhFile(const std::filesystem::path& path, LocalTriangleMeshBvhData& out) {
@@ -2433,45 +2628,16 @@ bool ExportStablePhysXMeshes() {
         gStablePhysXExportStatus = "导出目录创建失败";
         return false;
     }
-    if (!Paradise_hook || address.libUE4 == 0) {
+    if (address.libUE4 == 0) {
         gStablePhysXExportStatus = "驱动未就绪";
         return false;
     }
 
-    const uint64_t uworld = Paradise_hook->read<uint64_t>(address.libUE4 + offset.Gworld);
-    const uint64_t pxScene = GetSyncPxScene(address.libUE4, uworld);
-    if (pxScene == 0) {
+    const uint64_t uworld = GetDriverManager().read<uint64_t>(address.libUE4 + offset.Gworld);
+    std::vector<uint64_t> pxScenes;
+    CollectActivePxScenes(address.libUE4, uworld, pxScenes);
+    if (pxScenes.empty()) {
         gStablePhysXExportStatus = "PxScene 未找到";
-        return false;
-    }
-
-    // 读取 pruner 中的全部对象（不限距离/视角）
-    const uint64_t sqm = pxScene + offset.NpSceneQueriesSceneQueryManager;
-    const uint64_t pruner = Paradise_hook->read<uint64_t>(sqm + offset.PrunerExtPruner);
-    const uint32_t prunerType = Paradise_hook->read<uint32_t>(sqm + offset.PrunerExtType);
-    if (pruner == 0) {
-        gStablePhysXExportStatus = "Pruner 未找到";
-        return false;
-    }
-    uint64_t pool = 0;
-    if (prunerType == 1) pool = pruner + offset.AABBPrunerPool;
-    else if (prunerType == 0) pool = pruner + offset.BucketPrunerPool;
-    else { gStablePhysXExportStatus = "未知 PrunerType"; return false; }
-
-    const uint32_t objectCount = Paradise_hook->read<uint32_t>(pool + offset.PruningPoolNbObjects);
-    if (objectCount == 0 || objectCount > 200000) {
-        gStablePhysXExportStatus = "Pruner 对象数量异常";
-        return false;
-    }
-    const uint64_t objectsAddr = Paradise_hook->read<uint64_t>(pool + offset.PruningPoolObjects);
-    if (objectsAddr == 0) {
-        gStablePhysXExportStatus = "Pruner 对象地址无效";
-        return false;
-    }
-
-    std::vector<PhysXPrunerPayload> payloads(objectCount);
-    if (!ReadRemoteBufferRobust(objectsAddr, payloads.data(), payloads.size() * sizeof(PhysXPrunerPayload))) {
-        gStablePhysXExportStatus = "Pruner payload 读取失败";
         return false;
     }
 
@@ -2490,104 +2656,116 @@ bool ExportStablePhysXMeshes() {
     std::vector<TriMeshExportInfo> triMeshes;
     std::vector<HfExportInfo> hfMeshes;
 
-    for (uint32_t i = 0; i < objectCount; ++i) {
-        const PhysXPrunerPayload& payload = payloads[i];
-        if (payload.Shape == 0) continue;
+    for (uint64_t pxScene : pxScenes) {
+        const uint64_t sqm = pxScene + offset.NpSceneQueriesSceneQueryManager;
+        const uint64_t pruner = GetDriverManager().read<uint64_t>(sqm + offset.PrunerExtPruner);
+        const uint32_t prunerType = GetDriverManager().read<uint32_t>(sqm + offset.PrunerExtType);
+        uint64_t pool = 0;
+        if (prunerType == 1) pool = pruner + offset.AABBPrunerPool;
+        else if (prunerType == 0) pool = pruner + offset.BucketPrunerPool;
 
-        const uint64_t geometryAddr = payload.Shape + offset.ScbShapeCoreGeometry;
-        const uint32_t geometryType = Paradise_hook->read<uint32_t>(geometryAddr);
+        if (pruner != 0 && pool != 0) {
+            const uint32_t objectCount = GetDriverManager().read<uint32_t>(pool + offset.PruningPoolNbObjects);
+            const uint64_t objectsAddr = GetDriverManager().read<uint64_t>(pool + offset.PruningPoolObjects);
+            if (objectCount > 0 && objectCount <= 200000 && objectsAddr != 0) {
+                std::vector<PhysXPrunerPayload> payloads(objectCount);
+                if (ReadRemoteBufferRobust(objectsAddr, payloads.data(), payloads.size() * sizeof(PhysXPrunerPayload))) {
+                    for (uint32_t i = 0; i < objectCount; ++i) {
+                        const PhysXPrunerPayload& payload = payloads[i];
+                        if (payload.Shape == 0) continue;
 
-        if (geometryType == PX_GEOM_TRIANGLEMESH) {
-            const uint64_t mesh = Paradise_hook->read<uint64_t>(geometryAddr + offset.PxTriangleMeshGeometryTriangleMesh);
-            if (mesh == 0 || seenTriMeshes.count(mesh)) continue;
-            seenTriMeshes.insert(mesh);
+                        const uint64_t geometryAddr = payload.Shape + offset.ScbShapeCoreGeometry;
+                        const uint32_t geometryType = GetDriverManager().read<uint32_t>(geometryAddr);
 
-            const uint32_t vertexCount = Paradise_hook->read<uint32_t>(mesh + offset.PxTriangleMeshVertexCount);
-            const uint32_t triangleCount = Paradise_hook->read<uint32_t>(mesh + offset.PxTriangleMeshTriangleCount);
-            const uint64_t verticesAddr = Paradise_hook->read<uint64_t>(mesh + offset.PxTriangleMeshVertices);
-            const uint64_t trianglesAddr = Paradise_hook->read<uint64_t>(mesh + offset.PxTriangleMeshTriangles);
-            const uint8_t flags = Paradise_hook->read<uint8_t>(mesh + offset.PxTriangleMeshFlags);
-            if (vertexCount == 0 || triangleCount == 0 || verticesAddr == 0 || trianglesAddr == 0) continue;
-            if (triangleCount > 500000) continue;
+                        if (geometryType == PX_GEOM_TRIANGLEMESH) {
+                            const uint64_t mesh = GetDriverManager().read<uint64_t>(geometryAddr + offset.PxTriangleMeshGeometryTriangleMesh);
+                            if (mesh == 0 || seenTriMeshes.count(mesh)) continue;
+                            seenTriMeshes.insert(mesh);
 
-            triMeshes.push_back({mesh, {vertexCount, triangleCount, flags, verticesAddr, trianglesAddr}});
+                            const uint32_t vertexCount = GetDriverManager().read<uint32_t>(mesh + offset.PxTriangleMeshVertexCount);
+                            const uint32_t triangleCount = GetDriverManager().read<uint32_t>(mesh + offset.PxTriangleMeshTriangleCount);
+                            const uint64_t verticesAddr = GetDriverManager().read<uint64_t>(mesh + offset.PxTriangleMeshVertices);
+                            const uint64_t trianglesAddr = GetDriverManager().read<uint64_t>(mesh + offset.PxTriangleMeshTriangles);
+                            const uint8_t flags = GetDriverManager().read<uint8_t>(mesh + offset.PxTriangleMeshFlags);
+                            if (vertexCount == 0 || triangleCount == 0 || verticesAddr == 0 || trianglesAddr == 0) continue;
+                            if (triangleCount > 500000) continue;
 
-        } else if (geometryType == PX_GEOM_HEIGHTFIELD) {
-            const uint64_t heightField = Paradise_hook->read<uint64_t>(geometryAddr + offset.PxHeightFieldGeometryHeightField);
-            if (heightField == 0 || seenHeightFields.count(heightField)) continue;
-            seenHeightFields.insert(heightField);
+                            triMeshes.push_back({mesh, {vertexCount, triangleCount, flags, verticesAddr, trianglesAddr}});
+                        } else if (geometryType == PX_GEOM_HEIGHTFIELD) {
+                            const uint64_t heightField = GetDriverManager().read<uint64_t>(geometryAddr + offset.PxHeightFieldGeometryHeightField);
+                            if (heightField == 0 || seenHeightFields.count(heightField)) continue;
+                            seenHeightFields.insert(heightField);
 
-            PhysXHeightFieldHeaderSnapshot header;
-            if (!ReadHeightFieldHeaderSnapshot(heightField, header)) continue;
-            if (!IsValidHeightFieldHeader(header)) continue;
+                            PhysXHeightFieldHeaderSnapshot header;
+                            if (!ReadHeightFieldHeaderSnapshot(heightField, header)) continue;
+                            if (!IsValidHeightFieldHeader(header)) continue;
 
-            hfMeshes.push_back({heightField, {header.Rows, header.Columns, header.SampleStride,
-                                               header.SampleCount, header.ModifyCount, header.SamplesAddr,
-                                               header.Thickness}});
+                            hfMeshes.push_back({heightField, {header.Rows, header.Columns, header.SampleStride,
+                                                               header.SampleCount, header.ModifyCount, header.SamplesAddr,
+                                                               header.Thickness}});
+                        }
+                    }
+                }
+            }
         }
-    }
 
-    // 也从 PxScene actor 列表收集（补充 pruner 中可能没有的动态 actor）
-    const uint64_t actorArray = Paradise_hook->read<uint64_t>(pxScene + offset.PxSceneActors);
-    const uint32_t actorCount = Paradise_hook->read<uint32_t>(pxScene + offset.PxSceneActorCount);
-    if (actorArray != 0 && actorCount > 0 && actorCount <= 100000) {
-        std::vector<uint64_t> actors(actorCount);
-        if (ReadRemoteBufferRobust(actorArray, actors.data(), actorCount * sizeof(uint64_t))) {
-            for (uint64_t actor : actors) {
+        std::vector<uint64_t> actors;
+        if (CollectPxSceneActorPointers(pxScene, actors)) {
+                for (uint64_t actor : actors) {
                 if (actor == 0) continue;
-                const uint16_t shapeCount = Paradise_hook->read<uint16_t>(actor + offset.PxActorShapeCount);
+                const uint16_t shapeCount = GetDriverManager().read<uint16_t>(actor + offset.PxActorShapeCount);
                 if (shapeCount == 0 || shapeCount > 64) continue;
 
                 std::vector<uint64_t> shapes(std::min<uint16_t>(shapeCount, 64));
                 if (shapeCount == 1) {
-                    shapes[0] = Paradise_hook->read<uint64_t>(actor + offset.PxActorShapes);
+                    shapes[0] = GetDriverManager().read<uint64_t>(actor + offset.PxActorShapes);
                 } else {
-                    const uint64_t shapePtrArray = Paradise_hook->read<uint64_t>(actor + offset.PxActorShapes);
+                    const uint64_t shapePtrArray = GetDriverManager().read<uint64_t>(actor + offset.PxActorShapes);
                     if (shapePtrArray == 0) continue;
                     if (!ReadRemoteBufferRobust(shapePtrArray, shapes.data(), shapes.size() * sizeof(uint64_t))) continue;
                 }
 
-                for (uint64_t shape : shapes) {
-                    if (shape == 0) continue;
-                    uint64_t geometryAddr = shape + offset.PxShapeGeometryInline;
-                    const uint32_t npShapeFlags = Paradise_hook->read<uint32_t>(shape + offset.PxShapeFlags);
-                    if ((npShapeFlags & 0x1u) != 0) {
-                        const uint64_t corePtr = Paradise_hook->read<uint64_t>(shape + offset.PxShapeCorePtr);
-                        if (corePtr == 0) continue;
-                        geometryAddr = corePtr + offset.PxShapeCoreGeometry;
-                    }
-                    const uint32_t geometryType = Paradise_hook->read<uint32_t>(geometryAddr);
+                    for (uint64_t shape : shapes) {
+                        if (shape == 0) continue;
+                        uint64_t geometryAddr = shape + offset.PxShapeGeometryInline;
+                        const uint32_t npShapeFlags = GetDriverManager().read<uint32_t>(shape + offset.PxShapeFlags);
+                        if ((npShapeFlags & 0x1u) != 0) {
+                            const uint64_t corePtr = GetDriverManager().read<uint64_t>(shape + offset.PxShapeCorePtr);
+                            if (corePtr == 0) continue;
+                            geometryAddr = corePtr + offset.PxShapeCoreGeometry;
+                        }
+                        const uint32_t geometryType = GetDriverManager().read<uint32_t>(geometryAddr);
 
-                    if (geometryType == PX_GEOM_TRIANGLEMESH) {
-                        const uint64_t mesh = Paradise_hook->read<uint64_t>(geometryAddr + offset.PxTriangleMeshGeometryTriangleMesh);
-                        if (mesh == 0 || seenTriMeshes.count(mesh)) continue;
-                        seenTriMeshes.insert(mesh);
+                        if (geometryType == PX_GEOM_TRIANGLEMESH) {
+                            const uint64_t mesh = GetDriverManager().read<uint64_t>(geometryAddr + offset.PxTriangleMeshGeometryTriangleMesh);
+                            if (mesh == 0 || seenTriMeshes.count(mesh)) continue;
+                            seenTriMeshes.insert(mesh);
 
-                        const uint32_t vertexCount = Paradise_hook->read<uint32_t>(mesh + offset.PxTriangleMeshVertexCount);
-                        const uint32_t triangleCount = Paradise_hook->read<uint32_t>(mesh + offset.PxTriangleMeshTriangleCount);
-                        const uint64_t verticesAddr = Paradise_hook->read<uint64_t>(mesh + offset.PxTriangleMeshVertices);
-                        const uint64_t trianglesAddr = Paradise_hook->read<uint64_t>(mesh + offset.PxTriangleMeshTriangles);
-                        const uint8_t flags = Paradise_hook->read<uint8_t>(mesh + offset.PxTriangleMeshFlags);
-                        if (vertexCount == 0 || triangleCount == 0 || verticesAddr == 0 || trianglesAddr == 0) continue;
-                        if (triangleCount > 500000) continue;
+                            const uint32_t vertexCount = GetDriverManager().read<uint32_t>(mesh + offset.PxTriangleMeshVertexCount);
+                            const uint32_t triangleCount = GetDriverManager().read<uint32_t>(mesh + offset.PxTriangleMeshTriangleCount);
+                            const uint64_t verticesAddr = GetDriverManager().read<uint64_t>(mesh + offset.PxTriangleMeshVertices);
+                            const uint64_t trianglesAddr = GetDriverManager().read<uint64_t>(mesh + offset.PxTriangleMeshTriangles);
+                            const uint8_t flags = GetDriverManager().read<uint8_t>(mesh + offset.PxTriangleMeshFlags);
+                            if (vertexCount == 0 || triangleCount == 0 || verticesAddr == 0 || trianglesAddr == 0) continue;
+                            if (triangleCount > 500000) continue;
 
-                        triMeshes.push_back({mesh, {vertexCount, triangleCount, flags, verticesAddr, trianglesAddr}});
+                            triMeshes.push_back({mesh, {vertexCount, triangleCount, flags, verticesAddr, trianglesAddr}});
 
-                    } else if (geometryType == PX_GEOM_HEIGHTFIELD) {
-                        const uint64_t heightField = Paradise_hook->read<uint64_t>(geometryAddr + offset.PxHeightFieldGeometryHeightField);
-                        if (heightField == 0 || seenHeightFields.count(heightField)) continue;
-                        seenHeightFields.insert(heightField);
+                        } else if (geometryType == PX_GEOM_HEIGHTFIELD) {
+                            const uint64_t heightField = GetDriverManager().read<uint64_t>(geometryAddr + offset.PxHeightFieldGeometryHeightField);
+                            if (heightField == 0 || seenHeightFields.count(heightField)) continue;
+                            seenHeightFields.insert(heightField);
 
-                        PhysXHeightFieldHeaderSnapshot header;
-                        if (!ReadHeightFieldHeaderSnapshot(heightField, header)) continue;
-                        if (!IsValidHeightFieldHeader(header)) continue;
+                            PhysXHeightFieldHeaderSnapshot header;
+                            if (!ReadHeightFieldHeaderSnapshot(heightField, header)) continue;
+                            if (!IsValidHeightFieldHeader(header)) continue;
 
-                        hfMeshes.push_back({heightField, {header.Rows, header.Columns, header.SampleStride,
-                                                           header.SampleCount, header.ModifyCount, header.SamplesAddr,
-                                                           header.Thickness}});
+                            hfMeshes.push_back({heightField, {header.Rows, header.Columns, header.SampleStride,
+                                                               header.SampleCount, header.ModifyCount, header.SamplesAddr,
+                                                               header.Thickness}});
+                        }
                     }
                 }
-            }
         }
     }
 
@@ -2678,7 +2856,7 @@ static bool IsWithinCenterRegion(const Vec3& worldPos, const FMatrix& vpMat, flo
     if (!WorldToScreen(worldPos, vpMat, screenW, screenH, screenPos)) return false;
     const float cx = screenW * 0.5f;
     const float cy = screenH * 0.5f;
-    const float radius = std::min(screenW, screenH) * std::clamp(gPhysXCenterRegionFovDegrees / 90.0f, 0.05f, 0.65f);
+    const float radius = std::min(screenW, screenH) * std::clamp(gPhysXCenterRegionFovDegrees / 90.0f, 0.05f, 0.667f);
     const float dx = screenPos.x - cx;
     const float dy = screenPos.y - cy;
     return dx * dx + dy * dy <= radius * radius;
@@ -2687,7 +2865,7 @@ static bool IsWithinCenterRegion(const Vec3& worldPos, const FMatrix& vpMat, flo
 static bool IsBoundsWithinCenterRegion(const PhysXBounds3& bounds, const FMatrix& vpMat, float screenW, float screenH) {
     const float cx = screenW * 0.5f;
     const float cy = screenH * 0.5f;
-    const float radius = std::min(screenW, screenH) * std::clamp(gPhysXCenterRegionFovDegrees / 90.0f, 0.05f, 0.65f);
+    const float radius = std::min(screenW, screenH) * std::clamp(gPhysXCenterRegionFovDegrees / 90.0f, 0.05f, 0.667f);
     const float radiusSq = radius * radius;
 
     const Vec3 center = {
@@ -2938,11 +3116,11 @@ static float DistanceSqToBounds(const Vec3& point, const PhysXBounds3& bounds) {
 static uint64_t ResolvePhysXGeometryResource(uint32_t geometryType, uint64_t geometryAddr) {
     switch (geometryType) {
         case PX_GEOM_TRIANGLEMESH:
-            return Paradise_hook->read<uint64_t>(geometryAddr + offset.PxTriangleMeshGeometryTriangleMesh);
+            return GetDriverManager().read<uint64_t>(geometryAddr + offset.PxTriangleMeshGeometryTriangleMesh);
         case PX_GEOM_CONVEXMESH:
-            return Paradise_hook->read<uint64_t>(geometryAddr + offset.PxConvexMeshGeometryConvexMesh);
+            return GetDriverManager().read<uint64_t>(geometryAddr + offset.PxConvexMeshGeometryConvexMesh);
         case PX_GEOM_HEIGHTFIELD:
-            return Paradise_hook->read<uint64_t>(geometryAddr + offset.PxHeightFieldGeometryHeightField);
+            return GetDriverManager().read<uint64_t>(geometryAddr + offset.PxHeightFieldGeometryHeightField);
         default:
             return geometryAddr;
     }
@@ -2972,9 +3150,9 @@ static PhysXDrawDedupKey BuildPhysXDrawDedupKey(PhysXDrawSource source, uint32_t
 
 static bool ReadScbShapeLocalPose(uint64_t scbShape, PxTransformData& out) {
     uint64_t poseAddr = scbShape + offset.ScbShapeCoreTransform;
-    const uint32_t controlState = Paradise_hook->read<uint32_t>(scbShape + offset.ScbBaseControlState);
+    const uint32_t controlState = GetDriverManager().read<uint32_t>(scbShape + offset.ScbBaseControlState);
     if ((controlState & 0x4u) != 0) {
-        const uint64_t stream = Paradise_hook->read<uint64_t>(scbShape + offset.ScbBaseStreamPtr);
+        const uint64_t stream = GetDriverManager().read<uint64_t>(scbShape + offset.ScbBaseStreamPtr);
         if (stream == 0) return false;
         poseAddr = stream;
     }
@@ -2982,13 +3160,13 @@ static bool ReadScbShapeLocalPose(uint64_t scbShape, PxTransformData& out) {
 }
 
 static bool ReadScbStaticActorGlobalPose(uint64_t scbActor, PxTransformData& out) {
-    const uint32_t controlState = Paradise_hook->read<uint32_t>(scbActor + offset.ScbBaseControlState);
+    const uint32_t controlState = GetDriverManager().read<uint32_t>(scbActor + offset.ScbBaseControlState);
     const uint8_t scbType = static_cast<uint8_t>((controlState >> 24) & 0xF);
     if (scbType != PX_SCB_RIGID_STATIC) return false;
 
     uint64_t poseAddr = scbActor + offset.ScbRigidStaticActor2World;
     if ((controlState & 0x40u) != 0) {
-        const uint64_t stream = Paradise_hook->read<uint64_t>(scbActor + offset.ScbBaseStreamPtr);
+        const uint64_t stream = GetDriverManager().read<uint64_t>(scbActor + offset.ScbBaseStreamPtr);
         if (stream == 0) return false;
         poseAddr = stream + offset.ScbRigidStaticBufferedActor2World;
     }
@@ -2996,22 +3174,22 @@ static bool ReadScbStaticActorGlobalPose(uint64_t scbActor, PxTransformData& out
 }
 
 static uint64_t LookupPxSceneByIndex(uint64_t libUE4, uint16_t sceneIndex) {
-    const uint32_t hashSize = Paradise_hook->read<uint32_t>(libUE4 + offset.GPhysXSceneMapHashSize);
+    const uint32_t hashSize = GetDriverManager().read<uint32_t>(libUE4 + offset.GPhysXSceneMapHashSize);
     if (hashSize == 0) return 0;
 
-    const uint64_t entryArray = Paradise_hook->read<uint64_t>(libUE4 + offset.GPhysXSceneMap);
+    const uint64_t entryArray = GetDriverManager().read<uint64_t>(libUE4 + offset.GPhysXSceneMap);
     if (entryArray == 0) return 0;
 
-    uint64_t bucketBase = Paradise_hook->read<uint64_t>(libUE4 + offset.GPhysXSceneMapBucketPtr);
+    uint64_t bucketBase = GetDriverManager().read<uint64_t>(libUE4 + offset.GPhysXSceneMapBucketPtr);
     if (bucketBase == 0) {
         bucketBase = libUE4 + offset.GPhysXSceneMapBuckets;
     }
 
-    int32_t bucket = Paradise_hook->read<int32_t>(
+    int32_t bucket = GetDriverManager().read<int32_t>(
         bucketBase + 4ULL * ((hashSize - 1u) & static_cast<uint32_t>(sceneIndex)));
     while (bucket != -1) {
         PhysXSceneMapEntry entry{};
-        if (!Paradise_hook->read(entryArray + static_cast<uint64_t>(bucket) * sizeof(entry), &entry, sizeof(entry))) {
+        if (!GetDriverManager().read(entryArray + static_cast<uint64_t>(bucket) * sizeof(entry), &entry, sizeof(entry))) {
             return 0;
         }
         if (entry.Key == sceneIndex) {
@@ -3022,34 +3200,162 @@ static uint64_t LookupPxSceneByIndex(uint64_t libUE4, uint16_t sceneIndex) {
     return 0;
 }
 
-static uint64_t GetSyncPxScene(uint64_t libUE4, uint64_t uworld) {
-    if (libUE4 == 0 || uworld == 0) return 0;
-    const uint64_t physScene = Paradise_hook->read<uint64_t>(uworld + offset.PhysicsScene);
-    if (physScene == 0 || physScene <= 0x10000) return 0;
-    const uint32_t sceneCount = Paradise_hook->read<uint32_t>(physScene + offset.PhysSceneSceneCount);
-    if (sceneCount == 0 || sceneCount >= 16) return 0;
-    uint16_t sceneIndex = Paradise_hook->read<uint16_t>(physScene + offset.PhysSceneSceneIndexArray);
+static void CollectActivePxScenes(uint64_t libUE4, uint64_t uworld, std::vector<uint64_t>& outScenes) {
+    outScenes.clear();
+    if (libUE4 == 0 || uworld == 0) return;
+
+    const uint64_t physScene = GetDriverManager().read<uint64_t>(uworld + offset.PhysicsScene);
+    if (physScene == 0 || physScene <= 0x10000) return;
+
+    const uint32_t sceneCount = GetDriverManager().read<uint32_t>(physScene + offset.PhysSceneSceneCount);
+    if (sceneCount == 0 || sceneCount >= 16) return;
+
     if (gPhysXManualSceneIndexEnabled) {
-        sceneIndex = static_cast<uint16_t>(std::max(gPhysXManualSceneIndex, 0) & 0xFFFF);
+        const uint16_t sceneIndex = static_cast<uint16_t>(std::max(gPhysXManualSceneIndex, 0) & 0xFFFF);
+        const uint64_t pxScene = LookupPxSceneByIndex(libUE4, sceneIndex);
+        if (pxScene != 0) {
+            outScenes.push_back(pxScene);
+        }
+        return;
     }
-    return LookupPxSceneByIndex(libUE4, sceneIndex);
+
+    std::unordered_set<uint16_t> seenIndices;
+    for (uint32_t i = 0; i < sceneCount; ++i) {
+        const uint16_t sceneIndex = GetDriverManager().read<uint16_t>(
+            physScene + offset.PhysSceneSceneIndexArray + static_cast<uint64_t>(i) * sizeof(uint16_t));
+        if (!seenIndices.insert(sceneIndex).second) continue;
+        const uint64_t pxScene = LookupPxSceneByIndex(libUE4, sceneIndex);
+        if (pxScene != 0) {
+            outScenes.push_back(pxScene);
+        }
+    }
+}
+
+static uint64_t GetSyncPxScene(uint64_t libUE4, uint64_t uworld) {
+    std::vector<uint64_t> scenes;
+    CollectActivePxScenes(libUE4, uworld, scenes);
+    if (scenes.empty()) return 0;
+
+    for (uint64_t pxScene : scenes) {
+        if (pxScene == 0) continue;
+        const uint64_t actorArray = GetDriverManager().read<uint64_t>(pxScene + offset.PxSceneActors);
+        const uint32_t actorCount = GetDriverManager().read<uint32_t>(pxScene + offset.PxSceneActorCount);
+        if (actorArray != 0 && actorCount > 0 && actorCount <= 100000) {
+            return pxScene;
+        }
+    }
+
+    return scenes.front();
+}
+
+static bool IsLikelyPhysXActorPointer(uint64_t actor) {
+    if (actor == 0 || actor <= 0x10000) return false;
+    const uint16_t actorType = GetDriverManager().read<uint16_t>(actor + offset.PxActorType);
+    if (actorType != PX_ACTOR_RIGID_DYNAMIC && actorType != PX_ACTOR_RIGID_STATIC) return false;
+
+    const uint16_t shapeCount = GetDriverManager().read<uint16_t>(actor + offset.PxActorShapeCount);
+    if (shapeCount == 0 || shapeCount > 64) return false;
+
+    const uint64_t shapes = GetDriverManager().read<uint64_t>(actor + offset.PxActorShapes);
+    return shapes != 0;
+}
+
+static bool ReadPxSceneActorPointersBulk(uint64_t actorArray, uint32_t actorCount, std::vector<uint64_t>& outActors) {
+    outActors.assign(actorCount, 0);
+    return ReadRemoteBufferRobust(actorArray, outActors.data(), actorCount * sizeof(uint64_t));
+}
+
+static void ReadPxSceneActorPointersElementWise(uint64_t actorArray, uint32_t actorCount, std::vector<uint64_t>& outActors) {
+    outActors.clear();
+    outActors.resize(actorCount, 0);
+    for (uint32_t i = 0; i < actorCount; ++i) {
+        ReadRemoteArrayElementSafe<uint64_t>(actorArray, i, outActors[i]);
+    }
+}
+
+static size_t CountLikelyPhysXActors(const std::vector<uint64_t>& actors, size_t sampleBudget = 256) {
+    size_t scanned = 0;
+    size_t valid = 0;
+    for (uint64_t actor : actors) {
+        if (actor == 0) continue;
+        ++scanned;
+        if (IsLikelyPhysXActorPointer(actor)) ++valid;
+        if (scanned >= sampleBudget) break;
+    }
+    return valid;
+}
+
+static void FilterLikelyPhysXActors(const std::vector<uint64_t>& source, std::vector<uint64_t>& outActors) {
+    outActors.clear();
+    outActors.reserve(source.size());
+    for (uint64_t actor : source) {
+        if (!IsLikelyPhysXActorPointer(actor)) continue;
+        outActors.push_back(actor);
+    }
+}
+
+static bool CollectPxSceneActorPointers(uint64_t pxScene, std::vector<uint64_t>& outActors) {
+    outActors.clear();
+
+    const uint64_t actorArray = GetDriverManager().read<uint64_t>(pxScene + offset.PxSceneActors);
+    const uint32_t actorCount = GetDriverManager().read<uint32_t>(pxScene + offset.PxSceneActorCount);
+    if (actorArray == 0 || actorCount == 0 || actorCount > 100000) return false;
+
+    std::vector<uint64_t> bulkActors;
+    const bool bulkOk = ReadPxSceneActorPointersBulk(actorArray, actorCount, bulkActors);
+    const size_t bulkValid = bulkOk ? CountLikelyPhysXActors(bulkActors) : 0;
+    if (bulkOk && bulkValid >= 8) {
+        FilterLikelyPhysXActors(bulkActors, outActors);
+        if (!outActors.empty()) {
+            gPxSceneActorPointerCache[pxScene] = outActors;
+            return true;
+        }
+    }
+
+    std::vector<uint64_t> elementActors;
+    ReadPxSceneActorPointersElementWise(actorArray, actorCount, elementActors);
+    const size_t elementValid = CountLikelyPhysXActors(elementActors);
+    if (elementValid >= 4) {
+        FilterLikelyPhysXActors(elementActors, outActors);
+        if (!outActors.empty()) {
+            gPxSceneActorPointerCache[pxScene] = outActors;
+            return true;
+        }
+    }
+
+    auto cacheIt = gPxSceneActorPointerCache.find(pxScene);
+    if (cacheIt != gPxSceneActorPointerCache.end()) {
+        std::vector<uint64_t> stillValid;
+        stillValid.reserve(cacheIt->second.size());
+        for (uint64_t actor : cacheIt->second) {
+            if (!IsLikelyPhysXActorPointer(actor)) continue;
+            stillValid.push_back(actor);
+        }
+        if (!stillValid.empty()) {
+            cacheIt->second = stillValid;
+            outActors = stillValid;
+            return true;
+        }
+    }
+
+    return false;
 }
 
 static Vec3 ReadCameraWorldPosForPhysX() {
-    if (!Paradise_hook || address.libUE4 == 0) return Vec3::Zero();
+    if (address.libUE4 == 0) return Vec3::Zero();
 
-    const uint64_t uworld = Paradise_hook->read<uint64_t>(address.libUE4 + offset.Gworld);
+    const uint64_t uworld = GetDriverManager().read<uint64_t>(address.libUE4 + offset.Gworld);
     if (uworld == 0) return Vec3::Zero();
-    const uint64_t netDriver = Paradise_hook->read<uint64_t>(uworld + offset.NetDriver);
+    const uint64_t netDriver = GetDriverManager().read<uint64_t>(uworld + offset.NetDriver);
     if (netDriver == 0) return Vec3::Zero();
-    const uint64_t serverConn = Paradise_hook->read<uint64_t>(netDriver + offset.ServerConnection);
+    const uint64_t serverConn = GetDriverManager().read<uint64_t>(netDriver + offset.ServerConnection);
     if (serverConn == 0) return Vec3::Zero();
-    const uint64_t playerController = Paradise_hook->read<uint64_t>(serverConn + offset.PlayerController);
+    const uint64_t playerController = GetDriverManager().read<uint64_t>(serverConn + offset.PlayerController);
     if (playerController == 0) return Vec3::Zero();
-    const uint64_t pcm = Paradise_hook->read<uint64_t>(playerController + offset.PlayerCameraManager);
+    const uint64_t pcm = GetDriverManager().read<uint64_t>(playerController + offset.PlayerCameraManager);
     if (pcm == 0) return Vec3::Zero();
 
-    const Vec3 cameraWorldPos = Paradise_hook->read<Vec3>(pcm + offset.CameraCache + offset.POV);
+    const Vec3 cameraWorldPos = GetDriverManager().read<Vec3>(pcm + offset.CameraCache + offset.POV);
     if (!std::isfinite(cameraWorldPos.X) || !std::isfinite(cameraWorldPos.Y) || !std::isfinite(cameraWorldPos.Z)) {
         return Vec3::Zero();
     }
@@ -3139,6 +3445,60 @@ static void DrawCapsuleWireframe(ImDrawList* drawList, const FMatrix& vpMat, flo
     DrawSphereWireframe(drawList, vpMat, screenW, screenH, endB, radius, color);
 }
 
+// --- 自动导出辅助函数 ---
+
+static void MaybeAutoExportTriangleMesh(uint64_t signature, const CachedTriangleMeshData& cache,
+                                         uint32_t vertexCount, uint32_t triangleCount, uint8_t flags) {
+    if (!gPhysXAutoExport) return;
+    if (gAutoExportsThisFrame >= kAutoExportBudgetPerFrame) return;
+    if (gAutoExportedSigs.count(signature)) return;
+
+    char objName[64], metaName[64];
+    std::snprintf(objName, sizeof(objName), "tri_%016llx.obj", static_cast<unsigned long long>(signature));
+    std::snprintf(metaName, sizeof(metaName), "tri_%016llx.meta.txt", static_cast<unsigned long long>(signature));
+    auto dir = GetPhysXExportDir();
+    auto objPath = dir / objName;
+
+    if (std::filesystem::exists(objPath)) {
+        gAutoExportedSigs.insert(signature);
+        return;
+    }
+
+    EnsurePhysXExportDir();
+    if (WriteTriangleMeshObj(objPath, cache)) {
+        WriteTriangleMeshMetaFile(dir / metaName, signature, vertexCount, triangleCount, flags);
+        gLocalExportMetaLoaded = false;
+        ++gAutoExportsThisFrame;
+    }
+    gAutoExportedSigs.insert(signature);
+}
+
+static void MaybeAutoExportHeightField(uint64_t signature, const CachedHeightFieldData& cache,
+                                        uint32_t rows, uint32_t columns) {
+    if (!gPhysXAutoExport) return;
+    if (gAutoExportsThisFrame >= kAutoExportBudgetPerFrame) return;
+    if (gAutoExportedSigs.count(signature)) return;
+
+    char objName[64], metaName[64];
+    std::snprintf(objName, sizeof(objName), "hf_%016llx.obj", static_cast<unsigned long long>(signature));
+    std::snprintf(metaName, sizeof(metaName), "hf_%016llx.meta.txt", static_cast<unsigned long long>(signature));
+    auto dir = GetPhysXExportDir();
+    auto objPath = dir / objName;
+
+    if (std::filesystem::exists(objPath)) {
+        gAutoExportedSigs.insert(signature);
+        return;
+    }
+
+    EnsurePhysXExportDir();
+    if (WriteHeightFieldObj(objPath, cache)) {
+        WriteHeightFieldMetaFile(dir / metaName, signature, rows, columns);
+        gLocalExportMetaLoaded = false;
+        ++gAutoExportsThisFrame;
+    }
+    gAutoExportedSigs.insert(signature);
+}
+
 static bool GetCachedTriangleMesh(uint64_t mesh, uint32_t vertexCount, uint32_t triangleCount, uint8_t flags,
                                   uint64_t verticesAddr, uint64_t trianglesAddr, CachedTriangleMeshData& out) {
     auto it = gTriangleMeshCache.find(mesh);
@@ -3174,7 +3534,7 @@ static bool GetCachedTriangleMesh(uint64_t mesh, uint32_t vertexCount, uint32_t 
                     const size_t step = std::max<size_t>(vc / 4, 1);
                     for (size_t idx = 0; idx < vc && !stale; idx += step) {
                         Vec3 remote{};
-                        if (Paradise_hook->read(entry.VerticesAddr + idx * sizeof(Vec3),
+                        if (GetDriverManager().read(entry.VerticesAddr + idx * sizeof(Vec3),
                                                &remote, sizeof(remote))) {
                             const Vec3& c = entry.Vertices[idx];
                             if (remote.X != c.X || remote.Y != c.Y || remote.Z != c.Z)
@@ -3202,7 +3562,7 @@ static bool GetCachedTriangleMesh(uint64_t mesh, uint32_t vertexCount, uint32_t 
         auto cdIt = gGeomCacheMissCooldowns.find(mesh);
         if (cdIt != gGeomCacheMissCooldowns.end()) {
             const double now = GetMonotoneSec();
-            const double cooldownSec = std::min(1.0 * (1 << std::min(cdIt->second.ConsecutiveFailures - 1, 3)), 8.0);
+            const double cooldownSec = std::min(1.0 * (1 << std::min(cdIt->second.ConsecutiveFailures - 1, 1)), 1.0);
             if (now - cdIt->second.LastAttemptTime < cooldownSec) return false;
         }
     }
@@ -3211,7 +3571,7 @@ static bool GetCachedTriangleMesh(uint64_t mesh, uint32_t vertexCount, uint32_t 
 
     auto record_failure = [&]() {
         auto& cd = gGeomCacheMissCooldowns[mesh];
-        cd.ConsecutiveFailures = std::min(cd.ConsecutiveFailures + 1, 5);
+        cd.ConsecutiveFailures = std::min(cd.ConsecutiveFailures + 1, 3);
         cd.LastAttemptTime = GetMonotoneSec();
     };
 
@@ -3272,7 +3632,7 @@ static bool GetCachedTriangleMesh(uint64_t mesh, uint32_t vertexCount, uint32_t 
     };
 
     int successfulReads = 0;
-    const int maxAttempts = indexCount > (1ULL << 18) ? 8 : 5;
+    const int maxAttempts = indexCount > (1ULL << 18) ? 16 : 8;
     for (int attempt = 0; attempt < maxAttempts; ++attempt) {
         bool gotRead = false;
         if (expect16BitIndices) {
@@ -3310,7 +3670,7 @@ static bool GetCachedTriangleMesh(uint64_t mesh, uint32_t vertexCount, uint32_t 
     if (successfulReads == 0 || candidates.empty()) {
         // 记录失败冷却
         auto& cd = gGeomCacheMissCooldowns[mesh];
-        cd.ConsecutiveFailures = std::min(cd.ConsecutiveFailures + 1, 5);
+        cd.ConsecutiveFailures = std::min(cd.ConsecutiveFailures + 1, 3);
         cd.LastAttemptTime = GetMonotoneSec();
         return false;
     }
@@ -3338,6 +3698,23 @@ static bool GetCachedTriangleMesh(uint64_t mesh, uint32_t vertexCount, uint32_t 
     cache.TrianglesAddr = trianglesAddr;
     cache.Verified = false;
     cache.LastVerifiedAt = 0.0;
+
+    // 先计算签名，用于去重检查
+    const uint64_t signature = BuildTriangleMeshSignature(mesh, vertexCount, triangleCount, flags,
+                                                          cache.Vertices, cache.Indices);
+    gTriangleMeshSignatures[mesh] = signature;
+    gTriangleMeshSources[mesh] = TriangleMeshSourceInfo{vertexCount, triangleCount, flags, verticesAddr, trianglesAddr};
+
+    // 签名去重：相同内容已缓存则直接复用，跳过 AABB 重算
+    auto sigCacheIt = gTriMeshCacheBySig.find(signature);
+    if (sigCacheIt != gTriMeshCacheBySig.end()) {
+        sigCacheIt->second.LastUsedAt = GetMonotoneSec();
+        gTriangleMeshCache[mesh] = sigCacheIt->second;
+        gGeomCacheMissCooldowns.erase(mesh);
+        out = sigCacheIt->second;
+        MaybeAutoExportTriangleMesh(signature, sigCacheIt->second, vertexCount, triangleCount, flags);
+        return true;
+    }
 
     // 计算顶点整体包围盒
     if (!cache.Vertices.empty()) {
@@ -3374,13 +3751,10 @@ static bool GetCachedTriangleMesh(uint64_t mesh, uint32_t vertexCount, uint32_t 
         BuildTriangleChunkBounds(cache.TriangleBounds, cache.ChunkBounds);
     }
 
-    const uint64_t signature = BuildTriangleMeshSignature(mesh, vertexCount, triangleCount, flags,
-                                                          cache.Vertices, cache.Indices);
-    gTriangleMeshSignatures[mesh] = signature;
-    gTriangleMeshSources[mesh] = TriangleMeshSourceInfo{vertexCount, triangleCount, flags, verticesAddr, trianglesAddr};
-
+    gTriMeshCacheBySig[signature] = cache;
     gTriangleMeshCache.emplace(mesh, cache);
     gGeomCacheMissCooldowns.erase(mesh);  // 成功缓存，清除冷却
+    MaybeAutoExportTriangleMesh(signature, cache, vertexCount, triangleCount, flags);
     out = cache;
     return true;
 }
@@ -3397,7 +3771,7 @@ static bool GetCachedConvexMesh(uint64_t mesh, CachedConvexMeshData& out) {
         auto cdIt = gGeomCacheMissCooldowns.find(mesh);
         if (cdIt != gGeomCacheMissCooldowns.end()) {
             const double now = GetMonotoneSec();
-            const double cooldownSec = std::min(1.0 * (1 << std::min(cdIt->second.ConsecutiveFailures - 1, 3)), 8.0);
+            const double cooldownSec = std::min(1.0 * (1 << std::min(cdIt->second.ConsecutiveFailures - 1, 1)), 1.0);
             if (now - cdIt->second.LastAttemptTime < cooldownSec) return false;
         }
     }
@@ -3405,18 +3779,18 @@ static bool GetCachedConvexMesh(uint64_t mesh, CachedConvexMeshData& out) {
 
     auto record_failure = [&]() {
         auto& cd = gGeomCacheMissCooldowns[mesh];
-        cd.ConsecutiveFailures = std::min(cd.ConsecutiveFailures + 1, 5);
+        cd.ConsecutiveFailures = std::min(cd.ConsecutiveFailures + 1, 3);
         cd.LastAttemptTime = GetMonotoneSec();
     };
 
-    const uint8_t vertexCount = Paradise_hook->read<uint8_t>(mesh + offset.PxConvexMeshVertexCount);
-    const uint8_t polygonCount = Paradise_hook->read<uint8_t>(mesh + offset.PxConvexMeshPolygonCount);
+    const uint8_t vertexCount = GetDriverManager().read<uint8_t>(mesh + offset.PxConvexMeshVertexCount);
+    const uint8_t polygonCount = GetDriverManager().read<uint8_t>(mesh + offset.PxConvexMeshPolygonCount);
     if (vertexCount == 0 || polygonCount == 0 || vertexCount > 255) {
         record_failure();
         return false;
     }
 
-    const uint64_t hullBase = Paradise_hook->read<uint64_t>(mesh + offset.PxConvexMeshHullData);
+    const uint64_t hullBase = GetDriverManager().read<uint64_t>(mesh + offset.PxConvexMeshHullData);
     if (hullBase == 0) { record_failure(); return false; }
 
     const uint64_t verticesAddr = hullBase + 20ULL * polygonCount;
@@ -3426,7 +3800,7 @@ static bool GetCachedConvexMesh(uint64_t mesh, CachedConvexMeshData& out) {
     std::vector<PhysXConvexPolygonData> polygons(polygonCount);
     if (!ReadRemoteBufferRobust(hullBase, polygons.data(), polygons.size() * sizeof(PhysXConvexPolygonData))) { record_failure(); return false; }
 
-    const uint16_t edgeInfo = Paradise_hook->read<uint16_t>(mesh + offset.PxConvexMeshEdgeCount);
+    const uint16_t edgeInfo = GetDriverManager().read<uint16_t>(mesh + offset.PxConvexMeshEdgeCount);
     const uint16_t edgeCount = edgeInfo & 0x7FFFu;
     uint64_t indexBufferAddr = hullBase + 20ULL * polygonCount + 15ULL * vertexCount + 2ULL * edgeCount;
     if ((edgeInfo & 0x8000u) != 0) {
@@ -3480,7 +3854,7 @@ static bool GetCachedHeightField(uint64_t heightField, CachedHeightFieldData& ou
         auto cdIt = gGeomCacheMissCooldowns.find(heightField);
         if (cdIt != gGeomCacheMissCooldowns.end()) {
             const double now = GetMonotoneSec();
-            const double cooldownSec = std::min(1.0 * (1 << std::min(cdIt->second.ConsecutiveFailures - 1, 3)), 8.0);
+            const double cooldownSec = std::min(1.0 * (1 << std::min(cdIt->second.ConsecutiveFailures - 1, 1)), 1.0);
             if (now - cdIt->second.LastAttemptTime < cooldownSec) return false;
         }
     }
@@ -3522,7 +3896,7 @@ static bool GetCachedHeightField(uint64_t heightField, CachedHeightFieldData& ou
 
     if (best.Signature == 0) {
         auto& cd = gGeomCacheMissCooldowns[heightField];
-        cd.ConsecutiveFailures = std::min(cd.ConsecutiveFailures + 1, 5);
+        cd.ConsecutiveFailures = std::min(cd.ConsecutiveFailures + 1, 3);
         cd.LastAttemptTime = GetMonotoneSec();
         return false;
     }
@@ -3538,8 +3912,22 @@ static bool GetCachedHeightField(uint64_t heightField, CachedHeightFieldData& ou
         best.Data.SamplesAddr,
         0.0f  // Thickness — not stored in CachedHeightFieldData, use 0
     };
+
+    // 签名去重：相同内容已缓存则直接复用
+    auto sigCacheIt = gHfCacheBySig.find(best.Signature);
+    if (sigCacheIt != gHfCacheBySig.end()) {
+        sigCacheIt->second.LastUsedAt = GetMonotoneSec();
+        gHeightFieldCache[heightField] = sigCacheIt->second;
+        gGeomCacheMissCooldowns.erase(heightField);
+        out = sigCacheIt->second;
+        MaybeAutoExportHeightField(best.Signature, sigCacheIt->second, sigCacheIt->second.Rows, sigCacheIt->second.Columns);
+        return true;
+    }
+
+    gHfCacheBySig[best.Signature] = best.Data;
     gHeightFieldCache[heightField] = best.Data;
     gGeomCacheMissCooldowns.erase(heightField);
+    MaybeAutoExportHeightField(best.Signature, best.Data, best.Data.Rows, best.Data.Columns);
     out = best.Data;
     return true;
 }
@@ -3733,18 +4121,18 @@ static void UpdateLocalPhysXDrawCache(uint64_t shape, uint32_t geometryType, uin
 
     switch (geometryType) {
         case PX_GEOM_TRIANGLEMESH: {
-            const uint64_t mesh = Paradise_hook->read<uint64_t>(geometryAddr + offset.PxTriangleMeshGeometryTriangleMesh);
+            const uint64_t mesh = GetDriverManager().read<uint64_t>(geometryAddr + offset.PxTriangleMeshGeometryTriangleMesh);
             if (mesh == 0 || !GetRenderableLocalTriangleMesh(mesh)) return;
             if (!ReadMeshScale(geometryAddr + offset.PxTriangleMeshGeometryScale, entry.MeshScale)) return;
             entry.Resource = mesh;
             break;
         }
         case PX_GEOM_HEIGHTFIELD: {
-            const uint64_t heightField = Paradise_hook->read<uint64_t>(geometryAddr + offset.PxHeightFieldGeometryHeightField);
+            const uint64_t heightField = GetDriverManager().read<uint64_t>(geometryAddr + offset.PxHeightFieldGeometryHeightField);
             if (heightField == 0 || !GetRenderableLocalHeightField(heightField)) return;
-            entry.HeightScale = Paradise_hook->read<float>(geometryAddr + offset.PxHeightFieldGeometryHeightScale);
-            entry.RowScale = Paradise_hook->read<float>(geometryAddr + offset.PxHeightFieldGeometryRowScale);
-            entry.ColumnScale = Paradise_hook->read<float>(geometryAddr + offset.PxHeightFieldGeometryColumnScale);
+            entry.HeightScale = GetDriverManager().read<float>(geometryAddr + offset.PxHeightFieldGeometryHeightScale);
+            entry.RowScale = GetDriverManager().read<float>(geometryAddr + offset.PxHeightFieldGeometryRowScale);
+            entry.ColumnScale = GetDriverManager().read<float>(geometryAddr + offset.PxHeightFieldGeometryColumnScale);
             if (std::fabs(entry.HeightScale) <= 1e-6f || std::fabs(entry.RowScale) <= 1e-6f ||
                 std::fabs(entry.ColumnScale) <= 1e-6f) {
                 return;
@@ -3835,12 +4223,12 @@ static void DrawCachedLocalPhysXGeometry(const FMatrix& vpMat, const Vec3& local
 static bool DrawHeightFieldShape(ImDrawList* drawList, const FMatrix& vpMat, float screenW, float screenH,
                                  const Vec3& localPlayerPos, const PxTransformData& worldPose,
                                  uint64_t geometryAddr, PhysXDrawSource source, PhysXDrawStats& stats) {
-    const uint64_t heightField = Paradise_hook->read<uint64_t>(geometryAddr + offset.PxHeightFieldGeometryHeightField);
+    const uint64_t heightField = GetDriverManager().read<uint64_t>(geometryAddr + offset.PxHeightFieldGeometryHeightField);
     if (heightField == 0) return false;
 
-    const float heightScale = Paradise_hook->read<float>(geometryAddr + offset.PxHeightFieldGeometryHeightScale);
-    const float rowScale = Paradise_hook->read<float>(geometryAddr + offset.PxHeightFieldGeometryRowScale);
-    const float columnScale = Paradise_hook->read<float>(geometryAddr + offset.PxHeightFieldGeometryColumnScale);
+    const float heightScale = GetDriverManager().read<float>(geometryAddr + offset.PxHeightFieldGeometryHeightScale);
+    const float rowScale = GetDriverManager().read<float>(geometryAddr + offset.PxHeightFieldGeometryRowScale);
+    const float columnScale = GetDriverManager().read<float>(geometryAddr + offset.PxHeightFieldGeometryColumnScale);
     if (std::fabs(heightScale) <= 1e-6f || std::fabs(rowScale) <= 1e-6f || std::fabs(columnScale) <= 1e-6f) {
         return false;
     }
@@ -3849,9 +4237,14 @@ static bool DrawHeightFieldShape(ImDrawList* drawList, const FMatrix& vpMat, flo
         ? IM_COL32(90, 255, 180, 155)
         : IM_COL32(40, 255, 120, 145);
 
-    if (gPhysXUseLocalModelData) {
-        return DrawLocalHeightFieldInstance(drawList, vpMat, screenW, screenH, localPlayerPos, worldPose,
-                                            heightField, heightScale, rowScale, columnScale, source, stats);
+    // 磁盘优先：尝试从本地 OBJ 加载
+    {
+        const LocalObjMeshData* localMesh = GetLocalHeightFieldDataStrict(heightField);
+        if (localMesh) {
+            return DrawLocalHeightFieldInstance(drawList, vpMat, screenW, screenH, localPlayerPos, worldPose,
+                                                heightField, heightScale, rowScale, columnScale, source, stats);
+        }
+        if (gPhysXUseLocalModelData) return false;
     }
 
     CachedHeightFieldData cache;
@@ -3935,7 +4328,7 @@ static bool DrawTriangleMeshShape(ImDrawList* drawList, const FMatrix& vpMat, fl
                                   const Vec3& localPlayerPos, const PxTransformData& worldPose, uint64_t meshGeometryAddr,
                                   bool enableTriangleDistanceCull, bool isStaticMesh, PhysXDrawSource source,
                                   PhysXDrawStats& stats) {
-    const uint64_t mesh = Paradise_hook->read<uint64_t>(meshGeometryAddr + offset.PxTriangleMeshGeometryTriangleMesh);
+    const uint64_t mesh = GetDriverManager().read<uint64_t>(meshGeometryAddr + offset.PxTriangleMeshGeometryTriangleMesh);
     if (mesh == 0) return false;
 
     PxMeshScaleData scale{};
@@ -3948,20 +4341,26 @@ static bool DrawTriangleMeshShape(ImDrawList* drawList, const FMatrix& vpMat, fl
         : (isStaticMesh ? IM_COL32(255, 255, 255, 140) : IM_COL32(0, 220, 255, 120));
     const float lineThickness = (isStaticMesh || isPxSceneSource) ? 1.15f : 0.85f;
 
-    if (gPhysXUseLocalModelData) {
-        return DrawLocalTriangleMeshInstance(drawList, vpMat, screenW, screenH, localPlayerPos, worldPose,
-                                             mesh, scale, enableTriangleDistanceCull, isStaticMesh, source, stats);
+    // 磁盘优先：尝试从本地 OBJ 加载（仅需轻量 header 读取来解析签名）
+    {
+        const LocalObjMeshData* localMesh = GetLocalTriangleMeshDataStrict(mesh);
+        if (localMesh) {
+            return DrawLocalTriangleMeshInstance(drawList, vpMat, screenW, screenH, localPlayerPos, worldPose,
+                                                 mesh, scale, enableTriangleDistanceCull, isStaticMesh, source, stats);
+        }
+        // gPhysXUseLocalModelData = 仅磁盘模式，不回退内存
+        if (gPhysXUseLocalModelData) return false;
     }
 
-    const uint32_t vertexCount = Paradise_hook->read<uint32_t>(mesh + offset.PxTriangleMeshVertexCount);
-    const uint32_t triangleCount = Paradise_hook->read<uint32_t>(mesh + offset.PxTriangleMeshTriangleCount);
+    const uint32_t vertexCount = GetDriverManager().read<uint32_t>(mesh + offset.PxTriangleMeshVertexCount);
+    const uint32_t triangleCount = GetDriverManager().read<uint32_t>(mesh + offset.PxTriangleMeshTriangleCount);
     if (vertexCount == 0 || triangleCount == 0) return false;
 
-    const uint64_t verticesAddr = Paradise_hook->read<uint64_t>(mesh + offset.PxTriangleMeshVertices);
-    const uint64_t trianglesAddr = Paradise_hook->read<uint64_t>(mesh + offset.PxTriangleMeshTriangles);
+    const uint64_t verticesAddr = GetDriverManager().read<uint64_t>(mesh + offset.PxTriangleMeshVertices);
+    const uint64_t trianglesAddr = GetDriverManager().read<uint64_t>(mesh + offset.PxTriangleMeshTriangles);
     if (verticesAddr == 0 || trianglesAddr == 0) return false;
 
-    const uint8_t flags = Paradise_hook->read<uint8_t>(mesh + offset.PxTriangleMeshFlags);
+    const uint8_t flags = GetDriverManager().read<uint8_t>(mesh + offset.PxTriangleMeshFlags);
     CachedTriangleMeshData cache;
     if (!GetCachedTriangleMesh(mesh, vertexCount, triangleCount, flags, verticesAddr, trianglesAddr, cache)) {
         return false;
@@ -4011,7 +4410,7 @@ static bool DrawTriangleMeshShape(ImDrawList* drawList, const FMatrix& vpMat, fl
 static bool DrawConvexMeshShape(ImDrawList* drawList, const FMatrix& vpMat, float screenW, float screenH,
                                 const PxTransformData& worldPose, uint64_t meshGeometryAddr,
                                 PhysXDrawSource source, PhysXDrawStats& stats) {
-    const uint64_t mesh = Paradise_hook->read<uint64_t>(meshGeometryAddr + offset.PxConvexMeshGeometryConvexMesh);
+    const uint64_t mesh = GetDriverManager().read<uint64_t>(meshGeometryAddr + offset.PxConvexMeshGeometryConvexMesh);
     if (mesh == 0) return false;
 
     PxMeshScaleData scale{};
@@ -4098,7 +4497,7 @@ static void DrawPhysXStaticPrunerGeometry(const FMatrix& vpMat, const Vec3& loca
 
         const PxTransformData worldPose = ComposeTransforms(actorPose, shapePose);
         const uint64_t geometryAddr = payload.Shape + offset.ScbShapeCoreGeometry;
-        const uint32_t geometryType = Paradise_hook->read<uint32_t>(geometryAddr);
+        const uint32_t geometryType = GetDriverManager().read<uint32_t>(geometryAddr);
         if (geometryType > PX_GEOM_HEIGHTFIELD) {
             ++stats.RejectedByFilter;
             continue;
@@ -4115,7 +4514,7 @@ static void DrawPhysXStaticPrunerGeometry(const FMatrix& vpMat, const Vec3& loca
         switch (geometryType) {
             case PX_GEOM_SPHERE:
                 if (gPhysXDrawPrimitives && !gPhysXUseLocalModelData) {
-                    const float radius = Paradise_hook->read<float>(geometryAddr + offset.PxSphereGeometryRadius);
+                    const float radius = GetDriverManager().read<float>(geometryAddr + offset.PxSphereGeometryRadius);
                     DrawSphereWireframe(drawList, vpMat, screenW, screenH, worldPose, radius,
                                         IM_COL32(255, 80, 160, 220));
                     drewShape = true;
@@ -4123,8 +4522,8 @@ static void DrawPhysXStaticPrunerGeometry(const FMatrix& vpMat, const Vec3& loca
                 break;
             case PX_GEOM_CAPSULE:
                 if (gPhysXDrawPrimitives && !gPhysXUseLocalModelData) {
-                    const float halfHeight = Paradise_hook->read<float>(geometryAddr + offset.PxCapsuleGeometryHalfHeight);
-                    const float radius = Paradise_hook->read<float>(geometryAddr + offset.PxCapsuleGeometryRadius);
+                    const float halfHeight = GetDriverManager().read<float>(geometryAddr + offset.PxCapsuleGeometryHalfHeight);
+                    const float radius = GetDriverManager().read<float>(geometryAddr + offset.PxCapsuleGeometryRadius);
                     DrawCapsuleWireframe(drawList, vpMat, screenW, screenH, worldPose, halfHeight, radius,
                                          IM_COL32(255, 215, 0, 220));
                     drewShape = true;
@@ -4133,7 +4532,7 @@ static void DrawPhysXStaticPrunerGeometry(const FMatrix& vpMat, const Vec3& loca
             case PX_GEOM_BOX:
                 if (gPhysXDrawPrimitives && !gPhysXUseLocalModelData) {
                     Vec3 halfExtents{};
-                    if (Paradise_hook->read(geometryAddr + offset.PxBoxGeometryHalfExtents, &halfExtents, sizeof(halfExtents))) {
+                    if (GetDriverManager().read(geometryAddr + offset.PxBoxGeometryHalfExtents, &halfExtents, sizeof(halfExtents))) {
                         DrawBoxWireframe(drawList, vpMat, screenW, screenH, worldPose, halfExtents,
                                          IM_COL32(80, 255, 80, 220));
                         drewShape = true;
@@ -4180,12 +4579,12 @@ GameFrameData ReadGameData() {
     if (driver_stat.load(std::memory_order_relaxed) <= 0) return data;
     if (!gUseCameraCacheVPMatrix && address.Matrix == 0) return data;
 
-    const uint64_t uworld = Paradise_hook->read<uint64_t>(address.libUE4 + offset.Gworld);
+    const uint64_t uworld = GetDriverManager().read<uint64_t>(address.libUE4 + offset.Gworld);
     bool hasViewProjection = false;
     if (gUseCameraCacheVPMatrix) {
         hasViewProjection = BuildViewProjectionMatrixFromCameraCache(uworld, data.VPMat);
     } else if (address.Matrix != 0) {
-        hasViewProjection = Paradise_hook->read(address.Matrix, &data.VPMat, sizeof(FMatrix));
+        hasViewProjection = GetDriverManager().read(address.Matrix, &data.VPMat, sizeof(FMatrix));
     }
     if (!hasViewProjection) {
         return data;
@@ -4194,10 +4593,10 @@ GameFrameData ReadGameData() {
     // 读取本地玩家位置（2 ioctl）
     data.localPlayerPos = Vec3::Zero();
     if (address.LocalPlayerActor != 0) {
-        uint64_t localRootComponent = Paradise_hook->read<uint64_t>(
+        uint64_t localRootComponent = GetDriverManager().read<uint64_t>(
             address.LocalPlayerActor + offset.RootComponent);
         if (localRootComponent != 0) {
-            FTransform localTransform = Paradise_hook->read<FTransform>(
+            FTransform localTransform = GetDriverManager().read<FTransform>(
                 localRootComponent + offset.ComponentToWorld);
             data.localPlayerPos = localTransform.Translation;
         }
@@ -4205,9 +4604,9 @@ GameFrameData ReadGameData() {
 
     // 读取 FApp::DeltaTime（GOT 表，两次解引用）
     if (address.libUE4 != 0 && offset.FAppDeltaTimeGOT != 0) {
-        uint64_t gotEntry = Paradise_hook->read<uint64_t>(address.libUE4 + offset.FAppDeltaTimeGOT);
+        uint64_t gotEntry = GetDriverManager().read<uint64_t>(address.libUE4 + offset.FAppDeltaTimeGOT);
         if (gotEntry != 0) {
-            double deltaTime = Paradise_hook->read<double>(gotEntry);
+            double deltaTime = GetDriverManager().read<double>(gotEntry);
             if (deltaTime > 0.0 && deltaTime < 1.0) {
                 PushGameDeltaTime(deltaTime);
                 data.gameDeltaTime = (float)deltaTime;
@@ -4217,9 +4616,9 @@ GameFrameData ReadGameData() {
 
     // 读取 GFrameCounter（与 DeltaTime 同步）
     if (address.libUE4 != 0 && offset.GFrameCounterGOT != 0) {
-        uint64_t gotEntry = Paradise_hook->read<uint64_t>(address.libUE4 + offset.GFrameCounterGOT);
+        uint64_t gotEntry = GetDriverManager().read<uint64_t>(address.libUE4 + offset.GFrameCounterGOT);
         if (gotEntry != 0) {
-            data.frameCounter = Paradise_hook->read<uint64_t>(gotEntry);
+            data.frameCounter = GetDriverManager().read<uint64_t>(gotEntry);
         }
     }
 
@@ -4231,9 +4630,9 @@ GameFrameData ReadGameData() {
 uint64_t ReadFrameCounter() {
     if (driver_stat.load(std::memory_order_relaxed) <= 0) return 0;
     if (address.libUE4 == 0 || offset.GFrameCounterGOT == 0) return 0;
-    uint64_t gotEntry = Paradise_hook->read<uint64_t>(address.libUE4 + offset.GFrameCounterGOT);
+    uint64_t gotEntry = GetDriverManager().read<uint64_t>(address.libUE4 + offset.GFrameCounterGOT);
     if (gotEntry == 0) return 0;
-    return Paradise_hook->read<uint64_t>(gotEntry);
+    return GetDriverManager().read<uint64_t>(gotEntry);
 }
 
 // 使用预读数据绘制（在 fence wait 后调用）
@@ -4241,18 +4640,24 @@ void DrawObjectsWithData(const GameFrameData& data, float gameStepDeltaTime) {
     if (!gShowObjects) return;
     if (!data.valid) return;
 
+    PollAsyncLocalLoads();
+
     // 使本帧的 pruner 缓存失效，下一次可视性判断会重新读取
     InvalidateVisibilityCache();
 
     // 重置每帧几何缓存未命中计数
     gGeomCacheMissesThisFrame = 0;
     gTrianglesDrawnThisFrame = 0;
+    gAutoExportsThisFrame = 0;
 
     // 按大间隔定期清空几何缓存（三角面/凸包/高度场），触发下次按需重读
     MaybeFlushGeomCaches();
 
     // 每帧重建屏幕骨骼缓存，避免 auto-aim 读取到上一帧残留坐标。
-    gBoneScreenCache.clear();
+    {
+        std::lock_guard<std::mutex> lock(gBoneScreenCacheMutex);
+        gBoneScreenCache.clear();
+    }
 
     // 定期清理缓存（每 2 秒，假设 60 FPS）
     static int cleanupCounter = 0;
@@ -4298,6 +4703,30 @@ void DrawObjectsWithData(const GameFrameData& data, float gameStepDeltaTime) {
         DrawObjectsWithDataInternal(classified->players, vpToUse, data.localPlayerPos,
                                     data.frameCounter, gameStepDeltaTime);
     }
+    if (gShowBots && !classified->bots.empty()) {
+        DrawObjectsWithDataInternal(classified->bots, vpToUse, data.localPlayerPos,
+                                    data.frameCounter, gameStepDeltaTime);
+    }
+    if (gShowNPCs && !classified->npcs.empty()) {
+        DrawObjectsWithDataInternal(classified->npcs, vpToUse, data.localPlayerPos,
+                                    data.frameCounter, gameStepDeltaTime);
+    }
+    if (gShowMonsters && !classified->monsters.empty()) {
+        DrawObjectsWithDataInternal(classified->monsters, vpToUse, data.localPlayerPos,
+                                    data.frameCounter, gameStepDeltaTime);
+    }
+    if (gShowTombBoxes && !classified->tombBoxes.empty()) {
+        DrawObjectsWithDataInternal(classified->tombBoxes, vpToUse, data.localPlayerPos,
+                                    data.frameCounter, gameStepDeltaTime);
+    }
+    if (gShowOtherBoxes && !classified->otherBoxes.empty()) {
+        DrawObjectsWithDataInternal(classified->otherBoxes, vpToUse, data.localPlayerPos,
+                                    data.frameCounter, gameStepDeltaTime);
+    }
+    if (gShowEscapeBoxes && !classified->escapeBoxes.empty()) {
+        DrawObjectsWithDataInternal(classified->escapeBoxes, vpToUse, data.localPlayerPos,
+                                    data.frameCounter, gameStepDeltaTime);
+    }
     if (gShowVehicles && !classified->vehicles.empty()) {
         DrawObjectsWithDataInternal(classified->vehicles, vpToUse, data.localPlayerPos,
                                     data.frameCounter, gameStepDeltaTime);
@@ -4315,9 +4744,10 @@ static void DrawPhysXGeometry(const FMatrix& vpMat, const Vec3& localPlayerPos, 
                               float screenW, float screenH) {
     if (address.libUE4 == 0) return;
 
-    const uint64_t uworld = Paradise_hook->read<uint64_t>(address.libUE4 + offset.Gworld);
-    const uint64_t pxScene = GetSyncPxScene(address.libUE4, uworld);
-    if (pxScene == 0) return;
+    const uint64_t uworld = GetDriverManager().read<uint64_t>(address.libUE4 + offset.Gworld);
+    std::vector<uint64_t> pxScenes;
+    CollectActivePxScenes(address.libUE4, uworld, pxScenes);
+    if (pxScenes.empty()) return;
 
     PhysXDrawStats stats;
     std::unordered_set<PhysXDrawDedupKey, PhysXDrawDedupKeyHash> dedupKeys;
@@ -4326,72 +4756,54 @@ static void DrawPhysXGeometry(const FMatrix& vpMat, const Vec3& localPlayerPos, 
     liveShapes.reserve(4096);
     DrawPhysXStaticPrunerGeometry(vpMat, localPlayerPos, drawList, screenW, screenH, stats, dedupKeys, liveShapes);
 
-    const uint64_t actorArray = Paradise_hook->read<uint64_t>(pxScene + offset.PxSceneActors);
-    const uint32_t actorCount = Paradise_hook->read<uint32_t>(pxScene + offset.PxSceneActorCount);
-    if (actorArray == 0 || actorCount == 0 || actorCount > 100000) {
-        DrawCachedLocalPhysXGeometry(vpMat, localPlayerPos, drawList, screenW, screenH, stats, dedupKeys, liveShapes);
-        if (gShowAllClassNames) {
-            char text[160];
-            snprintf(text, sizeof(text), "PhysX A:%d/%d S:%d/%d M:%d T:%d F:%d",
-                     stats.ActorsDrawn, stats.ActorsScanned, stats.ShapesDrawn, stats.ShapesScanned,
-                     stats.MeshesDrawn, stats.TrianglesDrawn, stats.RejectedByFilter);
-            drawList->AddText(ImVec2(20.0f, 20.0f), IM_COL32(255, 220, 120, 255), text);
-        }
-        return;
-    }
-
-    std::vector<uint64_t> actors(actorCount);
-    if (!ReadRemoteBufferRobust(actorArray, actors.data(), actorCount * sizeof(uint64_t))) {
-        DrawCachedLocalPhysXGeometry(vpMat, localPlayerPos, drawList, screenW, screenH, stats, dedupKeys, liveShapes);
-        return;
-    }
-
-    // 收集 PxScene actor（pruner 未覆盖的静态 actor 如 HeightField + 全部动态 actor）
     std::vector<PhysXActorCandidate> sceneActors;
-    sceneActors.reserve(std::min<uint32_t>(actorCount, 256));
-
+    sceneActors.reserve(512);
     const int maxActorScans = std::max(gPhysXMaxActorsPerFrame * 4, 256);
     int actorScans = 0;
-    for (uint64_t actor : actors) {
-        if (actor == 0) continue;
-        if (actorScans >= maxActorScans) break;
-        ++actorScans;
 
-        const uint16_t actorType = Paradise_hook->read<uint16_t>(actor + offset.PxActorType);
-        if (actorType != PX_ACTOR_RIGID_DYNAMIC && actorType != PX_ACTOR_RIGID_STATIC) {
-            continue;
-        }
+    for (uint64_t pxScene : pxScenes) {
+        std::vector<uint64_t> actors;
+        if (!CollectPxSceneActorPointers(pxScene, actors)) continue;
+        for (uint64_t actor : actors) {
+            if (actor == 0) continue;
+            if (actorScans >= maxActorScans) break;
+            ++actorScans;
 
-        PxTransformData actorPose{};
-        if (!ReadActorGlobalPose(actor, actorType, actorPose)) {
-            continue;
-        }
+            const uint16_t actorType = GetDriverManager().read<uint16_t>(actor + offset.PxActorType);
+            if (actorType != PX_ACTOR_RIGID_DYNAMIC && actorType != PX_ACTOR_RIGID_STATIC) {
+                continue;
+            }
 
-        // 静态 actor（如 HeightField 地形）的 origin 可能远离玩家，
-        // 但几何体本身覆盖大面积 — 跳过 actor 级距离和 FOV 过滤，
-        // 由后续每三角形距离过滤控制
-        if (actorType != PX_ACTOR_RIGID_STATIC) {
-            if (address.LocalPlayerActor != 0 && gPhysXDrawRadiusMeters > 0.0f) {
-                const float distanceMeters = Vec3::Distance(localPlayerPos, actorPose.Translation) / 100.0f;
-                if (distanceMeters > gPhysXDrawRadiusMeters) {
+            PxTransformData actorPose{};
+            if (!ReadActorGlobalPose(actor, actorType, actorPose)) {
+                continue;
+            }
+
+            if (actorType != PX_ACTOR_RIGID_STATIC) {
+                if (address.LocalPlayerActor != 0 && gPhysXDrawRadiusMeters > 0.0f) {
+                    const float distanceMeters = Vec3::Distance(localPlayerPos, actorPose.Translation) / 100.0f;
+                    if (distanceMeters > gPhysXDrawRadiusMeters) {
+                        ++stats.RejectedByFilter;
+                        continue;
+                    }
+                }
+
+                if (!IsWithinCenterRegion(actorPose.Translation, vpMat, screenW, screenH)) {
                     ++stats.RejectedByFilter;
                     continue;
                 }
             }
 
-            if (!IsWithinCenterRegion(actorPose.Translation, vpMat, screenW, screenH)) {
-                ++stats.RejectedByFilter;
-                continue;
-            }
+            const Vec3 delta = actorPose.Translation - localPlayerPos;
+            PhysXActorCandidate candidate{};
+            candidate.Actor = actor;
+            candidate.ActorType = actorType;
+            candidate.Pose = actorPose;
+            candidate.DistanceSq = Vec3::Dot(delta, delta);
+            sceneActors.push_back(candidate);
         }
 
-        const Vec3 delta = actorPose.Translation - localPlayerPos;
-        PhysXActorCandidate candidate{};
-        candidate.Actor = actor;
-        candidate.ActorType = actorType;
-        candidate.Pose = actorPose;
-        candidate.DistanceSq = Vec3::Dot(delta, delta);
-        sceneActors.push_back(candidate);
+        if (actorScans >= maxActorScans) break;
     }
 
     std::sort(sceneActors.begin(), sceneActors.end(), [](const PhysXActorCandidate& a, const PhysXActorCandidate& b) {
@@ -4408,15 +4820,15 @@ static void DrawPhysXGeometry(const FMatrix& vpMat, const Vec3& localPlayerPos, 
         ++stats.ActorsScanned;
 
         const bool isStaticActor = actorType == PX_ACTOR_RIGID_STATIC;
-        const uint16_t shapeCount = Paradise_hook->read<uint16_t>(actor + offset.PxActorShapeCount);
+        const uint16_t shapeCount = GetDriverManager().read<uint16_t>(actor + offset.PxActorShapeCount);
         if (shapeCount == 0) continue;
 
         const uint32_t shapeLimit = std::min<uint32_t>(shapeCount, std::max(gPhysXMaxShapesPerActor, 1));
         std::vector<uint64_t> shapes(shapeLimit);
         if (shapeCount == 1) {
-            shapes[0] = Paradise_hook->read<uint64_t>(actor + offset.PxActorShapes);
+            shapes[0] = GetDriverManager().read<uint64_t>(actor + offset.PxActorShapes);
         } else {
-            const uint64_t shapePtrArray = Paradise_hook->read<uint64_t>(actor + offset.PxActorShapes);
+            const uint64_t shapePtrArray = GetDriverManager().read<uint64_t>(actor + offset.PxActorShapes);
             if (shapePtrArray == 0) continue;
             if (!ReadRemoteBufferRobust(shapePtrArray, shapes.data(), shapeLimit * sizeof(uint64_t))) continue;
         }
@@ -4427,15 +4839,15 @@ static void DrawPhysXGeometry(const FMatrix& vpMat, const Vec3& localPlayerPos, 
             liveShapes.insert(shape);
             ++stats.ShapesScanned;
 
-            const uint32_t npShapeFlags = Paradise_hook->read<uint32_t>(shape + offset.PxShapeFlags);
-            const uint64_t corePtr = Paradise_hook->read<uint64_t>(shape + offset.PxShapeCorePtr);
+            const uint32_t npShapeFlags = GetDriverManager().read<uint32_t>(shape + offset.PxShapeFlags);
+            const uint64_t corePtr = GetDriverManager().read<uint64_t>(shape + offset.PxShapeCorePtr);
 
             uint8_t shapeFlags = 0;
             if ((npShapeFlags & 0x40u) != 0) {
                 if (corePtr == 0) continue;
-                shapeFlags = Paradise_hook->read<uint8_t>(corePtr + offset.PxShapeCoreShapeFlags);
+                shapeFlags = GetDriverManager().read<uint8_t>(corePtr + offset.PxShapeCoreShapeFlags);
             } else {
-                shapeFlags = Paradise_hook->read<uint8_t>(shape + offset.PxShapeShapeFlags);
+                shapeFlags = GetDriverManager().read<uint8_t>(shape + offset.PxShapeShapeFlags);
             }
 
             if ((shapeFlags & (PX_SHAPE_SIMULATION | PX_SHAPE_SCENE_QUERY)) == 0 ||
@@ -4454,7 +4866,7 @@ static void DrawPhysXGeometry(const FMatrix& vpMat, const Vec3& localPlayerPos, 
                 geometryAddr = corePtr + offset.PxShapeCoreGeometry;
             }
 
-            const uint32_t geometryType = Paradise_hook->read<uint32_t>(geometryAddr + 0x0);
+            const uint32_t geometryType = GetDriverManager().read<uint32_t>(geometryAddr + 0x0);
             if (geometryType > PX_GEOM_HEIGHTFIELD) {
                 ++stats.RejectedByFilter;
                 continue;
@@ -4470,7 +4882,7 @@ static void DrawPhysXGeometry(const FMatrix& vpMat, const Vec3& localPlayerPos, 
             switch (geometryType) {
                 case PX_GEOM_SPHERE:
                     if (gPhysXDrawPrimitives && !gPhysXUseLocalModelData) {
-                        const float radius = Paradise_hook->read<float>(geometryAddr + offset.PxSphereGeometryRadius);
+                        const float radius = GetDriverManager().read<float>(geometryAddr + offset.PxSphereGeometryRadius);
                         DrawSphereWireframe(drawList, vpMat, screenW, screenH, worldPose, radius,
                                             IM_COL32(255, 80, 160, 220));
                         drewShape = true;
@@ -4478,8 +4890,8 @@ static void DrawPhysXGeometry(const FMatrix& vpMat, const Vec3& localPlayerPos, 
                     break;
                 case PX_GEOM_CAPSULE:
                     if (gPhysXDrawPrimitives && !gPhysXUseLocalModelData) {
-                        const float halfHeight = Paradise_hook->read<float>(geometryAddr + offset.PxCapsuleGeometryHalfHeight);
-                        const float radius = Paradise_hook->read<float>(geometryAddr + offset.PxCapsuleGeometryRadius);
+                        const float halfHeight = GetDriverManager().read<float>(geometryAddr + offset.PxCapsuleGeometryHalfHeight);
+                        const float radius = GetDriverManager().read<float>(geometryAddr + offset.PxCapsuleGeometryRadius);
                         DrawCapsuleWireframe(drawList, vpMat, screenW, screenH, worldPose, halfHeight, radius,
                                              IM_COL32(255, 215, 0, 220));
                         drewShape = true;
@@ -4488,7 +4900,7 @@ static void DrawPhysXGeometry(const FMatrix& vpMat, const Vec3& localPlayerPos, 
                 case PX_GEOM_BOX:
                     if (gPhysXDrawPrimitives && !gPhysXUseLocalModelData) {
                         Vec3 halfExtents{};
-                        if (Paradise_hook->read(geometryAddr + offset.PxBoxGeometryHalfExtents, &halfExtents, sizeof(halfExtents))) {
+                        if (GetDriverManager().read(geometryAddr + offset.PxBoxGeometryHalfExtents, &halfExtents, sizeof(halfExtents))) {
                             DrawBoxWireframe(drawList, vpMat, screenW, screenH, worldPose, halfExtents,
                                              IM_COL32(80, 255, 80, 220));
                             drewShape = true;
@@ -4560,9 +4972,19 @@ static void DrawObjectsWithDataInternal(
     ImDrawList* draw_list = ImGui::GetBackgroundDrawList();
     const float screenW = io.DisplaySize.x;
     const float screenH = io.DisplaySize.y;
+    if (!gDrawPredictedAimPoint) {
+        gPredictedAimHoverTimes.clear();
+    }
     for (size_t actorIndex = 0; actorIndex < actors.size(); ++actorIndex) {
         const auto& ca = actors[actorIndex];
-        if (address.LocalPlayerActor != 0 && ca.actorAddr == address.LocalPlayerActor) {
+        if ((address.LocalPlayerActor != 0 && ca.actorAddr == address.LocalPlayerActor) ||
+            (ca.actorType == ActorType::PLAYER && address.LocalPlayerKey != 0 && ca.playerKey == address.LocalPlayerKey)) {
+            continue;
+        }
+        if ((ca.actorType == ActorType::PLAYER || ca.actorType == ActorType::BOT) &&
+            address.LocalPlayerTeamID >= 0 &&
+            ca.teamID >= 0 &&
+            ca.teamID == address.LocalPlayerTeamID) {
             continue;
         }
 
@@ -4573,12 +4995,12 @@ static void DrawObjectsWithDataInternal(
         bool hasMeshTransform = false;
 
         if (hasBoneMap) {
-            meshTransform = Paradise_hook->read<FTransform>(ca.skelMeshCompAddr + offset.ComponentToWorld);
+            meshTransform = GetDriverManager().read<FTransform>(ca.skelMeshCompAddr + offset.ComponentToWorld);
             actorPos = meshTransform.Translation;
             hasMeshTransform = true;
             distance = Vec3::Distance(localPlayerPos, actorPos) / 100.0f;
         } else if (ca.rootCompAddr != 0) {
-            FTransform actorTransform = Paradise_hook->read<FTransform>(ca.rootCompAddr + offset.ComponentToWorld);
+            FTransform actorTransform = GetDriverManager().read<FTransform>(ca.rootCompAddr + offset.ComponentToWorld);
             actorPos = actorTransform.Translation;
             distance = Vec3::Distance(localPlayerPos, actorPos) / 100.0f;
         } else {
@@ -4589,20 +5011,20 @@ static void DrawObjectsWithDataInternal(
             continue;
         }
 
-        // 默认只显示 ClassNameMap 中已映射的对象。
-        // 只有开启”显示所有类名”时，才回退显示原始 className。
+        // 开启“显示所有类名”时始终显示原始 className，不使用 ClassNameMap 的映射名。
+        // 默认模式下仍优先显示映射名。
         const char* label = nullptr;
-        if (!ca.displayName.empty()) {
-            label = ca.displayName.c_str();
-        } else if (gShowAllClassNames && !ca.className.empty()) {
+        if (gShowAllClassNames && !ca.className.empty()) {
             label = ca.className.c_str();
+        } else if (!ca.displayName.empty()) {
+            label = ca.displayName.c_str();
         } else {
             continue;
         }
 
         // 距离衰减参数（可调整）
         constexpr float MIN_DISTANCE = 10.0f;   // 10米内全亮、全尺寸
-        constexpr float MAX_DISTANCE = 200.0f;  // 300米外最小透明度、最小尺寸
+        constexpr float MAX_DISTANCE = 200.0f;  // 200米外最小透明度、最小尺寸
 
         // 计算距离因子 [0, 1]：0=近，1=远
         float distanceFactor = 0.0f;
@@ -4681,7 +5103,7 @@ static void DrawObjectsWithDataInternal(
                             // 只读取到最大索引的骨骼
                             int readCount = maxIndex + 1;
                             FTransform allBones[MAX_BONE_COUNT];
-                            if (!Paradise_hook->read(BoneDataPtr, allBones, readCount * sizeof(FTransform))) {
+                            if (!GetDriverManager().read(BoneDataPtr, allBones, readCount * sizeof(FTransform))) {
                                 continue;
                             }
 
@@ -4704,7 +5126,7 @@ static void DrawObjectsWithDataInternal(
                             if (cstIndex < 0 || cstIndex >= BoneCount) continue;
 
                             FTransform bone;
-                            if (Paradise_hook->read(BoneDataPtr + cstIndex * sizeof(FTransform), &bone, sizeof(FTransform))) {
+                            if (GetDriverManager().read(BoneDataPtr + cstIndex * sizeof(FTransform), &bone, sizeof(FTransform))) {
                                 boneTranslations[boneID] = bone.Translation;
                                 validCount++;
                             }
@@ -4813,6 +5235,52 @@ static void DrawObjectsWithDataInternal(
                             }
                         }
 
+                        if (gDrawPredictedAimPoint &&
+                            (ca.actorType == ActorType::PLAYER || ca.actorType == ActorType::BOT)) {
+                            const int targetBoneID =
+                                (gAutoAim != nullptr) ? gAutoAim->GetConfig().targetBone : BONE_HEAD;
+                            if (targetBoneID >= 0 && targetBoneID < BONE_COUNT && boneOnScreen[targetBoneID]) {
+                                const Vec2 crosshairCenter(screenW * 0.5f, screenH * 0.5f);
+                                const float shortSide = std::max(1.0f, std::min(screenW, screenH));
+                                const float hoverRadius = shortSide * kPredictedAimCenterRadiusFraction;
+                                const float dx = boneScreenPos[targetBoneID].x - crosshairCenter.x;
+                                const float dy = boneScreenPos[targetBoneID].y - crosshairCenter.y;
+                                const float centerDistance = std::sqrt(dx * dx + dy * dy);
+                                float& hoverTime = gPredictedAimHoverTimes[ca.actorAddr];
+                                if (centerDistance <= hoverRadius) {
+                                    hoverTime = std::min(kPredictedAimShowDelaySeconds,
+                                                         hoverTime + std::max(gameStepDeltaTime, 0.0f));
+                                } else {
+                                    hoverTime = 0.0f;
+                                }
+
+                                if (hoverTime >= kPredictedAimShowDelaySeconds) {
+                                    PredictedAimPoint prediction;
+                                    if (ComputePredictedAimPoint(ca.actorAddr, distance,
+                                                                 boneScreenPos[targetBoneID], VPMat,
+                                                                 screenW, screenH, prediction) &&
+                                        prediction.predictedOnScreen) {
+                                        const ImVec2 currentPoint(prediction.currentScreenPos.x,
+                                                                  prediction.currentScreenPos.y);
+                                        const ImVec2 predictedPoint(prediction.predictedScreenPos.x,
+                                                                    prediction.predictedScreenPos.y);
+                                        const ImU32 lineColor = IM_COL32(80, 190, 255, boneAlpha);
+                                        const ImU32 ringColor = IM_COL32(140, 220, 255, boneAlpha);
+                                        draw_list->AddLine(currentPoint, predictedPoint, lineColor, 1.5f);
+                                        draw_list->AddCircle(predictedPoint, 8.0f, ringColor, 24, 2.0f);
+                                        draw_list->AddLine(ImVec2(predictedPoint.x - 6.0f, predictedPoint.y),
+                                                           ImVec2(predictedPoint.x + 6.0f, predictedPoint.y),
+                                                           ringColor, 1.8f);
+                                        draw_list->AddLine(ImVec2(predictedPoint.x, predictedPoint.y - 6.0f),
+                                                           ImVec2(predictedPoint.x, predictedPoint.y + 6.0f),
+                                                           ringColor, 1.8f);
+                                    }
+                                }
+                            } else {
+                                gPredictedAimHoverTimes[ca.actorAddr] = 0.0f;
+                            }
+                        }
+
                         // 缓存骨骼屏幕坐标供 auto-aim 使用
                         BoneScreenData bsd;
                         std::copy(std::begin(boneScreenPos), std::end(boneScreenPos), std::begin(bsd.screenPos));
@@ -4820,11 +5288,19 @@ static void DrawObjectsWithDataInternal(
                         std::copy(std::begin(boneVisible), std::end(boneVisible), std::begin(bsd.visible));
                         bsd.distance = distance;
                         bsd.teamID = ca.teamID;
+                        bsd.playerKey = ca.playerKey;
                         bsd.actorAddr = ca.actorAddr;
                         bsd.frameCounter = engineFrame;
                         bsd.valid = true;
+                        bsd.skelMeshCompAddr = ca.skelMeshCompAddr;
+                        bsd.boneDataPtr = ca.boneDataPtr;
+                        std::copy(std::begin(ca.boneMap), std::end(ca.boneMap), std::begin(bsd.boneMap));
+                        bsd.cachedBoneCount = ca.cachedBoneCount;
 
-                        gBoneScreenCache[ca.actorAddr] = bsd;
+                        {
+                            std::lock_guard<std::mutex> lock(gBoneScreenCacheMutex);
+                            gBoneScreenCache[ca.actorAddr] = bsd;
+                        }
                     }
                 }
             }
@@ -4835,19 +5311,31 @@ static void DrawObjectsWithDataInternal(
             Vec2 topLabelScreenPos;
             if (WorldToScreen(topLabelWorldPos, VPMat, io.DisplaySize.x, io.DisplaySize.y, topLabelScreenPos)) {
                 ImVec2 labelPos(topLabelScreenPos.x, topLabelScreenPos.y);
-                ImU32 teamColor = GetTeamColor(ca.teamID);
+                ImU32 teamColor = GetActorColor(ca);
                 float health = -1.0f;
                 float healthMax = -1.0f;
-                if (ca.actorType == ActorType::PLAYER) {
-                    health = Paradise_hook->read<float>(ca.actorAddr + offset.Health);
-                    healthMax = Paradise_hook->read<float>(ca.actorAddr + offset.HealthMax);
+                if (ca.actorType == ActorType::PLAYER || ca.actorType == ActorType::BOT) {
+                    health = GetDriverManager().read<float>(ca.actorAddr + offset.Health);
+                    healthMax = GetDriverManager().read<float>(ca.actorAddr + offset.HealthMax);
                 }
 
                 char displayName[256];
-                if (!ca.playerName.empty() && ca.teamID >= 0) {
+                const bool showBoxContent = IsBoxLikeActorType(ca.actorType) &&
+                                            ShouldShowBoxContentNearCrosshair(labelPos, screenW, screenH);
+                if (gShowAllClassNames) {
+                    snprintf(displayName, sizeof(displayName), "%s", label);
+                } else if (IsCategoryPrefixActorType(ca.actorType)) {
+                    if (!ca.playerName.empty()) {
+                        snprintf(displayName, sizeof(displayName), "%s: %s", label, ca.playerName.c_str());
+                    } else {
+                        snprintf(displayName, sizeof(displayName), "%s", label);
+                    }
+                } else if (!ca.playerName.empty() && ca.teamID >= 0) {
                     snprintf(displayName, sizeof(displayName), "[%d] %s", ca.teamID, ca.playerName.c_str());
                 } else if (!ca.playerName.empty()) {
                     snprintf(displayName, sizeof(displayName), "%s", ca.playerName.c_str());
+                } else if (showBoxContent && !ca.containerSummary.empty()) {
+                    snprintf(displayName, sizeof(displayName), "%s [%s]", label, ca.containerSummary.c_str());
                 } else {
                     snprintf(displayName, sizeof(displayName), "%s", label);
                 }
@@ -4856,13 +5344,15 @@ static void DrawObjectsWithDataInternal(
                 float originalFontSize = font->LegacySize;
                 float scaledFontSize = originalFontSize * textScale;
                 ImVec2 textSize = font->CalcTextSizeA(scaledFontSize, FLT_MAX, 0.0f, displayName);
-                const float labelYOffset = (ca.actorType == ActorType::PLAYER) ? 18.0f : 2.0f;
+                const float labelYOffset = (ca.actorType == ActorType::PLAYER || ca.actorType == ActorType::BOT) ? 18.0f : 2.0f;
                 ImVec2 textPos(labelPos.x - textSize.x * 0.5f, labelPos.y - textSize.y - labelYOffset);
                 ImVec2 bgMin(textPos.x - 6.0f, textPos.y - 3.0f);
                 ImVec2 bgMax(textPos.x + textSize.x + 6.0f, textPos.y + textSize.y + 3.0f);
 
-                DrawLabelBackground(draw_list, bgMin, bgMax, IM_COL32(0, 0, 0, 140));
-                draw_list->AddRect(bgMin, bgMax, IM_COL32(255, 255, 255, 32), 6.0f);
+                if (!UseCategoryLabelOnly(ca.actorType)) {
+                    DrawLabelBackground(draw_list, bgMin, bgMax, IM_COL32(0, 0, 0, 140));
+                    draw_list->AddRect(bgMin, bgMax, IM_COL32(255, 255, 255, 32), 6.0f);
+                }
 
                 draw_list->AddText(font, scaledFontSize, textPos, teamColor, displayName);
 
@@ -4898,8 +5388,9 @@ static void DrawObjectsWithDataInternal(
     }
 }
 
-// 供 auto-aim 访问骨骼缓存（同线程调用，返回引用避免拷贝）
-const std::unordered_map<uint64_t, BoneScreenData>& GetBoneScreenCache() {
+// 供 auto-aim 访问骨骼缓存（返回拷贝，避免跨线程引用）
+const std::unordered_map<uint64_t, BoneScreenData> GetBoneScreenCache() {
+    std::lock_guard<std::mutex> lock(gBoneScreenCacheMutex);
     return gBoneScreenCache;
 }
 
@@ -4978,7 +5469,7 @@ static bool SegmentIntersectsTriangleMeshShape(const Vec3& startWorld, const Vec
         return false;
     }
 
-    const uint64_t mesh = Paradise_hook->read<uint64_t>(geometryAddr + offset.PxTriangleMeshGeometryTriangleMesh);
+    const uint64_t mesh = GetDriverManager().read<uint64_t>(geometryAddr + offset.PxTriangleMeshGeometryTriangleMesh);
     if (mesh == 0) return false;
 
     PxMeshScaleData scale{};
@@ -5035,14 +5526,14 @@ static bool SegmentIntersectsTriangleMeshShape(const Vec3& startWorld, const Vec
         return false;  // 本地模式下无本地文件则跳过
     }
 
-    const uint32_t vertexCount = Paradise_hook->read<uint32_t>(mesh + offset.PxTriangleMeshVertexCount);
-    const uint32_t triangleCount = Paradise_hook->read<uint32_t>(mesh + offset.PxTriangleMeshTriangleCount);
-    const uint64_t verticesAddr = Paradise_hook->read<uint64_t>(mesh + offset.PxTriangleMeshVertices);
-    const uint64_t trianglesAddr = Paradise_hook->read<uint64_t>(mesh + offset.PxTriangleMeshTriangles);
+    const uint32_t vertexCount = GetDriverManager().read<uint32_t>(mesh + offset.PxTriangleMeshVertexCount);
+    const uint32_t triangleCount = GetDriverManager().read<uint32_t>(mesh + offset.PxTriangleMeshTriangleCount);
+    const uint64_t verticesAddr = GetDriverManager().read<uint64_t>(mesh + offset.PxTriangleMeshVertices);
+    const uint64_t trianglesAddr = GetDriverManager().read<uint64_t>(mesh + offset.PxTriangleMeshTriangles);
     if (vertexCount == 0 || triangleCount == 0 || verticesAddr == 0 || trianglesAddr == 0) return false;
 
     CachedTriangleMeshData cache;
-    const uint8_t flags = Paradise_hook->read<uint8_t>(mesh + offset.PxTriangleMeshFlags);
+    const uint8_t flags = GetDriverManager().read<uint8_t>(mesh + offset.PxTriangleMeshFlags);
     if (!GetCachedTriangleMesh(mesh, vertexCount, triangleCount, flags, verticesAddr, trianglesAddr, cache)) {
         return false;
     }
@@ -5186,12 +5677,12 @@ static bool SegmentIntersectsLocalTriangleMeshShape(const Vec3& startWorld, cons
 static bool SegmentIntersectsHeightFieldShape(const Vec3& startWorld, const Vec3& endWorld,
                                               const PxTransformData& worldPose, uint64_t geometryAddr,
                                               const D4DVector* invRotation = nullptr) {
-    const uint64_t heightField = Paradise_hook->read<uint64_t>(geometryAddr + offset.PxHeightFieldGeometryHeightField);
+    const uint64_t heightField = GetDriverManager().read<uint64_t>(geometryAddr + offset.PxHeightFieldGeometryHeightField);
     if (heightField == 0) return false;
 
-    const float heightScale = Paradise_hook->read<float>(geometryAddr + offset.PxHeightFieldGeometryHeightScale);
-    const float rowScale = Paradise_hook->read<float>(geometryAddr + offset.PxHeightFieldGeometryRowScale);
-    const float columnScale = Paradise_hook->read<float>(geometryAddr + offset.PxHeightFieldGeometryColumnScale);
+    const float heightScale = GetDriverManager().read<float>(geometryAddr + offset.PxHeightFieldGeometryHeightScale);
+    const float rowScale = GetDriverManager().read<float>(geometryAddr + offset.PxHeightFieldGeometryRowScale);
+    const float columnScale = GetDriverManager().read<float>(geometryAddr + offset.PxHeightFieldGeometryColumnScale);
     if (std::fabs(heightScale) <= 1e-6f || std::fabs(rowScale) <= 1e-6f || std::fabs(columnScale) <= 1e-6f) {
         return false;
     }
@@ -5204,8 +5695,7 @@ static bool SegmentIntersectsHeightFieldShape(const Vec3& startWorld, const Vec3
     if (gPhysXUseLocalModelData) {
         const LocalObjMeshData* localMesh = GetLocalHeightFieldDataStrict(heightField);
         if (localMesh) {
-            constexpr size_t kMaxHfTrianglesPerVisibilityTest = 2000;
-            const size_t hfTriLimit = std::min(localMesh->Indices.size() / 3, kMaxHfTrianglesPerVisibilityTest) * 3;
+            const size_t hfTriLimit = localMesh->Indices.size();
             for (size_t i = 0; i + 2 < hfTriLimit; i += 3) {
                 const uint32_t ia = localMesh->Indices[i];
                 const uint32_t ib = localMesh->Indices[i + 1];
@@ -5379,11 +5869,11 @@ static bool BuildVisibilityTriangleMeshData(const VisibilityBuildCandidate& cand
         }
     } else {
         const uint64_t mesh = candidate.Resource;
-        const uint32_t vertexCount = Paradise_hook->read<uint32_t>(mesh + offset.PxTriangleMeshVertexCount);
-        const uint32_t triangleCount = Paradise_hook->read<uint32_t>(mesh + offset.PxTriangleMeshTriangleCount);
-        const uint64_t verticesAddr = Paradise_hook->read<uint64_t>(mesh + offset.PxTriangleMeshVertices);
-        const uint64_t trianglesAddr = Paradise_hook->read<uint64_t>(mesh + offset.PxTriangleMeshTriangles);
-        const uint8_t flags = Paradise_hook->read<uint8_t>(mesh + offset.PxTriangleMeshFlags);
+        const uint32_t vertexCount = GetDriverManager().read<uint32_t>(mesh + offset.PxTriangleMeshVertexCount);
+        const uint32_t triangleCount = GetDriverManager().read<uint32_t>(mesh + offset.PxTriangleMeshTriangleCount);
+        const uint64_t verticesAddr = GetDriverManager().read<uint64_t>(mesh + offset.PxTriangleMeshVertices);
+        const uint64_t trianglesAddr = GetDriverManager().read<uint64_t>(mesh + offset.PxTriangleMeshTriangles);
+        const uint8_t flags = GetDriverManager().read<uint8_t>(mesh + offset.PxTriangleMeshFlags);
         if (vertexCount == 0 || triangleCount == 0 || verticesAddr == 0 || trianglesAddr == 0) return false;
 
         CachedTriangleMeshData cache;
@@ -5505,7 +5995,7 @@ static void GatherPrunerVisibilityCandidates(VisibilitySceneKind kind,
         if (payload.Shape == 0 || payload.Actor == 0) continue;
 
         const uint64_t geometryAddr = payload.Shape + offset.ScbShapeCoreGeometry;
-        const uint32_t geometryType = Paradise_hook->read<uint32_t>(geometryAddr);
+        const uint32_t geometryType = GetDriverManager().read<uint32_t>(geometryAddr);
         if (!MatchesVisibilitySceneKind(kind, geometryType, true)) continue;
 
         PxTransformData actorPose{}, shapePose{};
@@ -5520,13 +6010,13 @@ static void GatherPrunerVisibilityCandidates(VisibilitySceneKind kind,
         candidate.IsStatic = true;
 
         if (geometryType == PX_GEOM_TRIANGLEMESH) {
-            candidate.Resource = Paradise_hook->read<uint64_t>(geometryAddr + offset.PxTriangleMeshGeometryTriangleMesh);
+            candidate.Resource = GetDriverManager().read<uint64_t>(geometryAddr + offset.PxTriangleMeshGeometryTriangleMesh);
             if (!ReadMeshScale(geometryAddr + offset.PxTriangleMeshGeometryScale, candidate.MeshScale)) continue;
         } else if (geometryType == PX_GEOM_HEIGHTFIELD) {
-            candidate.Resource = Paradise_hook->read<uint64_t>(geometryAddr + offset.PxHeightFieldGeometryHeightField);
-            candidate.HeightScale = Paradise_hook->read<float>(geometryAddr + offset.PxHeightFieldGeometryHeightScale);
-            candidate.RowScale = Paradise_hook->read<float>(geometryAddr + offset.PxHeightFieldGeometryRowScale);
-            candidate.ColumnScale = Paradise_hook->read<float>(geometryAddr + offset.PxHeightFieldGeometryColumnScale);
+            candidate.Resource = GetDriverManager().read<uint64_t>(geometryAddr + offset.PxHeightFieldGeometryHeightField);
+            candidate.HeightScale = GetDriverManager().read<float>(geometryAddr + offset.PxHeightFieldGeometryHeightScale);
+            candidate.RowScale = GetDriverManager().read<float>(geometryAddr + offset.PxHeightFieldGeometryRowScale);
+            candidate.ColumnScale = GetDriverManager().read<float>(geometryAddr + offset.PxHeightFieldGeometryColumnScale);
             if (std::fabs(candidate.HeightScale) <= 1e-6f ||
                 std::fabs(candidate.RowScale) <= 1e-6f ||
                 std::fabs(candidate.ColumnScale) <= 1e-6f) {
@@ -5543,85 +6033,81 @@ static void GatherPxSceneVisibilityCandidates(VisibilitySceneKind kind,
                                               const Vec3& cameraWorldPos,
                                               float maxDistanceSq,
                                               std::unordered_map<uint64_t, VisibilityBuildCandidate>& candidates) {
-    if (!Paradise_hook || address.libUE4 == 0) return;
+    if (address.libUE4 == 0) return;
 
-    const uint64_t uworld = Paradise_hook->read<uint64_t>(address.libUE4 + offset.Gworld);
-    const uint64_t pxScene = GetSyncPxScene(address.libUE4, uworld);
-    if (pxScene == 0) return;
+    const uint64_t uworld = GetDriverManager().read<uint64_t>(address.libUE4 + offset.Gworld);
+    std::vector<uint64_t> pxScenes;
+    CollectActivePxScenes(address.libUE4, uworld, pxScenes);
+    for (uint64_t pxScene : pxScenes) {
+        std::vector<uint64_t> actors;
+        if (!CollectPxSceneActorPointers(pxScene, actors)) continue;
+        for (uint64_t actor : actors) {
+            if (actor == 0) continue;
+            const uint16_t actorType = GetDriverManager().read<uint16_t>(actor + offset.PxActorType);
+            const bool isStatic = actorType == PX_ACTOR_RIGID_STATIC;
+            const bool isDynamic = actorType == PX_ACTOR_RIGID_DYNAMIC;
+            if (!isStatic && !isDynamic) continue;
 
-    const uint64_t actorArray = Paradise_hook->read<uint64_t>(pxScene + offset.PxSceneActors);
-    const uint32_t actorCount = Paradise_hook->read<uint32_t>(pxScene + offset.PxSceneActorCount);
-    if (actorArray == 0 || actorCount == 0 || actorCount > 100000) return;
+            PxTransformData actorPose{};
+            if (!ReadActorGlobalPose(actor, actorType, actorPose)) continue;
+            const Vec3 delta = actorPose.Translation - cameraWorldPos;
+            if (Vec3::Dot(delta, delta) > maxDistanceSq * 4.0f) continue;
 
-    std::vector<uint64_t> actors(actorCount);
-    if (!ReadRemoteBufferRobust(actorArray, actors.data(), actorCount * sizeof(uint64_t))) return;
+            const uint16_t shapeCount = GetDriverManager().read<uint16_t>(actor + offset.PxActorShapeCount);
+            if (shapeCount == 0) continue;
 
-    for (uint64_t actor : actors) {
-        if (actor == 0) continue;
-        const uint16_t actorType = Paradise_hook->read<uint16_t>(actor + offset.PxActorType);
-        const bool isStatic = actorType == PX_ACTOR_RIGID_STATIC;
-        const bool isDynamic = actorType == PX_ACTOR_RIGID_DYNAMIC;
-        if (!isStatic && !isDynamic) continue;
-
-        PxTransformData actorPose{};
-        if (!ReadActorGlobalPose(actor, actorType, actorPose)) continue;
-        const Vec3 delta = actorPose.Translation - cameraWorldPos;
-        if (Vec3::Dot(delta, delta) > maxDistanceSq) continue;
-
-        const uint16_t shapeCount = Paradise_hook->read<uint16_t>(actor + offset.PxActorShapeCount);
-        if (shapeCount == 0 || shapeCount > 64) continue;
-
-        std::vector<uint64_t> shapes(std::min<uint16_t>(shapeCount, 64));
-        if (shapeCount == 1) {
-            shapes[0] = Paradise_hook->read<uint64_t>(actor + offset.PxActorShapes);
-        } else {
-            const uint64_t shapePtrArray = Paradise_hook->read<uint64_t>(actor + offset.PxActorShapes);
-            if (shapePtrArray == 0) continue;
-            if (!ReadRemoteBufferRobust(shapePtrArray, shapes.data(), shapes.size() * sizeof(uint64_t))) continue;
-        }
-
-        for (uint64_t shape : shapes) {
-            if (shape == 0) continue;
-            const uint32_t npShapeFlags = Paradise_hook->read<uint32_t>(shape + offset.PxShapeFlags);
-            PxTransformData shapePose{};
-            if (!ReadShapeLocalPose(shape, npShapeFlags, shapePose)) continue;
-
-            uint64_t geometryAddr = shape + offset.PxShapeGeometryInline;
-            if ((npShapeFlags & 0x1u) != 0) {
-                const uint64_t corePtr = Paradise_hook->read<uint64_t>(shape + offset.PxShapeCorePtr);
-                if (corePtr == 0) continue;
-                geometryAddr = corePtr + offset.PxShapeCoreGeometry;
+            std::vector<uint64_t> shapes(std::min<uint16_t>(shapeCount, 64));
+            if (shapeCount == 1) {
+                shapes[0] = GetDriverManager().read<uint64_t>(actor + offset.PxActorShapes);
+            } else {
+                const uint64_t shapePtrArray = GetDriverManager().read<uint64_t>(actor + offset.PxActorShapes);
+                if (shapePtrArray == 0) continue;
+                if (!ReadRemoteBufferRobust(shapePtrArray, shapes.data(), shapes.size() * sizeof(uint64_t))) continue;
             }
 
-            const uint32_t geometryType = Paradise_hook->read<uint32_t>(geometryAddr);
-            if (!MatchesVisibilitySceneKind(kind, geometryType, isStatic)) continue;
+            for (uint64_t shape : shapes) {
+                if (shape == 0) continue;
+                const uint32_t npShapeFlags = GetDriverManager().read<uint32_t>(shape + offset.PxShapeFlags);
+                PxTransformData shapePose{};
+                if (!ReadShapeLocalPose(shape, npShapeFlags, shapePose)) continue;
 
-            VisibilityBuildCandidate candidate{};
-            candidate.Key = shape;
-            candidate.Shape = shape;
-            candidate.GeometryType = geometryType;
-            candidate.WorldPose = ComposeTransforms(actorPose, shapePose);
-            candidate.IsStatic = isStatic;
+                uint64_t geometryAddr = shape + offset.PxShapeGeometryInline;
+                if ((npShapeFlags & 0x1u) != 0) {
+                    const uint64_t corePtr = GetDriverManager().read<uint64_t>(shape + offset.PxShapeCorePtr);
+                    if (corePtr == 0) continue;
+                    geometryAddr = corePtr + offset.PxShapeCoreGeometry;
+                }
 
-            if (geometryType == PX_GEOM_TRIANGLEMESH) {
-                candidate.Resource = Paradise_hook->read<uint64_t>(geometryAddr + offset.PxTriangleMeshGeometryTriangleMesh);
-                if (!ReadMeshScale(geometryAddr + offset.PxTriangleMeshGeometryScale, candidate.MeshScale)) continue;
-            } else if (geometryType == PX_GEOM_HEIGHTFIELD) {
-                candidate.Resource = Paradise_hook->read<uint64_t>(geometryAddr + offset.PxHeightFieldGeometryHeightField);
-                candidate.HeightScale = Paradise_hook->read<float>(geometryAddr + offset.PxHeightFieldGeometryHeightScale);
-                candidate.RowScale = Paradise_hook->read<float>(geometryAddr + offset.PxHeightFieldGeometryRowScale);
-                candidate.ColumnScale = Paradise_hook->read<float>(geometryAddr + offset.PxHeightFieldGeometryColumnScale);
-                if (std::fabs(candidate.HeightScale) <= 1e-6f ||
-                    std::fabs(candidate.RowScale) <= 1e-6f ||
-                    std::fabs(candidate.ColumnScale) <= 1e-6f) {
+                const uint32_t geometryType = GetDriverManager().read<uint32_t>(geometryAddr);
+                if (!MatchesVisibilitySceneKind(kind, geometryType, isStatic)) continue;
+
+                VisibilityBuildCandidate candidate{};
+                candidate.Key = shape;
+                candidate.Shape = shape;
+                candidate.GeometryType = geometryType;
+                candidate.WorldPose = ComposeTransforms(actorPose, shapePose);
+                candidate.IsStatic = isStatic;
+
+                if (geometryType == PX_GEOM_TRIANGLEMESH) {
+                    candidate.Resource = GetDriverManager().read<uint64_t>(geometryAddr + offset.PxTriangleMeshGeometryTriangleMesh);
+                    if (!ReadMeshScale(geometryAddr + offset.PxTriangleMeshGeometryScale, candidate.MeshScale)) continue;
+                } else if (geometryType == PX_GEOM_HEIGHTFIELD) {
+                    candidate.Resource = GetDriverManager().read<uint64_t>(geometryAddr + offset.PxHeightFieldGeometryHeightField);
+                    candidate.HeightScale = GetDriverManager().read<float>(geometryAddr + offset.PxHeightFieldGeometryHeightScale);
+                    candidate.RowScale = GetDriverManager().read<float>(geometryAddr + offset.PxHeightFieldGeometryRowScale);
+                    candidate.ColumnScale = GetDriverManager().read<float>(geometryAddr + offset.PxHeightFieldGeometryColumnScale);
+                    if (std::fabs(candidate.HeightScale) <= 1e-6f ||
+                        std::fabs(candidate.RowScale) <= 1e-6f ||
+                        std::fabs(candidate.ColumnScale) <= 1e-6f) {
+                        continue;
+                    }
+                } else {
                     continue;
                 }
-            } else {
-                continue;
-            }
 
-            if (candidate.Resource == 0) continue;
-            candidates[candidate.Key] = candidate;
+                if (candidate.Resource == 0) continue;
+                candidates[candidate.Key] = candidate;
+            }
         }
     }
 }
@@ -5677,7 +6163,7 @@ static std::chrono::milliseconds VisibilitySceneKeepAlive(VisibilitySceneKind ki
     switch (kind) {
         case VisibilitySceneKind::StaticMesh:
         case VisibilitySceneKind::HeightField:
-            return std::chrono::milliseconds(12000);
+            return std::chrono::milliseconds(120000);
         case VisibilitySceneKind::DynamicMesh:
             return std::chrono::milliseconds(1000);
     }
@@ -5688,7 +6174,9 @@ static void RefreshVisibilitySceneCache(VisibilitySceneKind kind,
                                         VisibilitySceneCacheState& state,
                                         const Vec3& cameraWorldPos,
                                         bool forceRefresh) {
-    const float maxDistanceCm = std::max(gMaxSkeletonDistance * 100.0f, 10000.0f);
+    const float maxDistanceCm = (kind == VisibilitySceneKind::StaticMesh || kind == VisibilitySceneKind::HeightField)
+        ? std::max(gMaxSkeletonDistance * 100.0f, 50000.0f)
+        : std::max(gMaxSkeletonDistance * 100.0f, 10000.0f);
     const float maxDistanceSq = maxDistanceCm * maxDistanceCm;
     std::unordered_map<uint64_t, VisibilityBuildCandidate> candidates;
     candidates.reserve(2048);
@@ -5812,42 +6300,100 @@ static bool EnsurePrunerDataCached() {
     gPrunerCache.objectCount = 0;
     gPrunerCache.generation = gPrunerCacheGeneration;
 
-    if (!Paradise_hook || address.libUE4 == 0) return false;
+    if (address.libUE4 == 0) return false;
 
-    const uint64_t uworld = Paradise_hook->read<uint64_t>(address.libUE4 + offset.Gworld);
-    const uint64_t pxScene = GetSyncPxScene(address.libUE4, uworld);
-    if (pxScene == 0) return false;
+    const uint64_t uworld = GetDriverManager().read<uint64_t>(address.libUE4 + offset.Gworld);
+    std::vector<uint64_t> pxScenes;
+    CollectActivePxScenes(address.libUE4, uworld, pxScenes);
+    if (pxScenes.empty()) return false;
 
-    const uint64_t sqm = pxScene + offset.NpSceneQueriesSceneQueryManager;
-    const uint64_t staticExt = sqm;
-    const uint64_t pruner = Paradise_hook->read<uint64_t>(staticExt + offset.PrunerExtPruner);
-    const uint32_t prunerType = Paradise_hook->read<uint32_t>(staticExt + offset.PrunerExtType);
-    if (pruner == 0) return false;
+    constexpr uint32_t kMaxPrunerObjects = 100000;
+    uint32_t totalObjectCount = 0;
+    for (uint64_t pxScene : pxScenes) {
+        const uint64_t sqm = pxScene + offset.NpSceneQueriesSceneQueryManager;
+        const uint64_t staticExt = sqm;
+        const uint64_t pruner = GetDriverManager().read<uint64_t>(staticExt + offset.PrunerExtPruner);
+        const uint32_t prunerType = GetDriverManager().read<uint32_t>(staticExt + offset.PrunerExtType);
+        if (pruner == 0) continue;
 
-    uint64_t pool = 0;
-    if (prunerType == 1) {
-        pool = pruner + offset.AABBPrunerPool;
-    } else if (prunerType == 0) {
-        pool = pruner + offset.BucketPrunerPool;
-    } else {
-        return false;
+        uint64_t pool = 0;
+        if (prunerType == 1) {
+            pool = pruner + offset.AABBPrunerPool;
+        } else if (prunerType == 0) {
+            pool = pruner + offset.BucketPrunerPool;
+        } else {
+            continue;
+        }
+
+        const uint32_t objectCount = GetDriverManager().read<uint32_t>(pool + offset.PruningPoolNbObjects);
+        if (objectCount == 0 || objectCount > kMaxPrunerObjects) continue;
+        if (totalObjectCount > kMaxPrunerObjects - objectCount) break;
+        totalObjectCount += objectCount;
     }
 
-    const uint32_t objectCount = Paradise_hook->read<uint32_t>(pool + offset.PruningPoolNbObjects);
-    if (objectCount == 0 || objectCount > 100000) return false;
+    if (totalObjectCount == 0) return false;
 
-    const uint64_t objectsAddr = Paradise_hook->read<uint64_t>(pool + offset.PruningPoolObjects);
-    const uint64_t boundsAddr = Paradise_hook->read<uint64_t>(pool + offset.PruningPoolWorldBoxes);
-    if (objectsAddr == 0 || boundsAddr == 0) return false;
+    // 限制单帧读取时间，防止大场景导致 1-2s 卡顿
+    constexpr uint32_t kMaxPrunerObjectsPerFrame = 20000;
+    const uint32_t readLimit = std::min(totalObjectCount, kMaxPrunerObjectsPerFrame);
 
-    gPrunerCache.payloads.resize(objectCount);
-    gPrunerCache.bounds.resize(objectCount);
-    if (!ReadRemoteBufferRobust(objectsAddr, gPrunerCache.payloads.data(),
-                                objectCount * sizeof(PhysXPrunerPayload))) {
-        return false;
+    gPrunerCache.payloads.clear();
+    gPrunerCache.bounds.clear();
+    gPrunerCache.payloads.reserve(readLimit);
+    gPrunerCache.bounds.reserve(readLimit);
+
+    for (uint64_t pxScene : pxScenes) {
+        if (gPrunerCache.payloads.size() >= readLimit) break;
+
+        const uint64_t sqm = pxScene + offset.NpSceneQueriesSceneQueryManager;
+        const uint64_t staticExt = sqm;
+        const uint64_t pruner = GetDriverManager().read<uint64_t>(staticExt + offset.PrunerExtPruner);
+        const uint32_t prunerType = GetDriverManager().read<uint32_t>(staticExt + offset.PrunerExtType);
+        if (pruner == 0) continue;
+
+        uint64_t pool = 0;
+        if (prunerType == 1) {
+            pool = pruner + offset.AABBPrunerPool;
+        } else if (prunerType == 0) {
+            pool = pruner + offset.BucketPrunerPool;
+        } else {
+            continue;
+        }
+
+        const uint32_t objectCount = GetDriverManager().read<uint32_t>(pool + offset.PruningPoolNbObjects);
+        if (objectCount == 0 || objectCount > kMaxPrunerObjects) continue;
+
+        // 限制本次读取数量，避免超出预算
+        const uint32_t remainingBudget = readLimit - static_cast<uint32_t>(gPrunerCache.payloads.size());
+        const uint32_t readCount = std::min(objectCount, remainingBudget);
+        if (readCount == 0) break;
+
+        const uint64_t objectsAddr = GetDriverManager().read<uint64_t>(pool + offset.PruningPoolObjects);
+        const uint64_t boundsAddr = GetDriverManager().read<uint64_t>(pool + offset.PruningPoolWorldBoxes);
+        if (objectsAddr == 0 || boundsAddr == 0) continue;
+
+        const size_t oldPayloadSize = gPrunerCache.payloads.size();
+        const size_t oldBoundsSize = gPrunerCache.bounds.size();
+        gPrunerCache.payloads.resize(oldPayloadSize + readCount);
+        gPrunerCache.bounds.resize(oldBoundsSize + readCount);
+        if (!ReadRemoteBufferRobust(objectsAddr, gPrunerCache.payloads.data() + oldPayloadSize,
+                                    readCount * sizeof(PhysXPrunerPayload))) {
+            gPrunerCache.payloads.resize(oldPayloadSize);
+            gPrunerCache.bounds.resize(oldBoundsSize);
+            continue;
+        }
+        if (!ReadRemoteBufferRobust(boundsAddr, gPrunerCache.bounds.data() + oldBoundsSize,
+                                    readCount * sizeof(PhysXBounds3))) {
+            gPrunerCache.payloads.resize(oldPayloadSize);
+            gPrunerCache.bounds.resize(oldBoundsSize);
+            continue;
+        }
     }
-    if (!ReadRemoteBufferRobust(boundsAddr, gPrunerCache.bounds.data(),
-                                objectCount * sizeof(PhysXBounds3))) {
+
+    const uint32_t objectCount = static_cast<uint32_t>(gPrunerCache.payloads.size());
+    if (objectCount == 0 || objectCount != gPrunerCache.bounds.size()) {
+        gPrunerCache.payloads.clear();
+        gPrunerCache.bounds.clear();
         return false;
     }
 
@@ -5961,7 +6507,7 @@ static bool EnsureVisibilityOccludersCached(const Vec3& cameraWorldPos) {
         if (distSq > maxDistanceSq) continue;
 
         const uint64_t geometryAddr = payload.Shape + offset.ScbShapeCoreGeometry;
-        const uint32_t geometryType = Paradise_hook->read<uint32_t>(geometryAddr);
+        const uint32_t geometryType = GetDriverManager().read<uint32_t>(geometryAddr);
         if (geometryType != PX_GEOM_TRIANGLEMESH && geometryType != PX_GEOM_HEIGHTFIELD) continue;
 
         PxTransformData actorPose{}, shapePose{};
@@ -5969,16 +6515,16 @@ static bool EnsureVisibilityOccludersCached(const Vec3& cameraWorldPos) {
         if (!ReadScbShapeLocalPose(payload.Shape, shapePose)) continue;
         const PxTransformData worldPose = ComposeTransforms(actorPose, shapePose);
         if (geometryType == PX_GEOM_TRIANGLEMESH) {
-            const uint64_t mesh = Paradise_hook->read<uint64_t>(geometryAddr + offset.PxTriangleMeshGeometryTriangleMesh);
+            const uint64_t mesh = GetDriverManager().read<uint64_t>(geometryAddr + offset.PxTriangleMeshGeometryTriangleMesh);
             PxMeshScaleData meshScale{};
             ReadMeshScale(geometryAddr + offset.PxTriangleMeshGeometryScale, meshScale);
             append_occluder(&gPrunerCache.inflatedBounds[i], worldPose, geometryAddr, geometryType, mesh,
                             &meshScale, 1.0f, 1.0f, 1.0f);
         } else if (geometryType == PX_GEOM_HEIGHTFIELD) {
-            const uint64_t heightField = Paradise_hook->read<uint64_t>(geometryAddr + offset.PxHeightFieldGeometryHeightField);
-            const float heightScale = Paradise_hook->read<float>(geometryAddr + offset.PxHeightFieldGeometryHeightScale);
-            const float rowScale = Paradise_hook->read<float>(geometryAddr + offset.PxHeightFieldGeometryRowScale);
-            const float columnScale = Paradise_hook->read<float>(geometryAddr + offset.PxHeightFieldGeometryColumnScale);
+            const uint64_t heightField = GetDriverManager().read<uint64_t>(geometryAddr + offset.PxHeightFieldGeometryHeightField);
+            const float heightScale = GetDriverManager().read<float>(geometryAddr + offset.PxHeightFieldGeometryHeightScale);
+            const float rowScale = GetDriverManager().read<float>(geometryAddr + offset.PxHeightFieldGeometryRowScale);
+            const float columnScale = GetDriverManager().read<float>(geometryAddr + offset.PxHeightFieldGeometryColumnScale);
             append_occluder(&gPrunerCache.inflatedBounds[i], worldPose, geometryAddr, geometryType, heightField,
                             nullptr, heightScale, rowScale, columnScale);
         }
@@ -5986,67 +6532,63 @@ static bool EnsureVisibilityOccludersCached(const Vec3& cameraWorldPos) {
 
     // 也从 PxScene actor 列表补充遮挡体。
     // 有些可绘制 mesh 不在 pruner 静态池里，之前因此完全不会参与可视性检测。
-    if (Paradise_hook && address.libUE4 != 0) {
-        const uint64_t uworld = Paradise_hook->read<uint64_t>(address.libUE4 + offset.Gworld);
+    if (address.libUE4 != 0) {
+        const uint64_t uworld = GetDriverManager().read<uint64_t>(address.libUE4 + offset.Gworld);
         const uint64_t pxScene = GetSyncPxScene(address.libUE4, uworld);
-        const uint64_t actorArray = pxScene ? Paradise_hook->read<uint64_t>(pxScene + offset.PxSceneActors) : 0;
-        const uint32_t actorCount = pxScene ? Paradise_hook->read<uint32_t>(pxScene + offset.PxSceneActorCount) : 0;
-        if (actorArray != 0 && actorCount > 0 && actorCount <= 100000) {
-            std::vector<uint64_t> actors(actorCount);
-            if (ReadRemoteBufferRobust(actorArray, actors.data(), actorCount * sizeof(uint64_t))) {
+        std::vector<uint64_t> actors;
+        if (pxScene != 0 && CollectPxSceneActorPointers(pxScene, actors)) {
                 for (uint64_t actor : actors) {
                     if (actor == 0) continue;
-                    const uint16_t actorType = Paradise_hook->read<uint16_t>(actor + offset.PxActorType);
+                    const uint16_t actorType = GetDriverManager().read<uint16_t>(actor + offset.PxActorType);
                     if (actorType != PX_ACTOR_RIGID_DYNAMIC && actorType != PX_ACTOR_RIGID_STATIC) continue;
 
                     PxTransformData actorPose{};
                     if (!ReadActorGlobalPose(actor, actorType, actorPose)) continue;
 
-                    const uint16_t shapeCount = Paradise_hook->read<uint16_t>(actor + offset.PxActorShapeCount);
+                    const uint16_t shapeCount = GetDriverManager().read<uint16_t>(actor + offset.PxActorShapeCount);
                     if (shapeCount == 0 || shapeCount > 64) continue;
 
                     std::vector<uint64_t> shapes(std::min<uint16_t>(shapeCount, 64));
                     if (shapeCount == 1) {
-                        shapes[0] = Paradise_hook->read<uint64_t>(actor + offset.PxActorShapes);
+                        shapes[0] = GetDriverManager().read<uint64_t>(actor + offset.PxActorShapes);
                     } else {
-                        const uint64_t shapePtrArray = Paradise_hook->read<uint64_t>(actor + offset.PxActorShapes);
+                        const uint64_t shapePtrArray = GetDriverManager().read<uint64_t>(actor + offset.PxActorShapes);
                         if (shapePtrArray == 0) continue;
                         if (!ReadRemoteBufferRobust(shapePtrArray, shapes.data(), shapes.size() * sizeof(uint64_t))) continue;
                     }
 
                     for (uint64_t shape : shapes) {
                         if (shape == 0) continue;
-                        const uint32_t npShapeFlags = Paradise_hook->read<uint32_t>(shape + offset.PxShapeFlags);
+                        const uint32_t npShapeFlags = GetDriverManager().read<uint32_t>(shape + offset.PxShapeFlags);
                         PxTransformData shapePose{};
                         if (!ReadShapeLocalPose(shape, npShapeFlags, shapePose)) continue;
                         const PxTransformData worldPose = ComposeTransforms(actorPose, shapePose);
 
                         uint64_t geometryAddr = shape + offset.PxShapeGeometryInline;
                         if ((npShapeFlags & 0x1u) != 0) {
-                            const uint64_t corePtr = Paradise_hook->read<uint64_t>(shape + offset.PxShapeCorePtr);
+                            const uint64_t corePtr = GetDriverManager().read<uint64_t>(shape + offset.PxShapeCorePtr);
                             if (corePtr == 0) continue;
                             geometryAddr = corePtr + offset.PxShapeCoreGeometry;
                         }
-                        const uint32_t geometryType = Paradise_hook->read<uint32_t>(geometryAddr);
+                        const uint32_t geometryType = GetDriverManager().read<uint32_t>(geometryAddr);
                         if (geometryType != PX_GEOM_TRIANGLEMESH && geometryType != PX_GEOM_HEIGHTFIELD) continue;
 
                         if (geometryType == PX_GEOM_TRIANGLEMESH) {
-                            const uint64_t mesh = Paradise_hook->read<uint64_t>(geometryAddr + offset.PxTriangleMeshGeometryTriangleMesh);
+                            const uint64_t mesh = GetDriverManager().read<uint64_t>(geometryAddr + offset.PxTriangleMeshGeometryTriangleMesh);
                             PxMeshScaleData meshScale{};
                             ReadMeshScale(geometryAddr + offset.PxTriangleMeshGeometryScale, meshScale);
                             append_occluder(nullptr, worldPose, geometryAddr, geometryType, mesh,
                                             &meshScale, 1.0f, 1.0f, 1.0f);
                         } else {
-                            const uint64_t heightField = Paradise_hook->read<uint64_t>(geometryAddr + offset.PxHeightFieldGeometryHeightField);
-                            const float heightScale = Paradise_hook->read<float>(geometryAddr + offset.PxHeightFieldGeometryHeightScale);
-                            const float rowScale = Paradise_hook->read<float>(geometryAddr + offset.PxHeightFieldGeometryRowScale);
-                            const float columnScale = Paradise_hook->read<float>(geometryAddr + offset.PxHeightFieldGeometryColumnScale);
+                            const uint64_t heightField = GetDriverManager().read<uint64_t>(geometryAddr + offset.PxHeightFieldGeometryHeightField);
+                            const float heightScale = GetDriverManager().read<float>(geometryAddr + offset.PxHeightFieldGeometryHeightScale);
+                            const float rowScale = GetDriverManager().read<float>(geometryAddr + offset.PxHeightFieldGeometryRowScale);
+                            const float columnScale = GetDriverManager().read<float>(geometryAddr + offset.PxHeightFieldGeometryColumnScale);
                             append_occluder(nullptr, worldPose, geometryAddr, geometryType, heightField,
                                             nullptr, heightScale, rowScale, columnScale);
                         }
                     }
                 }
-            }
         }
     }
 
@@ -6066,7 +6608,7 @@ static bool EnsureVisibilityOccludersCached(const Vec3& cameraWorldPos) {
         constexpr size_t kMaxTrianglesForPreScale = 4096;
         for (VisibilityOccluder& occ : gVisibilityOccluderCache.Items) {
             if (occ.GeometryType != PX_GEOM_TRIANGLEMESH) continue;
-            const uint64_t meshAddr = Paradise_hook->read<uint64_t>(occ.GeometryAddr + offset.PxTriangleMeshGeometryTriangleMesh);
+            const uint64_t meshAddr = GetDriverManager().read<uint64_t>(occ.GeometryAddr + offset.PxTriangleMeshGeometryTriangleMesh);
             if (meshAddr == 0) continue;
 
             PxMeshScaleData meshScale{};
@@ -6217,19 +6759,19 @@ static void AppendGpuSceneTriangle(std::vector<GpuSceneTriangle>& triangles,
 
 static bool AppendTriangleMeshSceneTriangles(uint64_t geometryAddr, const PxTransformData& worldPose,
                                              std::vector<GpuSceneTriangle>& triangles, size_t maxTriangles) {
-    const uint64_t mesh = Paradise_hook->read<uint64_t>(geometryAddr + offset.PxTriangleMeshGeometryTriangleMesh);
+    const uint64_t mesh = GetDriverManager().read<uint64_t>(geometryAddr + offset.PxTriangleMeshGeometryTriangleMesh);
     if (mesh == 0) return false;
     PxMeshScaleData scale{};
     if (!ReadMeshScale(geometryAddr + offset.PxTriangleMeshGeometryScale, scale)) return false;
 
-    const uint32_t vertexCount = Paradise_hook->read<uint32_t>(mesh + offset.PxTriangleMeshVertexCount);
-    const uint32_t triangleCount = Paradise_hook->read<uint32_t>(mesh + offset.PxTriangleMeshTriangleCount);
-    const uint64_t verticesAddr = Paradise_hook->read<uint64_t>(mesh + offset.PxTriangleMeshVertices);
-    const uint64_t trianglesAddr = Paradise_hook->read<uint64_t>(mesh + offset.PxTriangleMeshTriangles);
+    const uint32_t vertexCount = GetDriverManager().read<uint32_t>(mesh + offset.PxTriangleMeshVertexCount);
+    const uint32_t triangleCount = GetDriverManager().read<uint32_t>(mesh + offset.PxTriangleMeshTriangleCount);
+    const uint64_t verticesAddr = GetDriverManager().read<uint64_t>(mesh + offset.PxTriangleMeshVertices);
+    const uint64_t trianglesAddr = GetDriverManager().read<uint64_t>(mesh + offset.PxTriangleMeshTriangles);
     if (vertexCount == 0 || triangleCount == 0 || verticesAddr == 0 || trianglesAddr == 0) return false;
 
     CachedTriangleMeshData cache;
-    const uint8_t flags = Paradise_hook->read<uint8_t>(mesh + offset.PxTriangleMeshFlags);
+    const uint8_t flags = GetDriverManager().read<uint8_t>(mesh + offset.PxTriangleMeshFlags);
     if (!GetCachedTriangleMesh(mesh, vertexCount, triangleCount, flags, verticesAddr, trianglesAddr, cache)) return false;
 
     const size_t limit = std::min(static_cast<size_t>(cache.Indices.size() / 3ULL), static_cast<size_t>(triangleCount));
@@ -6249,11 +6791,11 @@ static bool AppendTriangleMeshSceneTriangles(uint64_t geometryAddr, const PxTran
 
 static bool AppendHeightFieldSceneTriangles(uint64_t geometryAddr, const PxTransformData& worldPose,
                                             std::vector<GpuSceneTriangle>& triangles, size_t maxTriangles) {
-    const uint64_t heightField = Paradise_hook->read<uint64_t>(geometryAddr + offset.PxHeightFieldGeometryHeightField);
+    const uint64_t heightField = GetDriverManager().read<uint64_t>(geometryAddr + offset.PxHeightFieldGeometryHeightField);
     if (heightField == 0) return false;
-    const float heightScale = Paradise_hook->read<float>(geometryAddr + offset.PxHeightFieldGeometryHeightScale);
-    const float rowScale = Paradise_hook->read<float>(geometryAddr + offset.PxHeightFieldGeometryRowScale);
-    const float columnScale = Paradise_hook->read<float>(geometryAddr + offset.PxHeightFieldGeometryColumnScale);
+    const float heightScale = GetDriverManager().read<float>(geometryAddr + offset.PxHeightFieldGeometryHeightScale);
+    const float rowScale = GetDriverManager().read<float>(geometryAddr + offset.PxHeightFieldGeometryRowScale);
+    const float columnScale = GetDriverManager().read<float>(geometryAddr + offset.PxHeightFieldGeometryColumnScale);
     if (std::fabs(heightScale) <= 1e-6f || std::fabs(rowScale) <= 1e-6f || std::fabs(columnScale) <= 1e-6f) return false;
 
     CachedHeightFieldData cache;
@@ -6307,7 +6849,7 @@ static bool EnsureGpuSceneTriangles(const Vec3& cameraWorldPos) {
         if (!ReadScbShapeLocalPose(payload.Shape, shapePose)) continue;
         const PxTransformData worldPose = ComposeTransforms(actorPose, shapePose);
         const uint64_t geometryAddr = payload.Shape + offset.ScbShapeCoreGeometry;
-        const uint32_t geometryType = Paradise_hook->read<uint32_t>(geometryAddr);
+        const uint32_t geometryType = GetDriverManager().read<uint32_t>(geometryAddr);
         if (geometryType == PX_GEOM_TRIANGLEMESH) {
             AppendTriangleMeshSceneTriangles(geometryAddr, worldPose, gGpuSceneCache.Triangles, kMaxSceneTriangles);
         } else if (geometryType == PX_GEOM_HEIGHTFIELD) {
@@ -6493,7 +7035,13 @@ static bool RunGpuDepthBufferVisibility(const Vec3& cameraWorldPos,
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &gGpuDepthRaster.CommandBuffer;
     if (vkQueueSubmit(gGpuDepthRaster.Queue, 1, &submitInfo, gGpuDepthRaster.Fence) != VK_SUCCESS) return false;
-    if (vkWaitForFences(gApp.device, 1, &gGpuDepthRaster.Fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return false;
+    // 使用短超时避免阻塞绘制线程
+    constexpr uint64_t kGpuTimeoutNs = 8'000'000; // 8ms
+    VkResult waitResult = vkWaitForFences(gApp.device, 1, &gGpuDepthRaster.Fence, VK_TRUE, kGpuTimeoutNs);
+    if (waitResult == VK_TIMEOUT) {
+        return false; // GPU 超时，跳过本帧可见性检测
+    }
+    if (waitResult != VK_SUCCESS) return false;
 
     // 读回结果
     std::vector<uint32_t> results(queries.size(), 1u);
@@ -6593,22 +7141,36 @@ static void BatchBoneVisibilityCheck(const Vec3& cameraWorldPos,
     if (count <= 0) return;
     if (cameraWorldPos.X == 0.0f && cameraWorldPos.Y == 0.0f && cameraWorldPos.Z == 0.0f) return;
     if (!gUseDepthBufferVisibility) return;
-    RefreshVisibilityScenes(cameraWorldPos, false);
+
+    if (!gVisibilityRefreshInProgress.load(std::memory_order_acquire)) {
+        gVisibilityRefreshInProgress.store(true, std::memory_order_relaxed);
+        Vec3 camPos = cameraWorldPos;
+        std::thread([camPos]() {
+            RefreshVisibilityScenes(camPos, false);
+            gVisibilityRefreshInProgress.store(false, std::memory_order_release);
+        }).detach();
+    }
+
+    // 一次性获取三个 scene 的 snapshot，避免每条射线重复加锁 + 原子引用计数
+    auto staticSnap = gStaticVisibilityScene.Scene.AcquireSnapshot();
+    auto hfSnap     = gHeightFieldVisibilityScene.Scene.AcquireSnapshot();
+    auto dynamicSnap = gDynamicVisibilityScene.Scene.AcquireSnapshot();
 
     for (int i = 0; i < count; ++i) {
         if (!boneHasData[i]) continue;
         const VisibilityRaycastQuery query = VisibilityScene::BuildRaycastQuery(cameraWorldPos, boneWorldPos[i]);
         if (!query.Valid) continue;
 
-        if (gStaticVisibilityScene.Scene.Raycast(query).Hit) {
+        // any-hit: 首次命中立即标记遮挡，跳过剩余 scene
+        if (gStaticVisibilityScene.Scene.RaycastAnyWithSnapshot(query, staticSnap)) {
             boneVisible[i] = false;
             continue;
         }
-        if (gHeightFieldVisibilityScene.Scene.Raycast(query).Hit) {
+        if (gHeightFieldVisibilityScene.Scene.RaycastAnyWithSnapshot(query, hfSnap)) {
             boneVisible[i] = false;
             continue;
         }
-        if (gDynamicVisibilityScene.Scene.Raycast(query).Hit) {
+        if (gDynamicVisibilityScene.Scene.RaycastAnyWithSnapshot(query, dynamicSnap)) {
             boneVisible[i] = false;
         }
     }
@@ -6707,7 +7269,11 @@ static void DrawDepthBufferOverlay() {
 void ShutdownDrawObjects() {
     ResetGpuDepthRasterResources();
     ResetGpuDepthQueryResources();
-    gBoneScreenCache.clear();
+    {
+        std::lock_guard<std::mutex> lock(gBoneScreenCacheMutex);
+        gBoneScreenCache.clear();
+    }
+    gPredictedAimHoverTimes.clear();
     gBoneWorldCache.clear();
     gGpuSceneCache.Triangles.clear();
     gGpuSceneCache.Valid = false;
@@ -6719,12 +7285,16 @@ void ShutdownDrawObjects() {
     gTriangleMeshCache.clear();
     gConvexMeshCache.clear();
     gHeightFieldCache.clear();
+    gTriMeshCacheBySig.clear();
+    gHfCacheBySig.clear();
+    gAutoExportedSigs.clear();
     gTriangleMeshSignatures.clear();
     gHeightFieldSignatures.clear();
     gLocalTriObjCache.clear();
     gLocalHfObjCache.clear();
     gLocalTriBvhCache.clear();
     gLocalPhysXDrawCache.clear();
+    gPxSceneActorPointerCache.clear();
     gLocalTriMetaBySig.clear();
     gLocalHfMetaBySig.clear();
     gLocalExportMetaLoaded = false;

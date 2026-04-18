@@ -1,6 +1,6 @@
 #include "bullet_spread_monitor.h"
 
-#include "arm64_hwbp_debugger_compat.h"
+#include "HwBreakpointMgr4.h"
 #include "cpu_affinity.h"
 #include "driver_manager.h"
 #include "read_mem.h"
@@ -8,9 +8,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
-#include <fcntl.h>
-#include <poll.h>
-#include <sys/ioctl.h>
+#include <dirent.h>
 #include <thread>
 #include <unistd.h>
 #include <mutex>
@@ -25,115 +23,30 @@ constexpr uintptr_t kSpreadVecOffset = 0x26CULL;
 constexpr uintptr_t kDeviationOffset = 0x70CULL;
 constexpr uintptr_t kDeviationYawOffset = 0x710ULL;
 constexpr uintptr_t kDeviationPitchOffset = 0x714ULL;
-constexpr int kPollTimeoutMs = 250;
+constexpr int kSampleIntervalMs = 200;
 constexpr int kStartRetryDelayMs = 150;
+constexpr const char* kDefaultAuthKey = "dce3771681d4c7a143d5d06b7d32548e";
 
-class Arm64HwbpSession {
-public:
-    bool Start(int pid, uintptr_t addr, int& errorOut) {
-        Stop();
-
-        fd_ = open("/dev/arm64_hwbp_debugger", O_RDWR | O_CLOEXEC);
-        if (fd_ < 0) {
-            errorOut = errno;
-            return false;
-        }
-
-        arm64_hwbp_request req{};
-        req.pid = pid;
-        req.addr = static_cast<uint64_t>(addr);
-        if (ioctl(fd_, ARM64_HWBP_IOC_SET_BREAKPOINT, &req) == 0) {
-            errorOut = 0;
-            return true;
-        }
-
-        errorOut = errno;
-
-        close(fd_);
-        fd_ = -1;
-        return false;
+void GetProcessTasks(int pid, std::vector<int>& vOutput) {
+    char szTaskPath[256];
+    snprintf(szTaskPath, sizeof(szTaskPath), "/proc/%d/task", pid);
+    DIR* dir = opendir(szTaskPath);
+    if (!dir) return;
+    struct dirent* ptr;
+    while ((ptr = readdir(dir)) != nullptr) {
+        if (ptr->d_type != DT_DIR) continue;
+        if (ptr->d_name[0] == '.') continue;
+        if (strspn(ptr->d_name, "0123456789") != strlen(ptr->d_name)) continue;
+        vOutput.push_back(atoi(ptr->d_name));
     }
-
-    void Stop() {
-        if (fd_ >= 0) {
-            ioctl(fd_, ARM64_HWBP_IOC_CLEAR_BREAKPOINT);
-            close(fd_);
-            fd_ = -1;
-        }
-    }
-
-    bool IsOpen() const {
-        return fd_ >= 0;
-    }
-
-    bool WaitAndRead(arm64_hwbp_regs_snapshot& snapshot, int& errorOut) {
-        if (fd_ < 0) {
-            errorOut = ENODEV;
-            return false;
-        }
-
-        pollfd pfd{};
-        pfd.fd = fd_;
-        pfd.events = POLLIN | POLLRDNORM;
-
-        const int pollRet = poll(&pfd, 1, kPollTimeoutMs);
-        if (pollRet == 0) {
-            errorOut = 0;
-            return false;
-        }
-        if (pollRet < 0) {
-            errorOut = (errno == EINTR) ? 0 : errno;
-            return false;
-        }
-        if ((pfd.revents & (POLLERR | POLLNVAL)) != 0) {
-            errorOut = EIO;
-            return false;
-        }
-
-        if ((pfd.revents & (POLLIN | POLLRDNORM)) == 0) {
-            errorOut = 0;
-            return false;
-        }
-
-        ssize_t n = read(fd_, &snapshot, sizeof(snapshot));
-        if (n == static_cast<ssize_t>(sizeof(snapshot))) {
-            errorOut = 0;
-            return true;
-        }
-        if (n < 0 && errno == EAGAIN) {
-            errorOut = 0;
-            return false;
-        }
-
-        errorOut = (n < 0) ? errno : EIO;
-        return false;
-    }
-
-    bool GetStatus(arm64_hwbp_status& status, int& errorOut) {
-        if (fd_ < 0) {
-            errorOut = ENODEV;
-            return false;
-        }
-
-        if (ioctl(fd_, ARM64_HWBP_IOC_GET_STATUS, &status) == 0) {
-            errorOut = 0;
-            return true;
-        }
-
-        errorOut = errno;
-        return false;
-    }
-
-private:
-    int fd_ = -1;
-};
+    closedir(dir);
+}
 
 std::mutex gBulletSpreadStateMutex;
 BulletSpreadDebugState gBulletSpreadState;
 std::thread gBulletSpreadThread;
 std::atomic<bool> gBulletSpreadThreadRunning{false};
 std::atomic<bool> gBulletSpreadEnabled{false};
-std::atomic<bool> gBulletSpreadStatusRequest{false};
 std::mutex gBulletSpreadConfigMutex;
 int gBulletSpreadPid = 0;
 uint64_t gBulletSpreadLibUE4 = 0;
@@ -165,40 +78,16 @@ void UpdateStateFlags(bool threadRunning, bool sessionOpen, bool breakpointArmed
     gBulletSpreadState.threadRunning = threadRunning;
     gBulletSpreadState.sessionOpen = sessionOpen;
     gBulletSpreadState.breakpointArmed = breakpointArmed;
-    if (!sessionOpen) {
-        gBulletSpreadState.statusValid = false;
-        gBulletSpreadState.driverStatusAddr = 0;
-        gBulletSpreadState.driverStatusHitCount = 0;
-        gBulletSpreadState.driverStatusThreadCount = 0;
-        gBulletSpreadState.driverStatusFlags = 0;
-    }
 }
 
 void UpdateStateError(int errorCode) {
     std::lock_guard<std::mutex> lock(gBulletSpreadStateMutex);
-    if (errorCode == EAGAIN) {
-        gBulletSpreadState.lastError = 0;
-        return;
-    }
     gBulletSpreadState.lastError = errorCode;
 }
 
-void UpdateStateDriverStatus(const arm64_hwbp_status& status, int errorCode) {
-    std::lock_guard<std::mutex> lock(gBulletSpreadStateMutex);
-    gBulletSpreadState.lastStatusMonotonicMs = GetMonotonicMs();
-    gBulletSpreadState.lastStatusError = errorCode;
-    gBulletSpreadState.statusValid = (errorCode == 0);
-    if (errorCode != 0) {
-        return;
-    }
-
-    gBulletSpreadState.driverStatusAddr = static_cast<uintptr_t>(status.addr);
-    gBulletSpreadState.driverStatusHitCount = status.hit_count;
-    gBulletSpreadState.driverStatusThreadCount = status.thread_count;
-    gBulletSpreadState.driverStatusFlags = status.flags;
-}
-
-void UpdateStateHit(const arm64_hwbp_regs_snapshot& snap,
+void UpdateStateHit(const HW_HIT_ITEM& hitItem,
+                    uintptr_t breakpointAddr,
+                    uint64_t hitTotalCount,
                     uintptr_t thisPtr,
                     const Vec3& spread,
                     float deviation,
@@ -207,12 +96,12 @@ void UpdateStateHit(const arm64_hwbp_regs_snapshot& snap,
                     bool valid) {
     std::lock_guard<std::mutex> lock(gBulletSpreadStateMutex);
     gBulletSpreadState.valid = valid;
-    gBulletSpreadState.pid = snap.tgid;
-    gBulletSpreadState.tid = snap.tid;
-    gBulletSpreadState.hitCount = snap.hit_count;
+    gBulletSpreadState.tid = static_cast<int>(hitItem.task_id);
+    gBulletSpreadState.hitCount++;
+    gBulletSpreadState.hitTotalCount = hitTotalCount;
     gBulletSpreadState.lastHitMonotonicMs = GetMonotonicMs();
-    gBulletSpreadState.breakpointAddr = static_cast<uintptr_t>(snap.bp_addr);
-    gBulletSpreadState.pc = static_cast<uintptr_t>(snap.pc);
+    gBulletSpreadState.breakpointAddr = breakpointAddr;
+    gBulletSpreadState.pc = static_cast<uintptr_t>(hitItem.regs_info.pc);
     gBulletSpreadState.thisPtr = thisPtr;
     gBulletSpreadState.spread = spread;
     gBulletSpreadState.deviation = deviation;
@@ -226,23 +115,23 @@ bool ReadSpreadState(uintptr_t thisPtr,
                      float& deviation,
                      float& deviationYaw,
                      float& deviationPitch) {
-    if (!Paradise_hook || thisPtr < 0x10000ULL) {
+    if (thisPtr < 0x10000ULL) {
         return false;
     }
 
-    if (!Paradise_hook->read(thisPtr + kSpreadVecOffset, &spread, sizeof(spread))) {
+    if (!GetDriverManager().read(thisPtr + kSpreadVecOffset, &spread, sizeof(spread))) {
         return false;
     }
 
-    if (!Paradise_hook->read(thisPtr + kDeviationOffset, &deviation, sizeof(deviation))) {
+    if (!GetDriverManager().read(thisPtr + kDeviationOffset, &deviation, sizeof(deviation))) {
         return false;
     }
 
-    if (!Paradise_hook->read(thisPtr + kDeviationYawOffset, &deviationYaw, sizeof(deviationYaw))) {
+    if (!GetDriverManager().read(thisPtr + kDeviationYawOffset, &deviationYaw, sizeof(deviationYaw))) {
         return false;
     }
 
-    if (!Paradise_hook->read(thisPtr + kDeviationPitchOffset, &deviationPitch, sizeof(deviationPitch))) {
+    if (!GetDriverManager().read(thisPtr + kDeviationPitchOffset, &deviationPitch, sizeof(deviationPitch))) {
         return false;
     }
 
@@ -276,78 +165,118 @@ void BulletSpreadThreadMain() {
         return;
     }
 
-    Arm64HwbpSession session;
-    int sessionError = 0;
-    const uintptr_t breakpointAddr = libUE4Base + ResolveBreakpointOffset(target);
-    if (!session.Start(pid, breakpointAddr, sessionError)) {
-        while (gBulletSpreadThreadRunning.load(std::memory_order_acquire)) {
-            UpdateStateFlags(true, false, false);
-            UpdateStateError(sessionError);
-            if (sessionError != EAGAIN && sessionError != EBUSY) {
-                gBulletSpreadThreadRunning.store(false, std::memory_order_release);
-                UpdateStateFlags(false, false, false);
-                return;
-            }
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(kStartRetryDelayMs));
-            if (session.Start(pid, breakpointAddr, sessionError)) {
-                break;
-            }
-        }
-
-        if (!gBulletSpreadThreadRunning.load(std::memory_order_acquire)) {
-            UpdateStateFlags(false, false, false);
-            return;
-        }
+    // 连接 CHwBreakpointMgr 驱动
+    CHwBreakpointMgr driver;
+    int connectErr = driver.ConnectDriver(kDefaultAuthKey);
+    if (connectErr < 0) {
+        UpdateStateError(-connectErr);
+        UpdateStateFlags(false, false, false);
+        return;
     }
 
-    UpdateStateFlags(true, true, true);
-    gBulletSpreadStatusRequest.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(gBulletSpreadStateMutex);
+        gBulletSpreadState.driverConnected = true;
+        gBulletSpreadState.sessionOpen = true;
+    }
 
+    const uintptr_t breakpointAddr = libUE4Base + ResolveBreakpointOffset(target);
+
+    // 持续监控循环：对所有线程安装断点 → wait → suspend → read → uninstall → repeat
     while (gBulletSpreadThreadRunning.load(std::memory_order_acquire)) {
-        if (gBulletSpreadStatusRequest.exchange(false, std::memory_order_acq_rel)) {
-            arm64_hwbp_status status{};
-            int statusError = 0;
-            if (session.GetStatus(status, statusError)) {
-                UpdateStateDriverStatus(status, 0);
-            } else {
-                UpdateStateDriverStatus(status, statusError);
-            }
-        }
-
-        arm64_hwbp_regs_snapshot snap{};
-        int waitError = 0;
-        const bool hasSnapshot = session.WaitAndRead(snap, waitError);
-        if (!gBulletSpreadThreadRunning.load(std::memory_order_acquire)) {
-            break;
-        }
-
-        if (!hasSnapshot) {
-            if (waitError != 0) {
-                UpdateStateError(waitError);
-            }
+        // 枚举目标进程的所有 task（线程）
+        std::vector<int> vTask;
+        GetProcessTasks(pid, vTask);
+        if (vTask.empty()) {
+            UpdateStateError(ESRCH);
+            std::this_thread::sleep_for(std::chrono::milliseconds(kStartRetryDelayMs));
             continue;
         }
 
-        uintptr_t thisPtr = static_cast<uintptr_t>(snap.regs[0]);
-        if (target == BulletBreakpointTarget::BulletSpreadFuncEntry && thisPtr < 0x10000ULL) {
-            thisPtr = static_cast<uintptr_t>(snap.regs[19]);
+        // 对每个线程安装硬件断点
+        std::vector<uint64_t> vHwBpHandle;
+        for (int taskId : vTask) {
+            uint64_t hProcess = driver.OpenProcess(static_cast<uint64_t>(taskId));
+            if (!hProcess) continue;
+
+            uint64_t hwbpHandle = driver.InstProcessHwBp(
+                hProcess, breakpointAddr, HW_BREAKPOINT_LEN_4, HW_BREAKPOINT_X);
+            if (hwbpHandle) {
+                vHwBpHandle.push_back(hwbpHandle);
+            }
+            driver.CloseHandle(hProcess);
         }
-        Vec3 spread = Vec3::Zero();
-        float deviation = 0.0f;
-        float deviationYaw = 0.0f;
-        float deviationPitch = 0.0f;
-        bool valid = static_cast<uintptr_t>(snap.pc) == breakpointAddr;
-        if (valid && target == BulletBreakpointTarget::BulletSpreadFuncEntry) {
-            valid = ReadSpreadState(thisPtr, spread, deviation, deviationYaw, deviationPitch);
+
+        if (vHwBpHandle.empty()) {
+            UpdateStateError(ENODEV);
+            UpdateStateFlags(true, true, false);
+            std::this_thread::sleep_for(std::chrono::milliseconds(kStartRetryDelayMs));
+            continue;
         }
-        UpdateStateHit(snap, thisPtr, spread, deviation, deviationYaw, deviationPitch, valid);
-        gBulletSpreadStatusRequest.store(true, std::memory_order_release);
+
+        UpdateStateFlags(true, true, true);
+
+        // 等待采样间隔
+        std::this_thread::sleep_for(std::chrono::milliseconds(kSampleIntervalMs));
+
+        if (!gBulletSpreadThreadRunning.load(std::memory_order_acquire)) {
+            for (uint64_t h : vHwBpHandle) driver.UninstProcessHwBp(h);
+            break;
+        }
+
+        // 暂停所有断点
+        for (uint64_t h : vHwBpHandle) {
+            driver.SuspendProcessHwBp(h);
+        }
+
+        // 读取所有断点的命中信息，取最后一个命中项
+        HW_HIT_ITEM bestHit{};
+        uint64_t bestHitTotal = 0;
+        bool hasHit = false;
+
+        for (uint64_t h : vHwBpHandle) {
+            uint64_t hitTotalCount = 0;
+            std::vector<HW_HIT_ITEM> hitItems;
+            BOOL readOk = driver.ReadHwBpInfo(h, hitTotalCount, hitItems);
+            if (readOk && !hitItems.empty()) {
+                bestHit = hitItems.back();
+                bestHitTotal += hitTotalCount;
+                hasHit = true;
+            }
+        }
+
+        // 卸载所有断点
+        for (uint64_t h : vHwBpHandle) {
+            driver.UninstProcessHwBp(h);
+        }
+
+        if (hasHit) {
+            uintptr_t thisPtr = static_cast<uintptr_t>(bestHit.regs_info.regs[0]);
+            if (target == BulletBreakpointTarget::BulletSpreadFuncEntry && thisPtr < 0x10000ULL) {
+                thisPtr = static_cast<uintptr_t>(bestHit.regs_info.regs[19]);
+            }
+
+            Vec3 spread = Vec3::Zero();
+            float deviation = 0.0f;
+            float deviationYaw = 0.0f;
+            float deviationPitch = 0.0f;
+            bool valid = static_cast<uintptr_t>(bestHit.regs_info.pc) == breakpointAddr
+                      || static_cast<uintptr_t>(bestHit.hit_addr) == breakpointAddr;
+            if (valid && target == BulletBreakpointTarget::BulletSpreadFuncEntry) {
+                valid = ReadSpreadState(thisPtr, spread, deviation, deviationYaw, deviationPitch);
+            }
+            UpdateStateHit(bestHit, breakpointAddr, bestHitTotal,
+                           thisPtr, spread, deviation, deviationYaw, deviationPitch, valid);
+        }
     }
 
-    session.Stop();
+    driver.DisconnectDriver();
     gBulletSpreadThreadRunning.store(false, std::memory_order_release);
     UpdateStateFlags(false, false, false);
+    {
+        std::lock_guard<std::mutex> lock(gBulletSpreadStateMutex);
+        gBulletSpreadState.driverConnected = false;
+    }
 }
 
 void StartBulletSpreadThreadIfNeeded() {
@@ -460,10 +389,6 @@ void SetBulletBreakpointTarget(BulletBreakpointTarget target) {
 BulletSpreadDebugState GetBulletSpreadDebugState() {
     std::lock_guard<std::mutex> lock(gBulletSpreadStateMutex);
     return gBulletSpreadState;
-}
-
-void RequestBulletSpreadDriverStatus() {
-    gBulletSpreadStatusRequest.store(true, std::memory_order_release);
 }
 
 void ShutdownBulletSpreadMonitor() {

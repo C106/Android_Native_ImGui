@@ -55,7 +55,7 @@ static void ResetExportedMesh(ExportedBVHMesh& outMesh) {
 }
 
 static bool ReadArray(uint64_t addr, void* dst, size_t size) {
-    return addr != 0 && dst != nullptr && size != 0 && Paradise_hook->read(addr, dst, size);
+    return addr != 0 && dst != nullptr && size != 0 && GetDriverManager().read(addr, dst, size);
 }
 
 bool ExportBVHMeshFromMemory(uint64_t pxTriangleMeshAddr, ExportedBVHMesh& outMesh) {
@@ -65,8 +65,8 @@ bool ExportBVHMeshFromMemory(uint64_t pxTriangleMeshAddr, ExportedBVHMesh& outMe
     if (pxTriangleMeshAddr == 0) return false;
 
     // 读取顶点和三角形数量
-    uint32_t nbVertices = Paradise_hook->read<uint32_t>(pxTriangleMeshAddr + PxTriangleMeshOffsets::mNbVertices);
-    uint32_t nbTriangles = Paradise_hook->read<uint32_t>(pxTriangleMeshAddr + PxTriangleMeshOffsets::mNbTriangles);
+    uint32_t nbVertices = GetDriverManager().read<uint32_t>(pxTriangleMeshAddr + PxTriangleMeshOffsets::mNbVertices);
+    uint32_t nbTriangles = GetDriverManager().read<uint32_t>(pxTriangleMeshAddr + PxTriangleMeshOffsets::mNbTriangles);
     outMesh.vertexCount = nbVertices;
     outMesh.triangleCount = nbTriangles;
 
@@ -75,37 +75,37 @@ bool ExportBVHMeshFromMemory(uint64_t pxTriangleMeshAddr, ExportedBVHMesh& outMe
     }
 
     // 读取顶点数组指针
-    uint64_t verticesPtr = Paradise_hook->read<uint64_t>(pxTriangleMeshAddr + PxTriangleMeshOffsets::mVertices);
+    uint64_t verticesPtr = GetDriverManager().read<uint64_t>(pxTriangleMeshAddr + PxTriangleMeshOffsets::mVertices);
     if (verticesPtr == 0) return false;
 
     // 读取顶点数据
     outMesh.vertices.resize(nbVertices);
     for (uint32_t i = 0; i < nbVertices; ++i) {
-        float x = Paradise_hook->read<float>(verticesPtr + i * 12 + 0);
-        float y = Paradise_hook->read<float>(verticesPtr + i * 12 + 4);
-        float z = Paradise_hook->read<float>(verticesPtr + i * 12 + 8);
+        float x = GetDriverManager().read<float>(verticesPtr + i * 12 + 0);
+        float y = GetDriverManager().read<float>(verticesPtr + i * 12 + 4);
+        float z = GetDriverManager().read<float>(verticesPtr + i * 12 + 8);
         outMesh.vertices[i] = Vec3{x, y, z};
     }
 
     // 读取三角形索引
-    uint64_t trianglesPtr = Paradise_hook->read<uint64_t>(pxTriangleMeshAddr + PxTriangleMeshOffsets::mTriangles);
+    uint64_t trianglesPtr = GetDriverManager().read<uint64_t>(pxTriangleMeshAddr + PxTriangleMeshOffsets::mTriangles);
     if (trianglesPtr == 0) return false;
 
     outMesh.indices.resize(nbTriangles * 3);
 
     // 检测索引格式（16位或32位）
-    uint8_t flags = Paradise_hook->read<uint8_t>(pxTriangleMeshAddr + PxTriangleMeshOffsets::mFlags);
+    uint8_t flags = GetDriverManager().read<uint8_t>(pxTriangleMeshAddr + PxTriangleMeshOffsets::mFlags);
     const bool has16BitIndices = (flags & 0x2u) != 0;
     outMesh.meshFlags = flags;
     outMesh.uses16BitIndices = has16BitIndices;
 
     if (has16BitIndices) {
         for (uint32_t i = 0; i < nbTriangles * 3; ++i) {
-            outMesh.indices[i] = Paradise_hook->read<uint16_t>(trianglesPtr + i * 2);
+            outMesh.indices[i] = GetDriverManager().read<uint16_t>(trianglesPtr + i * 2);
         }
     } else {
         for (uint32_t i = 0; i < nbTriangles * 3; ++i) {
-            outMesh.indices[i] = Paradise_hook->read<uint32_t>(trianglesPtr + i * 4);
+            outMesh.indices[i] = GetDriverManager().read<uint32_t>(trianglesPtr + i * 4);
         }
     }
 
@@ -114,13 +114,13 @@ bool ExportBVHMeshFromMemory(uint64_t pxTriangleMeshAddr, ExportedBVHMesh& outMe
     ReadArray(rtreeAddr + RTreeOffsets::mBoundsMax, outMesh.rtree.boundsMax, sizeof(outMesh.rtree.boundsMax));
     ReadArray(rtreeAddr + RTreeOffsets::mInvDiagonal, outMesh.rtree.invDiagonal, sizeof(outMesh.rtree.invDiagonal));
     ReadArray(rtreeAddr + RTreeOffsets::mDiagonalScaler, outMesh.rtree.diagonalScaler, sizeof(outMesh.rtree.diagonalScaler));
-    outMesh.rtree.pageSize = Paradise_hook->read<uint32_t>(rtreeAddr + RTreeOffsets::mPageSize);
-    outMesh.rtree.numRootPages = Paradise_hook->read<uint32_t>(rtreeAddr + RTreeOffsets::mNumRootPages);
-    outMesh.rtree.numLevels = Paradise_hook->read<uint32_t>(rtreeAddr + RTreeOffsets::mNumLevels);
-    outMesh.rtree.totalNodes = Paradise_hook->read<uint32_t>(rtreeAddr + RTreeOffsets::mTotalNodes);
-    outMesh.rtree.totalPages = Paradise_hook->read<uint32_t>(rtreeAddr + RTreeOffsets::mTotalPages);
-    outMesh.rtree.flags = Paradise_hook->read<uint32_t>(rtreeAddr + RTreeOffsets::mFlags);
-    outMesh.rtree.pagesPtr = Paradise_hook->read<uint64_t>(rtreeAddr + RTreeOffsets::mPages);
+    outMesh.rtree.pageSize = GetDriverManager().read<uint32_t>(rtreeAddr + RTreeOffsets::mPageSize);
+    outMesh.rtree.numRootPages = GetDriverManager().read<uint32_t>(rtreeAddr + RTreeOffsets::mNumRootPages);
+    outMesh.rtree.numLevels = GetDriverManager().read<uint32_t>(rtreeAddr + RTreeOffsets::mNumLevels);
+    outMesh.rtree.totalNodes = GetDriverManager().read<uint32_t>(rtreeAddr + RTreeOffsets::mTotalNodes);
+    outMesh.rtree.totalPages = GetDriverManager().read<uint32_t>(rtreeAddr + RTreeOffsets::mTotalPages);
+    outMesh.rtree.flags = GetDriverManager().read<uint32_t>(rtreeAddr + RTreeOffsets::mFlags);
+    outMesh.rtree.pagesPtr = GetDriverManager().read<uint64_t>(rtreeAddr + RTreeOffsets::mPages);
 
     constexpr uint32_t kExpectedPageSize = 4;
     constexpr uint32_t kMaxExportPages = 1u << 16;

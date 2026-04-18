@@ -46,6 +46,11 @@ LOCAL_CFLAGS := -DFT2_BUILD_LIBRARY
 include $(BUILD_STATIC_LIBRARY)
 
 include $(CLEAR_VARS)
+LOCAL_MODULE := paradise_api
+LOCAL_SRC_FILES := libparadise_api.a
+include $(PREBUILT_STATIC_LIBRARY)
+
+include $(CLEAR_VARS)
 
 LOCAL_CPP_EXTENSION := .cpp .cc
 LOCAL_MODULE := Debugger
@@ -94,5 +99,5 @@ FILE_LIST += $(wildcard $(LOCAL_PATH)/src/*.c*)
 LOCAL_SRC_FILES := $(FILE_LIST:$(LOCAL_PATH)/%=%)
 
 LOCAL_LDLIBS := -lm -ldl -lz -llog -landroid -lvulkan
-LOCAL_STATIC_LIBRARIES := freetype
+LOCAL_STATIC_LIBRARIES := freetype paradise_api
 include $(BUILD_EXECUTABLE)

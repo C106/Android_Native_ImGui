@@ -434,19 +434,27 @@ inline Vec3 MatrixTransformPosition(const FMatrix& M, const Vec3& P)
 }
 
 struct Offsets{
-    uintptr_t Gworld = 0x14988578;
-    uintptr_t Gname = 0x146F9F30;
-    uintptr_t GUObject = 0x14706480;
+    uintptr_t Gworld = 0x15772758;
+    uintptr_t Gname = 0x154CE510;
+    uintptr_t GUObject = 0x154DAC80;
+    // FApp::DeltaTime (GOT 表，需要两次解引用)
+    uintptr_t FAppDeltaTimeGOT = 0x14CEDB78;  // libUE4 + offset -> ptr -> double*
+    uintptr_t GFrameCounterGOT = 0x14CF3DF0; //uint64 
+    uintptr_t CanvasMap = 0x1573BEE8;
     uintptr_t PersistentLevel = 0xB0;
     uintptr_t TArray = 0xA0;
     uintptr_t NetDriver = 0xb8;
-    uintptr_t PhysicsScene = 0xD88; //UWorld -> PhysicsScene (verified live via ceserver)
+    uintptr_t GameInstance = 0xb08; // UWorld -> OwningGameInstance (SDK.txt)
+    uintptr_t AssociatedFrontendHUD = 0x4b0; // UAEGameInstance -> AssociatedFrontendHUD (SDK.txt)
+    uintptr_t FrontendHUDUserSettings = 0xbe8; // FrontendHUD -> UserSettings (SDK.txt)
+
+    uintptr_t PhysicsScene = 0xD90; //UWorld -> PhysicsScene (verified live via ceserver)
     uintptr_t PhysSceneSceneCount = 0x4; // FPhysScene -> scene count / upper bound
     uintptr_t PhysSceneSceneIndexArray = 0x56; // FPhysScene -> uint16 SceneIndex[SceneType]
-    uintptr_t GPhysXSceneMap = 0x1496E918; // libUE4 + offset -> entry array pointer, 0x18 bytes per entry
-    uintptr_t GPhysXSceneMapBuckets = 0x1496E950; // inline hash bucket storage for SceneIndex -> PxScene*
-    uintptr_t GPhysXSceneMapBucketPtr = 0x1496E958; // libUE4 + offset -> heap bucket pointer override
-    uintptr_t GPhysXSceneMapHashSize = 0x1496E960; // libUE4 + offset -> hash bucket count
+    uintptr_t GPhysXSceneMap = 0x15757948; // libUE4 + offset -> entry array pointer, 0x18 bytes per entry
+    uintptr_t GPhysXSceneMapBuckets = 0x15757980; // inline hash bucket storage for SceneIndex -> PxScene*
+    uintptr_t GPhysXSceneMapBucketPtr = 0x15757988; // libUE4 + offset -> heap bucket pointer override
+    uintptr_t GPhysXSceneMapHashSize = 0x15757990; // libUE4 + offset -> hash bucket count
     uintptr_t NpSceneQueriesSceneQueryManager = 0x2430; // physx::NpSceneQueries -> Sq::SceneQueryManager
     uintptr_t SceneQueryManagerPrunerExtStride = 0x30; // Sq::SceneQueryManager::mPrunerExt[i] stride
     uintptr_t PrunerExtPruner = 0x0; // Sq::PrunerExt -> Sq::Pruner*
@@ -483,7 +491,7 @@ struct Offsets{
     uintptr_t PxShapeGeometryInline = 0x98; // physx::NpShape -> inline geometry block (0x30 bytes)
     uintptr_t PxShapeCoreGeometry = 0x38; // shape core -> geometry block (0x30 bytes)
     uintptr_t PxShapeGeometryType = 0x98; // physx::NpShape::getGeometryType reads the first dword of the geometry block
-    uintptr_t PxRigidDynamicBodyToWorld = 0xB0; // physx::NpRigidDynamic -> inline body-to-world pose
+    uintptr_t PxRigidDynamicBodyToWorld = 0xD0; // physx::NpRigidDynamic -> inline body-to-world pose (verified live via ceserver_api)
     uintptr_t PxRigidDynamicFlags = 0x17C; // physx::NpRigidDynamic flags, bit0x200 selects external pose storage
     uintptr_t PxRigidDynamicCorePtr = 0x70; // physx::NpRigidDynamic -> core pointer when pose is external
     uintptr_t PxRigidDynamicCoreBodyToWorld = 0xD0; // dynamic core -> body-to-world pose
@@ -491,7 +499,7 @@ struct Offsets{
     uintptr_t PxRigidStaticFlags = 0x68; // physx::NpRigidStatic flags, bit0x40 selects external pose storage
     uintptr_t PxRigidStaticCorePtr = 0x70; // physx::NpRigidStatic -> core pointer when pose is external
     uintptr_t PxRigidStaticCoreGlobalPose = 0xB0; // static core -> global pose
-    uintptr_t ServerConnection = 0x88;
+    uintptr_t ServerConnection = 0x88; // UWorld::GetNetDriver()->ServerConnection
     uintptr_t PxTriangleMeshGeometryTriangleMesh = 0x28; // PxTriangleMeshGeometry -> PxTriangleMesh*
     uintptr_t PxTriangleMeshGeometryScale = 0x4; // PxTriangleMeshGeometry -> PxMeshScale (7 dwords)
     uintptr_t PxSphereGeometryRadius = 0x4; // PxSphereGeometry -> float radius
@@ -525,31 +533,81 @@ struct Offsets{
     uintptr_t PxHeightFieldSampleStride = 0x60; // physx::Gu::HeightField -> uint32_t mSampleStride
     uintptr_t PxHeightFieldSampleCount = 0x64; // physx::Gu::HeightField -> uint32_t mNbSamples
     uintptr_t PxHeightFieldModifyCount = 0x70; // physx::Gu::HeightField::getTimestamp() -> uint32_t mModifyCount
-    uintptr_t PlayerController = 0x30;
-    uintptr_t AcknowledgedPawn = 0x638;  // PlayerController->AcknowledgedPawn
-    uintptr_t PlayerCameraManager = 0x658;
-    uintptr_t CameraCache = 0x640;
-    uintptr_t POV = 0x10;
-    uintptr_t RootComponent = 0x268;
-    uintptr_t ComponentToWorld = 0x1F0;
-    uintptr_t CanvasMap = 0x14954368;
-    uintptr_t SkeletalMeshComponent = 0x650;
-    uintptr_t MasterPoseComponent = 0x7f8;  // USkinnedMeshComponent -> USkinnedMeshComponent* (from SDK dump)
-    uintptr_t ComponentSpaceTransforms = 0x810;   // ComponentSpaceTransformsArray[0], [1] is at +0x10
-    uintptr_t CachedComponentSpaceTransforms = 0xbb8;  // TArray<FTransform> (缓存的组件空间变换，单缓冲，更稳定)
-    uintptr_t CurrentReadComponentTransformIndex = 0x830; // int32, 0 or 1 — 需要根据 SDK dump 确认
-    uintptr_t BoneSpaceTransforms = 0xba8;  // TArray<FTransform> (局部空间骨骼变换)
-    uintptr_t SkeletalMesh = 0x7f0;        // USkinnedMeshComponent -> USkeletalMesh*
-    uintptr_t RefBoneInfo = 0x238;          // USkeletalMesh -> FReferenceSkeleton.RawRefBoneInfo
-    // UAECharacter (Character.Pawn.Actor.Object)
-    uintptr_t PlayerName = 0xae8;           // FString PlayerName
-    uintptr_t TeamID = 0xb68;              // int TeamID
-    uintptr_t Health = 0xfd8;              // STExtraCharacter -> float Health
-    uintptr_t HealthMax = 0xfe0;           // STExtraCharacter -> float HealthMax
-    uintptr_t bIsWeaponFiring = 0x2598;    // bool (ByteOffset: 0, ByteMask: 1, FieldMask: 255)
-    // FApp::DeltaTime (GOT 表，需要两次解引用)
-    uintptr_t FAppDeltaTimeGOT = 0x14012220;  // libUE4 + offset -> ptr -> double*
-    uintptr_t GFrameCounterGOT = 0x14018260; //uint64 
+
+    uintptr_t PlayerController = 0x30;   //Player.Object -> APlayerController*
+    uintptr_t AcknowledgedPawn = 0x640;  // PlayerController->AcknowledgedPawn
+    uintptr_t PlayerCameraManager = 0x660; // PlayerController->PlayerCameraManager
+    uintptr_t ControllerPlayerKey = 0xb50; // UAEPlayerController -> uint32 PlayerKey
+    uintptr_t ControllerTeamID = 0xb88; // UAEPlayerController -> int TeamID
+    uintptr_t isPressingBtn_AimAndFire = 0x3b28; // STExtraPlayerController -> bool isPressingBtn_AimAndFire (sdk.txt)
+    uintptr_t CameraCache = 0x640; //PlayerCameraManager.Actor.Object -> CameraCacheEntry
+    uintptr_t POV = 0x10;  //CameraCacheEntry -> CameraCachePOV
+    uintptr_t MinimalViewInfoFOV = 0x30; // MinimalViewInfo -> FOV (sdk.txt)
+    uintptr_t RootComponent = 0x260; //Actor -> RootComponent
+    uintptr_t ComponentToWorld = 0x1F0; //SceneComponent -> FTransform ComponentToWorld
+    uintptr_t ReplicatedMovement = 0x168; // Actor -> ReplicatedMovement (sdk.txt)
+
+    uintptr_t SkeletalMeshComponent = 0x658; //Character.Pawn.Actor.Object -> USkinnedMeshComponent*
+    uintptr_t MasterPoseComponent = 0x810;  // USkinnedMeshComponent -> USkinnedMeshComponent* (from SDK dump)
+    uintptr_t ComponentSpaceTransforms = 0x828;   // ComponentSpaceTransformsArray[0], [1] is at +0x10
+    uintptr_t CachedComponentSpaceTransforms = 0xbe0;  // TArray<FTransform> (缓存的组件空间变换，单缓冲，更稳定)
+    uintptr_t CurrentReadComponentTransformIndex = 0x86C; // int32, 0 or 1 — 需要根据 SDK dump 确认
+    uintptr_t BoneSpaceTransforms = 0xbd0;  // TArray<FTransform> (局部空间骨骼变换)
+    uintptr_t SkeletalMesh = 0x808;        // USkinnedMeshComponent -> USkeletalMesh*
+     uintptr_t RefBoneInfo = 0x240;          // USkeletalMesh -> FReferenceSkeleton.FinalRefBoneInfo (GetRefBoneInfo)
+    // UAECharacter (Character.Pawn.Actor.Object)/UAECharacter.Character.Pawn.Actor.Object
+    uintptr_t PlayerName = 0xaf8;           // FString PlayerName 
+    uintptr_t CharacterPlayerKey = 0xb18;  // UAECharacter -> uint32 PlayerKey
+    uintptr_t TeamID = 0xb78;              // int TeamID
+    uintptr_t bIsAI = 0xb94;               // UAECharacter -> bool bIsAI
+    uintptr_t bIsMLAI = 0xb95;             // UAECharacter -> bool bIsMLAI
+    uintptr_t Health = 0xff8;              // STExtraCharacter -> float Health
+    uintptr_t HealthMax = 0x1000;           // STExtraCharacter -> float HealthMax
+    uintptr_t bIsWeaponFiring = 0x2608;    // bool (ByteOffset: 0, ByteMask: 1, FieldMask: 255)
+    uintptr_t bIsGunADS = 0x17b8; // STExtraCharacter -> bool bIsGunADS (sdk.txt)
+    uintptr_t STCharacterMovement = 0x2be0; // STExtraCharacter -> STCharacterMovementComponent* (sdk.txt)
+    uintptr_t CurrentVehicle = 0x12a8; // STExtraCharacter -> CurrentVehicle (sdk.txt)
+    uintptr_t CurrentUsingWeaponSafety = 0x1108; // STExtraCharacter -> CurrentUsingWeaponSafety (sdk.txt)
+    uintptr_t CurEquipWeapon = 0x2628; // STExtraCharacter -> CurEquipWeapon (sdk.txt)
+    uintptr_t MovementVelocity = 0x144; // MovementComponent -> Velocity (sdk.txt)
+    uintptr_t TombBoxBoxPickupWrapperActor = 0x7e8; // PlayerTombBox -> BoxPickupWrapperActor
+    uintptr_t TombBoxPickupListWrapper = 0x7f0; // PlayerTombBox -> PickupListWrapper
+    uintptr_t TombBoxAirDropWrapperInner = 0x7f8; // PlayerTombBox -> AirDropWrapperInner
+    uintptr_t TombBoxWrapperInner = 0x9f8; // PlayerTombBox -> WrapperInner
+    uintptr_t PickUpListWrapperPickUpDataList = 0xd98; // PickUpListWrapperActor -> PickUpDataList
+    uintptr_t PickUpListWrapperCachePickUpDataList = 0xe08; // PickUpListWrapperActor -> CachePickUpDataList
+    uintptr_t ShootWeaponEntityComp = 0x1f70; // STExtraWeapon -> ShootWeaponEntityComp (sdk.txt)
+    uintptr_t WeaponBWantToFire = 0x20b0; // STExtraShootWeapon -> bool bWantsToFire (sdk.txt)
+    uintptr_t WeaponBWantToFireCommon = 0x20b1; // STExtraShootWeapon -> bool bWantsToFireCommon (sdk.txt)
+    uintptr_t CurShootWeaponState = 0x22a8; // STExtraShootWeapon -> byte CurShootWeaponState (sdk.txt)
+    uintptr_t BulletFireSpeed = 0x15cc; // ShootWeaponEntity -> BulletFireSpeed (sdk.txt)
+    uintptr_t RecoilInfo = 0x1e00; // ShootWeaponEntity -> SRecoilInfo (sdk.txt)
+    uintptr_t AccessoriesVRecoilFactor = 0x1ec8; // ShootWeaponEntity -> AccessoriesVRecoilFactor (sdk.txt)
+    uintptr_t AccessoriesVRecoilFactorModifier = 0x1ecc; // ShootWeaponEntity -> AccessoriesVRecoilFactorModifier
+    uintptr_t VerticalRecoilFactorModifier = 0x1ed0; // ShootWeaponEntity -> VerticalRecoilFactorModifier
+    uintptr_t AccessoriesHRecoilFactor = 0x1ed4; // ShootWeaponEntity -> AccessoriesHRecoilFactor
+    uintptr_t AccessoriesHRecoilFactorModifier = 0x1ed8; // ShootWeaponEntity -> AccessoriesHRecoilFactorModifier
+    uintptr_t HorizontalRecoilFactorModifier = 0x1edc; // ShootWeaponEntity -> HorizontalRecoilFactorModifier
+    uintptr_t AccessoriesAllRecoilFactorModifier = 0x1ee0; // ShootWeaponEntity -> AccessoriesAllRecoilFactorModifier
+    uintptr_t AccessoriesRecoveryFactor = 0x1ee4; // ShootWeaponEntity -> AccessoriesRecoveryFactor
+    uintptr_t UserSettingsFPViewSwitch = 0x2a0; // SettingConfig_C -> FPViewSwitch (SDK.txt final class layout)
+    uintptr_t GyroscopeSenNoneSniper = 0x88; // SettingConfig_C -> GyroscopeSenNoneSniper
+    uintptr_t GyroscopeSenRedDot = 0x8c; // SettingConfig_C -> GyroscopeSenRedDotSniper
+    uintptr_t GyroscopeSen2X = 0x90; // SettingConfig_C -> GyroscopeSen2XSniper
+    uintptr_t GyroscopeSen3X = 0x2d4; // SettingConfig_C -> GyroscopeSen3XSniper
+    uintptr_t GyroscopeSen4X = 0x94; // SettingConfig_C -> GyroscopeSen4XSniper
+    uintptr_t GyroscopeSen6X = 0x2d8; // SettingConfig_C -> GyroscopeSen6XSniper
+    uintptr_t GyroscopeSen8X = 0x98; // SettingConfig_C -> GyroscopeSen8XSniper
+    uintptr_t GyroscopeSenNoneSniperFP = 0x2b4; // SettingConfig_C -> GyroscopeSenNoneSniperFP
+    uintptr_t FireGyroscopeSenNoneSniper = 0x58c; // SettingConfig_C -> FireGyroscopeSenNoneSniper
+    uintptr_t FireGyroscopeSenRedDot = 0x590; // SettingConfig_C -> FireGyroscopeSenRedDotSniper
+    uintptr_t FireGyroscopeSen2X = 0x594; // SettingConfig_C -> FireGyroscopeSen2XSniper
+    uintptr_t FireGyroscopeSen3X = 0x5a0; // SettingConfig_C -> FireGyroscopeSen3XSniper
+    uintptr_t FireGyroscopeSen4X = 0x598; // SettingConfig_C -> FireGyroscopeSen4XSniper
+    uintptr_t FireGyroscopeSen6X = 0x5a4; // SettingConfig_C -> FireGyroscopeSen6XSniper
+    uintptr_t FireGyroscopeSen8X = 0x59c; // SettingConfig_C -> FireGyroscopeSen8XSniper
+    uintptr_t FireGyroscopeSenNoneSniperFP = 0x5b0; // SettingConfig_C -> FireGyroscopeSenNoneSniperFp
+//
 };
 struct Addresses{
     uintptr_t Uworld,libUE4;
@@ -557,4 +615,6 @@ struct Addresses{
     uintptr_t Matrix;
     uintptr_t ProjectionMat,Ulevel,localplay,oneself,Arrayaddr,Objaddr;
     uintptr_t LocalPlayerActor = 0;  // 本地玩家操控的 actor
+    uint32_t LocalPlayerKey = 0;     // 本地玩家 PlayerKey
+    int32_t LocalPlayerTeamID = -1;  // 本地玩家 TeamID
 };

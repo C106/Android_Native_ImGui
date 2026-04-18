@@ -1,4 +1,5 @@
 #include "read_mem.h"
+#include "auto_aim.h"
 #include "cpu_affinity.h"
 #include "game_fps_monitor.h"
 #include <android/log.h>
@@ -6,6 +7,7 @@
 #include <chrono>
 #include <unordered_map>
 #include <unordered_set>
+#include <sstream>
 #include <vector>
 #include <memory>
 #include <string>
@@ -45,8 +47,11 @@ struct ClassInfo {
 static const std::unordered_map<std::string, ClassInfo> kClassNameMap = {
     // 玩家角色
     {"BP_TrainPlayerPawn_C",    {"骨骼测试", ActorType::PLAYER}},
-    {"BP_PlayerPawn_CG35_C",    {"骨骼测试", ActorType::PLAYER}},
+    {"BP_PlayerPawn_CG36_C",    {"骨骼测试", ActorType::PLAYER}},
     {"BP_PlayerPawn_C",         {"玩家", ActorType::PLAYER}},
+
+    // 盒子
+    {"BP_Escape_MonsterDeadInventoryBox_C", {"其他盒子", ActorType::OTHER_BOX}},
 
     // 载具
     {"VH_4SportCar_C",            {"敞篷跑车", ActorType::VEHICLE}},
@@ -62,7 +67,237 @@ static const std::unordered_map<std::string, ClassInfo> kClassNameMap = {
     {"VH_StationWagon_New_C",         {"旅行车", ActorType::VEHICLE}},
     // 其他（道具、NPC等）
     // 用户按需填充
+    {"BP_Escape_RobocopDog_C",         {"机械狗", ActorType::MONSTER}},
 };
+
+static bool ClassNameLooksLikeMonster(const std::string& className) {
+    static const char* kMonsterTokens[] = {
+        "RobocopDog", "Zombie", "Mutant", "Beast", "YearBeast", "Raven", "Wolf"
+    };
+    for (const char* token : kMonsterTokens) {
+        if (className.find(token) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ClassNameLooksLikeBot(const std::string& className) {
+    static const char* kBotTokens[] = {
+        "Bot", "AIPlayer", "AIPawn", "RobotPlayer"
+    };
+    for (const char* token : kBotTokens) {
+        if (className.find(token) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ClassNameLooksLikeNPC(const std::string& className) {
+    static const char* kNPCTokens[] = {
+        "BPPawn_Escape_Rookie", "BPPawn_Escape_Sniper", "BPPawn_Escape_HighCo", "BPPawn_Escape_Machinegun", "BPPawn_Escape_Armed", "BPPawn_Escape_Commando", "BPPawn_Escape_Lurker",
+        "BPPawn_Escape_JY_", "BPPawn_escape_L", "BPPawn_Escape_HighRo"
+    };
+    for (const char* token : kNPCTokens) {
+        if (className.find(token) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ClassNameLooksLikeTombBox(const std::string& className) {
+    return className.find("PlayerTombBox") != std::string::npos ||
+           className.find("TreasureBox") != std::string::npos;
+}
+
+static bool ClassNameLooksLikeEscapeBox(const std::string& className) {
+    return className.rfind("EscapeBox", 0) == 0;
+}
+
+static bool ClassNameLooksLikeEscapeInnerBox(const std::string& className) {
+    return className.find("InnerSupplyBoxBase") != std::string::npos ||
+           className.find("InnerSupplyBox") != std::string::npos;
+}
+
+static bool ClassNameLooksLikeContainer(const std::string& className) {
+    return className.find("PickUpListWrapperActor") != std::string::npos ||
+           className.find("PickUpWrapperActor") != std::string::npos ||
+           className.find("EscapeInnerWrapperList") != std::string::npos;
+}
+
+static std::string BuildEscapeBoxDisplayName(const std::string& className) {
+    const char* typeLabel = "未知";
+    if (className.find("Supply") != std::string::npos) {
+        typeLabel = "Supply";
+    } else if (className.find("Weapon") != std::string::npos) {
+        typeLabel = "Weapon";
+    } else if (className.find("Medical") != std::string::npos) {
+        typeLabel = "Medical";
+    }
+
+    const char* levelLabel = "";
+    if (className.find("Lv1") != std::string::npos) {
+        levelLabel = " Lv1";
+    } else if (className.find("Lv2") != std::string::npos) {
+        levelLabel = " Lv2";
+    } else if (className.find("Lv3") != std::string::npos) {
+        levelLabel = " Lv3";
+    } else if (className.find("Lv4") != std::string::npos) {
+        levelLabel = " Lv4";
+    }
+
+    return std::string("宝箱 ") + typeLabel + levelLabel;
+}
+
+static int ReadRemoteTArrayNum(uint64_t arrayAddr, int hardLimit) {
+    if (arrayAddr == 0) {
+        return 0;
+    }
+    const int32_t num = GetDriverManager().read<int32_t>(arrayAddr + 0x8);
+    if (num <= 0 || num > hardLimit) {
+        return 0;
+    }
+    const uint64_t data = GetDriverManager().read<uint64_t>(arrayAddr);
+    if (data == 0) {
+        return 0;
+    }
+    return num;
+}
+
+static int ReadPickUpWrapperItemCount(uint64_t wrapperActor) {
+    if (wrapperActor == 0) {
+        return 0;
+    }
+
+    int count = ReadRemoteTArrayNum(wrapperActor + offset.PickUpListWrapperPickUpDataList, 512);
+    if (count > 0) {
+        return count;
+    }
+    return ReadRemoteTArrayNum(wrapperActor + offset.PickUpListWrapperCachePickUpDataList, 512);
+}
+
+struct PickUpItemDataLite {
+    int32_t Unknown0 = 0;
+    int32_t TypeSpecificID = 0;
+    uint8_t Padding0[0x10]{};
+    int32_t Count = 0;
+    uint8_t Tail[0x1C]{};
+};
+static_assert(sizeof(PickUpItemDataLite) == 0x38, "PickUpItemDataLite size mismatch");
+
+static bool ReadPickUpWrapperItems(uint64_t wrapperActor,
+                                   std::vector<PickUpItemDataLite>& outItems) {
+    outItems.clear();
+    if (wrapperActor == 0) {
+        return false;
+    }
+
+    uint64_t listAddr = wrapperActor + offset.PickUpListWrapperPickUpDataList;
+    uint64_t data = GetDriverManager().read<uint64_t>(listAddr);
+    int32_t num = GetDriverManager().read<int32_t>(listAddr + 0x8);
+
+    if (data == 0 || num <= 0 || num > 128) {
+        listAddr = wrapperActor + offset.PickUpListWrapperCachePickUpDataList;
+        data = GetDriverManager().read<uint64_t>(listAddr);
+        num = GetDriverManager().read<int32_t>(listAddr + 0x8);
+    }
+
+    if (data == 0 || num <= 0 || num > 128) {
+        return false;
+    }
+
+    outItems.resize(num);
+    GetDriverManager().read(data, outItems.data(), static_cast<size_t>(num) * sizeof(PickUpItemDataLite));
+    return true;
+}
+
+static std::string BuildPickUpItemSummary(const std::vector<PickUpItemDataLite>& items,
+                                          int maxShownItems = 4) {
+    if (items.empty()) {
+        return "";
+    }
+
+    std::unordered_map<int32_t, int32_t> mergedCounts;
+    std::vector<int32_t> orderedIds;
+    orderedIds.reserve(items.size());
+
+    for (const PickUpItemDataLite& item : items) {
+        if (item.TypeSpecificID <= 0 || item.Count <= 0) {
+            continue;
+        }
+        auto it = mergedCounts.find(item.TypeSpecificID);
+        if (it == mergedCounts.end()) {
+            mergedCounts.emplace(item.TypeSpecificID, item.Count);
+            orderedIds.push_back(item.TypeSpecificID);
+        } else {
+            it->second += item.Count;
+        }
+    }
+
+    if (orderedIds.empty()) {
+        return "";
+    }
+
+    std::ostringstream out;
+    const int shownCount = std::min<int>(static_cast<int>(orderedIds.size()), maxShownItems);
+    for (int i = 0; i < shownCount; ++i) {
+        const int32_t typeSpecificID = orderedIds[i];
+        if (i > 0) {
+            out << ", ";
+        }
+        out << typeSpecificID << "x" << mergedCounts[typeSpecificID];
+    }
+    if (static_cast<int>(orderedIds.size()) > shownCount) {
+        out << " +" << (static_cast<int>(orderedIds.size()) - shownCount);
+    }
+    return out.str();
+}
+
+static void FillPickUpWrapperDisplayData(uint64_t wrapperActor,
+                                         int& outItemCount,
+                                         std::string& outSummary) {
+    outItemCount = 0;
+    outSummary.clear();
+
+    std::vector<PickUpItemDataLite> items;
+    if (!ReadPickUpWrapperItems(wrapperActor, items)) {
+        return;
+    }
+
+    outItemCount = static_cast<int>(items.size());
+    outSummary = BuildPickUpItemSummary(items);
+}
+
+static uint64_t ResolveTombBoxWrapperActor(uint64_t tombBoxActor) {
+    if (tombBoxActor == 0) {
+        return 0;
+    }
+
+    const uintptr_t candidates[] = {
+        offset.TombBoxPickupListWrapper,
+        offset.TombBoxWrapperInner,
+        offset.TombBoxBoxPickupWrapperActor,
+        offset.TombBoxAirDropWrapperInner,
+    };
+    for (uintptr_t wrapperOffset : candidates) {
+        const uint64_t wrapper = GetDriverManager().read<uint64_t>(tombBoxActor + wrapperOffset);
+        if (wrapper > 0x10000000ULL) {
+            return wrapper;
+        }
+    }
+    return 0;
+}
+
+static bool TryReadActorWorldPos(uint64_t rootCompAddr, Vec3& outPos) {
+    if (rootCompAddr == 0) {
+        return false;
+    }
+    const FTransform actorTransform = GetDriverManager().read<FTransform>(rootCompAddr + offset.ComponentToWorld);
+    outPos = actorTransform.Translation;
+    return true;
+}
 
 // 分类 actor（根据类名映射表）
 // 返回 {displayName, actorType}，如果类名不在映射表中返回 {"", ActorType::OTHER}
@@ -70,6 +305,32 @@ static std::pair<std::string, ActorType> ClassifyActor(const std::string& classN
     auto it = kClassNameMap.find(className);
     if (it != kClassNameMap.end()) {
         return {it->second.displayName, it->second.type};
+    }
+
+    if (className.find("PlayerPawn") != std::string::npos) {
+        return {"玩家", ActorType::PLAYER};
+    }
+
+    if (ClassNameLooksLikeTombBox(className)) {
+        return {"战利品箱", ActorType::TOMB_BOX};
+    }
+    if (ClassNameLooksLikeEscapeBox(className)) {
+        return {BuildEscapeBoxDisplayName(className), ActorType::ESCAPE_BOX};
+    }
+    if (ClassNameLooksLikeEscapeInnerBox(className)) {
+        return {"宝箱内箱", ActorType::ESCAPE_INNER_BOX};
+    }
+    if (ClassNameLooksLikeContainer(className)) {
+        return {"容器", ActorType::CONTAINER};
+    }
+    if (ClassNameLooksLikeNPC(className)) {
+        return {"NPC", ActorType::NPC};
+    }
+    if (ClassNameLooksLikeMonster(className)) {
+        return {"Monster", ActorType::MONSTER};
+    }
+    if (ClassNameLooksLikeBot(className)) {
+        return {"Bot", ActorType::BOT};
     }
     return {"", ActorType::OTHER};  // 不在映射表中，归类为 OTHER 但不显示
 }
@@ -101,14 +362,14 @@ std::string GetNameByIndex(int32_t index, uint64_t libUE4) {
     int chunkIdx  = index / ElementsPerChunk;
     int withinIdx = index % ElementsPerChunk;
 
-    uint64_t chunksArr = Paradise_hook->read<uint64_t>(libUE4 + offset.Gname);
-    uint64_t chunk     = Paradise_hook->read<uint64_t>(chunksArr + chunkIdx * 8);
-    uint64_t entryAddr = Paradise_hook->read<uint64_t>(chunk + withinIdx * 8);
+    uint64_t chunksArr = GetDriverManager().read<uint64_t>(libUE4 + offset.Gname);
+    uint64_t chunk     = GetDriverManager().read<uint64_t>(chunksArr + chunkIdx * 8);
+    uint64_t entryAddr = GetDriverManager().read<uint64_t>(chunk + withinIdx * 8);
 
     if (entryAddr == 0) return "";
 
     char buf[65] = {};
-    Paradise_hook->read(entryAddr + 0x0C, buf, 64);
+    GetDriverManager().read(entryAddr + 0x0C, buf, 64);
 
     std::string name(buf);
     nameCache[index] = name;
@@ -116,19 +377,19 @@ std::string GetNameByIndex(int32_t index, uint64_t libUE4) {
 }
 
 std::string GetObjectName(uint64_t object, uint64_t libUE4) {
-    int32_t nameIndex = Paradise_hook->read<int32_t>(object + 0x18);
+    int32_t nameIndex = GetDriverManager().read<int32_t>(object + 0x18);
     return GetNameByIndex(nameIndex, libUE4);
 }
 
 Vec3 GetActorLocation(uint64_t Actor) {
-    uint64_t RootComp = Paradise_hook->read<uint64_t>(Actor + offset.RootComponent);
+    uint64_t RootComp = GetDriverManager().read<uint64_t>(Actor + offset.RootComponent);
     if (RootComp == 0) return {0, 0, 0};
-    return Paradise_hook->read<Vec3>(RootComp + offset.ComponentToWorld + 0x10);
+    return GetDriverManager().read<Vec3>(RootComp + offset.ComponentToWorld + 0x10);
 }
 
 void hexdump(uint64_t addr, size_t size) {
     std::vector<uint8_t> buf(size);
-    Paradise_hook->read(addr, buf.data(), size);
+    GetDriverManager().read(addr, buf.data(), size);
 
     for (size_t i = 0; i < size; i += 16) {
         printf("%012lx: ", addr + i);
@@ -149,34 +410,34 @@ void hexdump(uint64_t addr, size_t size) {
 }
 
 void DumpObjects(uint64_t libUE4, int count) {
-    uint64_t chunk0 = Paradise_hook->read<uint64_t>(libUE4 + offset.GUObject);
-    int numElements = Paradise_hook->read<int32_t>(libUE4 + offset.GUObject + 0x10);
+    uint64_t chunk0 = GetDriverManager().read<uint64_t>(libUE4 + offset.GUObject);
+    int numElements = GetDriverManager().read<int32_t>(libUE4 + offset.GUObject + 0x10);
 
     if (count > numElements) count = numElements;
 
     for (int i = 0; i < count; i++) {
-        uint64_t object = Paradise_hook->read<uint64_t>(chunk0 + i * 0x18);
+        uint64_t object = GetDriverManager().read<uint64_t>(chunk0 + i * 0x18);
         if (object == 0) continue;
 
-        int32_t nameIndex = Paradise_hook->read<int32_t>(object + 0x18);
-        int32_t nameNumber = Paradise_hook->read<int32_t>(object + 0x1C);
+        int32_t nameIndex = GetDriverManager().read<int32_t>(object + 0x18);
+        int32_t nameNumber = GetDriverManager().read<int32_t>(object + 0x1C);
 
         std::string name = GetNameByIndex(nameIndex, libUE4);
         if (nameNumber > 0) {
             name += "_" + std::to_string(nameNumber - 1);
         }
 
-        uint64_t classPtr = Paradise_hook->read<uint64_t>(object + 0x10);
+        uint64_t classPtr = GetDriverManager().read<uint64_t>(object + 0x10);
         std::string className;
         if (classPtr != 0) {
-            int32_t classNameIdx = Paradise_hook->read<int32_t>(classPtr + 0x18);
+            int32_t classNameIdx = GetDriverManager().read<int32_t>(classPtr + 0x18);
             className = GetNameByIndex(classNameIdx, libUE4);
         }
 
-        uint64_t outerPtr = Paradise_hook->read<uint64_t>(object + 0x28);
+        uint64_t outerPtr = GetDriverManager().read<uint64_t>(object + 0x28);
         std::string outerName;
         if (outerPtr != 0) {
-            int32_t outerNameIdx = Paradise_hook->read<int32_t>(outerPtr + 0x18);
+            int32_t outerNameIdx = GetDriverManager().read<int32_t>(outerPtr + 0x18);
             outerName = GetNameByIndex(outerNameIdx, libUE4);
         }
 
@@ -188,10 +449,10 @@ void DumpObjects(uint64_t libUE4, int count) {
 //  Driver 初始化（UI 线程调用一次）
 // ═══════════════════════════════════════════
 void InitDriver(const char* packageName, uint64_t& libUE4Out) {
-    int pid = Paradise_hook->get_pid(packageName);
+    int pid = GetDriverManager().get_pid(packageName);
     if (pid > 0) {
         printf("[+] pid = %d\n", pid);
-        libUE4Out = Paradise_hook->get_module_base("libUE4.so");
+        libUE4Out = GetDriverManager().get_module_base("libUE4.so");
         sLibUE4 = libUE4Out;
         address.libUE4 = libUE4Out;  // 保存到 address 结构体
         if(libUE4Out){
@@ -201,9 +462,25 @@ void InitDriver(const char* packageName, uint64_t& libUE4Out) {
         StartGameFPSMonitor(packageName);
         EnableMemoryMode(true);  // 启用内存读取模式
 
-        address.Matrix = Paradise_hook->read<uint64_t>(
-            Paradise_hook->read<uint64_t>(libUE4Out + offset.CanvasMap) + 0x20) + 0x270;
+        address.Matrix = GetDriverManager().read<uint64_t>(
+            GetDriverManager().read<uint64_t>(libUE4Out + offset.CanvasMap) + 0x20) + 0x270;
         ConfigureBulletSpreadMonitor(pid, libUE4Out);
+
+        if (GetDriverManager().supports_touch()) {
+            int touch_max_x = 0;
+            int touch_max_y = 0;
+            const bool touch_ready = GetDriverManager().touch_init(&touch_max_x, &touch_max_y) &&
+                                     touch_max_x > 0 && touch_max_y > 0;
+            if (!touch_ready) {
+                LOGE("touch_init failed during driver initialization");
+                if (gAutoAim) {
+                    gAutoAim->GetConfig().triggerBotEnabled = false;
+                }
+            } else {
+                LOGI("touch_init ok during driver initialization: %d x %d", touch_max_x, touch_max_y);
+                GetDriverManager().touch_destroy();
+            }
+        }
 
         // LocalPlayerActor 由读取线程定期刷新（每 ~10 次扫描）
 
@@ -215,20 +492,20 @@ void InitDriver(const char* packageName, uint64_t& libUE4Out) {
 }
 
 void DumpTArray(){
-    uint64_t Gworld = Paradise_hook->read<uint64_t>(sLibUE4 + offset.Gworld);
-    uint64_t level = Paradise_hook->read<uint64_t>(Gworld + 0xB0);
+    uint64_t Gworld = GetDriverManager().read<uint64_t>(sLibUE4 + offset.Gworld);
+    uint64_t level = GetDriverManager().read<uint64_t>(Gworld + 0xB0);
 
     for (uint64_t off = 0x0; off <= 0x250; off += 0x8) {
-        uint64_t ptr = Paradise_hook->read<uint64_t>(level + off);
-        int32_t count = Paradise_hook->read<int32_t>(level + off + 0x8);
-        int32_t max   = Paradise_hook->read<int32_t>(level + off + 0xC);
+        uint64_t ptr = GetDriverManager().read<uint64_t>(level + off);
+        int32_t count = GetDriverManager().read<int32_t>(level + off + 0x8);
+        int32_t max   = GetDriverManager().read<int32_t>(level + off + 0xC);
 
         if (ptr > 0x10000ULL && ptr < 0x800000000000ULL
                     && count > 5 && count <= max && max < 100000) {
             printf("ULevel+0x%03llX -> Data=0x%llX  Count=%d  Max=%d\n", off, ptr, count, max);
             // 验证前3个元素
             for (int i = 0; i < 150 && i < count; i++) {
-                uint64_t actor = Paradise_hook->read<uint64_t>(ptr + i * 8);
+                uint64_t actor = GetDriverManager().read<uint64_t>(ptr + i * 8);
                 if (actor) {
                     std::string name = GetObjectName(actor,sLibUE4);
                     if(name.length()<9){
@@ -251,25 +528,25 @@ void DumpBones() {
     for (const auto& ca : *actors) {
         if (ca.className != "BP_TrainPlayerPawn_C") continue;
 
-        uint64_t skelMeshComp = Paradise_hook->read<uint64_t>(ca.actorAddr + offset.SkeletalMeshComponent);
+        uint64_t skelMeshComp = GetDriverManager().read<uint64_t>(ca.actorAddr + offset.SkeletalMeshComponent);
         if (skelMeshComp == 0) { printf("SkeletalMeshComponent is null\n"); continue; }
 
-        int boneCount = Paradise_hook->read<int>(skelMeshComp + offset.ComponentSpaceTransforms + 0x8);
+        int boneCount = GetDriverManager().read<int>(skelMeshComp + offset.ComponentSpaceTransforms + 0x8);
         if (boneCount != 66) continue;
 
-        uint64_t skelMesh = Paradise_hook->read<uint64_t>(skelMeshComp + offset.SkeletalMesh);
+        uint64_t skelMesh = GetDriverManager().read<uint64_t>(skelMeshComp + offset.SkeletalMesh);
         if (skelMesh == 0) { printf("SkeletalMesh is null\n"); continue; }
 
         // FReferenceSkeleton.RawRefBoneInfo at SkeletalMesh+0x238
         // FMeshBoneInfo: FName(8) + ParentIndex(4) + padding(4) = 0x10 stride
-        uint64_t boneInfoPtr = Paradise_hook->read<uint64_t>(skelMesh + offset.RefBoneInfo);
-        int boneInfoCount = Paradise_hook->read<int>(skelMesh + offset.RefBoneInfo + 0x8);
+        uint64_t boneInfoPtr = GetDriverManager().read<uint64_t>(skelMesh + offset.RefBoneInfo);
+        int boneInfoCount = GetDriverManager().read<int>(skelMesh + offset.RefBoneInfo + 0x8);
 
         printf("=== %s (0x%llX) BoneCount=%d ===\n",
                ca.className.c_str(), (unsigned long long)ca.actorAddr, boneInfoCount);
 
         // 读取 ComponentToWorld 用于诊断
-        FTransform meshTransform = Paradise_hook->read<FTransform>(skelMeshComp + offset.ComponentToWorld);
+        FTransform meshTransform = GetDriverManager().read<FTransform>(skelMeshComp + offset.ComponentToWorld);
         float mq2 = meshTransform.Rotation.X * meshTransform.Rotation.X
                   + meshTransform.Rotation.Y * meshTransform.Rotation.Y
                   + meshTransform.Rotation.Z * meshTransform.Rotation.Z
@@ -284,15 +561,15 @@ void DumpBones() {
         int count = (boneInfoCount > 0 && boneInfoCount < 300) ? boneInfoCount : boneCount;
 
         // 读取骨骼 transform 数据用于诊断
-        uint64_t boneDataPtr = Paradise_hook->read<uint64_t>(skelMeshComp + offset.ComponentSpaceTransforms);
+        uint64_t boneDataPtr = GetDriverManager().read<uint64_t>(skelMeshComp + offset.ComponentSpaceTransforms);
         for (int i = 0; i < count; i++) {
-            int32_t nameIndex = Paradise_hook->read<int32_t>(boneInfoPtr + i * kBoneInfoStride);
-            int32_t parentIdx = Paradise_hook->read<int32_t>(boneInfoPtr + i * kBoneInfoStride + 0x08);
+            int32_t nameIndex = GetDriverManager().read<int32_t>(boneInfoPtr + i * kBoneInfoStride);
+            int32_t parentIdx = GetDriverManager().read<int32_t>(boneInfoPtr + i * kBoneInfoStride + 0x08);
             std::string boneName = GetNameByIndex(nameIndex, sLibUE4);
 
             // 按当前 48 字节 stride 读取
             FTransform bone;
-            Paradise_hook->read(boneDataPtr + i * sizeof(FTransform), &bone, sizeof(FTransform));
+            GetDriverManager().read(boneDataPtr + i * sizeof(FTransform), &bone, sizeof(FTransform));
             float quatLen2 = bone.Rotation.X * bone.Rotation.X
                            + bone.Rotation.Y * bone.Rotation.Y
                            + bone.Rotation.Z * bone.Rotation.Z
@@ -314,25 +591,25 @@ void DumpBones() {
 
 // 读取游戏 FPS Level（仅读取 FPS Level，不打印其他设置）
 static int ReadGameFPSLevel() {
-    if (!Paradise_hook || driver_stat.load(std::memory_order_relaxed) <= 0) {
+    if (driver_stat.load(std::memory_order_relaxed) <= 0) {
         return 6; // 默认 60fps
     }
 
     // 通过 GameInstance → FrontendHUD → UserSettings 访问 SettingConfig
-    uint64_t uworld = Paradise_hook->read<uint64_t>(sLibUE4 + offset.Gworld);
+    uint64_t uworld = GetDriverManager().read<uint64_t>(sLibUE4 + offset.Gworld);
     if (uworld == 0) return 6;
 
-    uint64_t gameInstance = Paradise_hook->read<uint64_t>(uworld + 0xb00);
+    uint64_t gameInstance = GetDriverManager().read<uint64_t>(uworld + offset.GameInstance);
     if (gameInstance == 0) return 6;
 
-    uint64_t frontendHUD = Paradise_hook->read<uint64_t>(gameInstance + 0x4a8);
+    uint64_t frontendHUD = GetDriverManager().read<uint64_t>(gameInstance + offset.AssociatedFrontendHUD);
     if (frontendHUD == 0) return 6;
 
-    uint64_t userSettings = Paradise_hook->read<uint64_t>(frontendHUD + 0xbc8);
+    uint64_t userSettings = GetDriverManager().read<uint64_t>(frontendHUD + offset.FrontendHUDUserSettings);
     if (userSettings == 0) return 6;
 
     // 读取 FPS Level (offset 0x120)
-    int fpsLevel = Paradise_hook->read<int32_t>(userSettings + 0x120);
+    int fpsLevel = GetDriverManager().read<int32_t>(userSettings + 0x120);
 
     // 验证范围 (2-9)
     if (fpsLevel < 2 || fpsLevel > 9) {
@@ -381,9 +658,25 @@ std::shared_ptr<std::vector<CachedActor>> GetCachedActors() {
     std::lock_guard<std::mutex> lock(gActorListMtx);
     auto all = std::make_shared<std::vector<CachedActor>>();
     all->reserve(gClassifiedActors->players.size() +
+                 gClassifiedActors->bots.size() +
+                 gClassifiedActors->npcs.size() +
+                 gClassifiedActors->monsters.size() +
+                 gClassifiedActors->tombBoxes.size() +
+                 gClassifiedActors->otherBoxes.size() +
+                 gClassifiedActors->escapeBoxes.size() +
+                 gClassifiedActors->escapeInnerBoxes.size() +
+                 gClassifiedActors->containers.size() +
                  gClassifiedActors->vehicles.size() +
                  gClassifiedActors->others.size());
     all->insert(all->end(), gClassifiedActors->players.begin(), gClassifiedActors->players.end());
+    all->insert(all->end(), gClassifiedActors->bots.begin(), gClassifiedActors->bots.end());
+    all->insert(all->end(), gClassifiedActors->npcs.begin(), gClassifiedActors->npcs.end());
+    all->insert(all->end(), gClassifiedActors->monsters.begin(), gClassifiedActors->monsters.end());
+    all->insert(all->end(), gClassifiedActors->tombBoxes.begin(), gClassifiedActors->tombBoxes.end());
+    all->insert(all->end(), gClassifiedActors->otherBoxes.begin(), gClassifiedActors->otherBoxes.end());
+    all->insert(all->end(), gClassifiedActors->escapeBoxes.begin(), gClassifiedActors->escapeBoxes.end());
+    all->insert(all->end(), gClassifiedActors->escapeInnerBoxes.begin(), gClassifiedActors->escapeInnerBoxes.end());
+    all->insert(all->end(), gClassifiedActors->containers.begin(), gClassifiedActors->containers.end());
     all->insert(all->end(), gClassifiedActors->vehicles.begin(), gClassifiedActors->vehicles.end());
     all->insert(all->end(), gClassifiedActors->others.begin(), gClassifiedActors->others.end());
     return all;
@@ -404,7 +697,7 @@ static void readThreadFunc() {
         ReadFrameData frame;
 
         // ── 每次扫描都读取 uworld（检测 world 切换）──
-        frame.uworld = Paradise_hook->read<uint64_t>(sLibUE4 + offset.Gworld);
+        frame.uworld = GetDriverManager().read<uint64_t>(sLibUE4 + offset.Gworld);
         if (frame.uworld == 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             continue;
@@ -425,36 +718,38 @@ static void readThreadFunc() {
         gTargetFPS = GetFPSFromLevel(newFPSLevel);
 
         // 刷新 LocalPlayerActor
-        uint64_t netDriver = Paradise_hook->read<uint64_t>(frame.uworld + offset.NetDriver);
+        uint64_t netDriver = GetDriverManager().read<uint64_t>(frame.uworld + offset.NetDriver);
         if (netDriver != 0) {
-            uint64_t serverConnection = Paradise_hook->read<uint64_t>(netDriver + offset.ServerConnection);
+            uint64_t serverConnection = GetDriverManager().read<uint64_t>(netDriver + offset.ServerConnection);
             uint64_t connection = 0;
             if (serverConnection != 0) {
                 connection = serverConnection;
             } else {
                 uint64_t clientConnectionsArray = netDriver + 0x90;
-                uint64_t clientConnectionsData = Paradise_hook->read<uint64_t>(clientConnectionsArray);
-                int clientConnectionsCount = Paradise_hook->read<int>(clientConnectionsArray + 0x8);
+                uint64_t clientConnectionsData = GetDriverManager().read<uint64_t>(clientConnectionsArray);
+                int clientConnectionsCount = GetDriverManager().read<int>(clientConnectionsArray + 0x8);
                 if (clientConnectionsData != 0 && clientConnectionsCount > 0) {
-                    connection = Paradise_hook->read<uint64_t>(clientConnectionsData);
+                    connection = GetDriverManager().read<uint64_t>(clientConnectionsData);
                 }
             }
             if (connection != 0) {
-                uint64_t playerController = Paradise_hook->read<uint64_t>(connection + offset.PlayerController);
+                uint64_t playerController = GetDriverManager().read<uint64_t>(connection + offset.PlayerController);
                 if (playerController != 0) {
-                    address.LocalPlayerActor = Paradise_hook->read<uint64_t>(playerController + offset.AcknowledgedPawn);
+                    address.LocalPlayerActor = GetDriverManager().read<uint64_t>(playerController + offset.AcknowledgedPawn);
+                    address.LocalPlayerKey = GetDriverManager().read<uint32_t>(playerController + offset.ControllerPlayerKey);
+                    address.LocalPlayerTeamID = GetDriverManager().read<int32_t>(playerController + offset.ControllerTeamID);
                 }
             }
         }
 
         // ── Actor 列表扫描 ──
-        frame.persistentLevel = Paradise_hook->read<uint64_t>(frame.uworld + offset.PersistentLevel);
-        uint64_t TArray = Paradise_hook->read<uint64_t>(frame.persistentLevel + offset.TArray);
-        frame.actorCount = Paradise_hook->read<int>(frame.persistentLevel + offset.TArray + 0x8);
+        frame.persistentLevel = GetDriverManager().read<uint64_t>(frame.uworld + offset.PersistentLevel);
+        uint64_t TArray = GetDriverManager().read<uint64_t>(frame.persistentLevel + offset.TArray);
+        frame.actorCount = GetDriverManager().read<int>(frame.persistentLevel + offset.TArray + 0x8);
         if (frame.actorCount <= 0) frame.actorCount = 0;
 
         std::vector<uint64_t> ptrBuf(frame.actorCount);
-        Paradise_hook->read(TArray, ptrBuf.data(), frame.actorCount * sizeof(uint64_t));
+        GetDriverManager().read(TArray, ptrBuf.data(), frame.actorCount * sizeof(uint64_t));
 
         std::vector<CachedActor> newActors;
         newActors.reserve(frame.actorCount);
@@ -465,12 +760,12 @@ static void readThreadFunc() {
                 continue;
 
             // 每次都完整读取，不使用缓存
-            uint64_t rootComp = Paradise_hook->read<uint64_t>(addr + offset.RootComponent);
+            uint64_t rootComp = GetDriverManager().read<uint64_t>(addr + offset.RootComponent);
 
             std::string className;
-            uint64_t classPtr = Paradise_hook->read<uint64_t>(addr + 0x10);
+            uint64_t classPtr = GetDriverManager().read<uint64_t>(addr + 0x10);
             if (classPtr != 0) {
-                int32_t classNameIdx = Paradise_hook->read<int32_t>(classPtr + 0x18);
+                int32_t classNameIdx = GetDriverManager().read<int32_t>(classPtr + 0x18);
                 className = GetNameByIndex(classNameIdx, sLibUE4);
             }
 
@@ -480,11 +775,11 @@ static void readThreadFunc() {
             CachedActor ca(addr, rootComp, std::move(className), std::move(displayName), actorType);
 
             {
-                uint64_t fstringData = Paradise_hook->read<uint64_t>(addr + offset.PlayerName);
-                int32_t fstringLen = Paradise_hook->read<int32_t>(addr + offset.PlayerName + 0x8);
+                uint64_t fstringData = GetDriverManager().read<uint64_t>(addr + offset.PlayerName);
+                int32_t fstringLen = GetDriverManager().read<int32_t>(addr + offset.PlayerName + 0x8);
                 if (fstringData != 0 && fstringLen > 0 && fstringLen < 128) {
                     std::vector<char16_t> utf16buf(fstringLen);
-                    Paradise_hook->read(fstringData, utf16buf.data(), fstringLen * sizeof(char16_t));
+                    GetDriverManager().read(fstringData, utf16buf.data(), fstringLen * sizeof(char16_t));
                     std::string name;
                     name.reserve(fstringLen * 3);
                     for (int j = 0; j < fstringLen - 1; j++) {
@@ -505,27 +800,41 @@ static void readThreadFunc() {
                 }
             }
 
-            ca.teamID = Paradise_hook->read<int32_t>(addr + offset.TeamID);
+            ca.playerKey = GetDriverManager().read<uint32_t>(addr + offset.CharacterPlayerKey);
+            ca.teamID = GetDriverManager().read<int32_t>(addr + offset.TeamID);
+            const bool isAI = GetDriverManager().read<uint8_t>(addr + offset.bIsAI) != 0;
+            const bool isMLAI = GetDriverManager().read<uint8_t>(addr + offset.bIsMLAI) != 0;
+            if (actorType == ActorType::PLAYER && (isAI || isMLAI)) {
+                ca.actorType = ActorType::BOT;
+                ca.displayName = "Bot";
+            }
 
-            uint64_t skelMeshComp = Paradise_hook->read<uint64_t>(addr + offset.SkeletalMeshComponent);
+            if (ca.actorType == ActorType::TOMB_BOX || ca.actorType == ActorType::OTHER_BOX) {
+                ca.linkedActorAddr = ResolveTombBoxWrapperActor(addr);
+                FillPickUpWrapperDisplayData(ca.linkedActorAddr, ca.containerItemCount, ca.containerSummary);
+            } else if (ca.actorType == ActorType::CONTAINER) {
+                FillPickUpWrapperDisplayData(addr, ca.containerItemCount, ca.containerSummary);
+            }
+
+            uint64_t skelMeshComp = GetDriverManager().read<uint64_t>(addr + offset.SkeletalMeshComponent);
             if (skelMeshComp != 0) {
                 ca.skelMeshCompAddr = skelMeshComp;
-                int boneCount = Paradise_hook->read<int>(skelMeshComp + offset.ComponentSpaceTransforms + 0x8);
-                uint64_t boneDataPtr = Paradise_hook->read<uint64_t>(skelMeshComp + offset.ComponentSpaceTransforms);
+                int boneCount = GetDriverManager().read<int>(skelMeshComp + offset.ComponentSpaceTransforms + 0x8);
+                uint64_t boneDataPtr = GetDriverManager().read<uint64_t>(skelMeshComp + offset.ComponentSpaceTransforms);
                 if (boneCount > 0 && boneCount < 300 && boneDataPtr != 0) {
                     ca.cachedBoneCount = boneCount;
                     ca.boneDataPtr = boneDataPtr;
                 }
 
-                uint64_t skelMesh = Paradise_hook->read<uint64_t>(skelMeshComp + offset.SkeletalMesh);
+                uint64_t skelMesh = GetDriverManager().read<uint64_t>(skelMeshComp + offset.SkeletalMesh);
                 if (skelMesh != 0) {
-                    uint64_t boneInfoPtr = Paradise_hook->read<uint64_t>(skelMesh + offset.RefBoneInfo);
-                    int boneInfoCount = Paradise_hook->read<int>(skelMesh + offset.RefBoneInfo + 0x8);
+                    uint64_t boneInfoPtr = GetDriverManager().read<uint64_t>(skelMesh + offset.RefBoneInfo);
+                    int boneInfoCount = GetDriverManager().read<int>(skelMesh + offset.RefBoneInfo + 0x8);
 
                     if (boneInfoCount > 0 && boneInfoCount < 300) {
                         constexpr int kBoneInfoStride = 0x10;
                         for (int j = 0; j < boneInfoCount; j++) {
-                            int32_t nameIndex = Paradise_hook->read<int32_t>(boneInfoPtr + j * kBoneInfoStride);
+                            int32_t nameIndex = GetDriverManager().read<int32_t>(boneInfoPtr + j * kBoneInfoStride);
                             std::string boneName = GetNameByIndex(nameIndex, sLibUE4);
 
                             auto it = gBoneNameToID.find(boneName);
@@ -541,12 +850,135 @@ static void readThreadFunc() {
             newActors.push_back(std::move(ca));
         }
 
+        {
+            std::unordered_map<uint64_t, uint64_t> wrapperToBox;
+            wrapperToBox.reserve(newActors.size());
+            for (const CachedActor& actor : newActors) {
+                if ((actor.actorType == ActorType::TOMB_BOX || actor.actorType == ActorType::OTHER_BOX) &&
+                    actor.linkedActorAddr != 0) {
+                    wrapperToBox[actor.linkedActorAddr] = actor.actorAddr;
+                }
+            }
+            for (CachedActor& actor : newActors) {
+                if (actor.actorType != ActorType::CONTAINER) {
+                    continue;
+                }
+                auto it = wrapperToBox.find(actor.actorAddr);
+                if (it != wrapperToBox.end()) {
+                    actor.linkedActorAddr = it->second;
+                }
+            }
+        }
+
+        {
+            struct IndexedPos {
+                size_t index = 0;
+                Vec3 pos{};
+            };
+
+            std::vector<IndexedPos> containers;
+            std::vector<IndexedPos> innerBoxes;
+            std::vector<IndexedPos> escapeBoxes;
+            containers.reserve(newActors.size());
+            innerBoxes.reserve(newActors.size());
+            escapeBoxes.reserve(newActors.size());
+
+            for (size_t i = 0; i < newActors.size(); ++i) {
+                Vec3 pos{};
+                if (!TryReadActorWorldPos(newActors[i].rootCompAddr, pos)) {
+                    continue;
+                }
+                switch (newActors[i].actorType) {
+                    case ActorType::CONTAINER:
+                        containers.push_back({i, pos});
+                        break;
+                    case ActorType::ESCAPE_INNER_BOX:
+                        innerBoxes.push_back({i, pos});
+                        break;
+                    case ActorType::ESCAPE_BOX:
+                        escapeBoxes.push_back({i, pos});
+                        break;
+                    default:
+                        break;
+                }
+            }
+
+            constexpr float kInnerBoxToContainerMaxDistance = 250.0f;
+            constexpr float kEscapeBoxToInnerBoxMaxDistance = 350.0f;
+
+            for (const IndexedPos& innerBox : innerBoxes) {
+                float bestDistance = kInnerBoxToContainerMaxDistance;
+                size_t bestContainerIndex = static_cast<size_t>(-1);
+                for (const IndexedPos& container : containers) {
+                    const float distance = Vec3::Distance(innerBox.pos, container.pos);
+                    if (distance < bestDistance) {
+                        bestDistance = distance;
+                        bestContainerIndex = container.index;
+                    }
+                }
+                if (bestContainerIndex == static_cast<size_t>(-1)) {
+                    continue;
+                }
+
+                CachedActor& innerActor = newActors[innerBox.index];
+                const CachedActor& containerActor = newActors[bestContainerIndex];
+                innerActor.linkedActorAddr = containerActor.actorAddr;
+                innerActor.containerItemCount = containerActor.containerItemCount;
+                innerActor.containerSummary = containerActor.containerSummary;
+            }
+
+            for (const IndexedPos& escapeBox : escapeBoxes) {
+                float bestDistance = kEscapeBoxToInnerBoxMaxDistance;
+                size_t bestInnerIndex = static_cast<size_t>(-1);
+                for (const IndexedPos& innerBox : innerBoxes) {
+                    const float distance = Vec3::Distance(escapeBox.pos, innerBox.pos);
+                    if (distance < bestDistance) {
+                        bestDistance = distance;
+                        bestInnerIndex = innerBox.index;
+                    }
+                }
+                if (bestInnerIndex == static_cast<size_t>(-1)) {
+                    continue;
+                }
+
+                CachedActor& escapeActor = newActors[escapeBox.index];
+                const CachedActor& innerActor = newActors[bestInnerIndex];
+                escapeActor.linkedActorAddr = innerActor.actorAddr;
+                escapeActor.containerItemCount = innerActor.containerItemCount;
+                escapeActor.containerSummary = innerActor.containerSummary;
+            }
+        }
+
         // 分类
         auto classified = std::make_shared<ClassifiedActors>();
         for (auto& actor : newActors) {
             switch (actor.actorType) {
                 case ActorType::PLAYER:
                     classified->players.push_back(std::move(actor));
+                    break;
+                case ActorType::BOT:
+                    classified->bots.push_back(std::move(actor));
+                    break;
+                case ActorType::NPC:
+                    classified->npcs.push_back(std::move(actor));
+                    break;
+                case ActorType::MONSTER:
+                    classified->monsters.push_back(std::move(actor));
+                    break;
+                case ActorType::TOMB_BOX:
+                    classified->tombBoxes.push_back(std::move(actor));
+                    break;
+                case ActorType::OTHER_BOX:
+                    classified->otherBoxes.push_back(std::move(actor));
+                    break;
+                case ActorType::ESCAPE_BOX:
+                    classified->escapeBoxes.push_back(std::move(actor));
+                    break;
+                case ActorType::ESCAPE_INNER_BOX:
+                    classified->escapeInnerBoxes.push_back(std::move(actor));
+                    break;
+                case ActorType::CONTAINER:
+                    classified->containers.push_back(std::move(actor));
                     break;
                 case ActorType::VEHICLE:
                     classified->vehicles.push_back(std::move(actor));
@@ -606,19 +1038,19 @@ void DebugGUObjectArray() {
       printf("MaxElements addr (0x14706540): 0x%lx\n", test4);
 
       // 读取值
-      int32_t numElements = Paradise_hook->read<int32_t>(test3);
-      int32_t maxElements = Paradise_hook->read<int32_t>(test4);
+      int32_t numElements = GetDriverManager().read<int32_t>(test3);
+      int32_t maxElements = GetDriverManager().read<int32_t>(test4);
 
       printf("NumElements value: %d\n", numElements);
       printf("MaxElements value: %d\n", maxElements);
 
       // 读取 chunk 指针
-      uint64_t chunkPtr = Paradise_hook->read<uint64_t>(test2 + 0xC8);
+      uint64_t chunkPtr = GetDriverManager().read<uint64_t>(test2 + 0xC8);
       printf("First chunk pointer: 0x%lx\n", chunkPtr);
 
       // 读取第一个对象
       if (chunkPtr != 0) {
-          uint64_t firstObj = Paradise_hook->read<uint64_t>(chunkPtr);
+          uint64_t firstObj = GetDriverManager().read<uint64_t>(chunkPtr);
           printf("First object: 0x%lx\n", firstObj);
       }
       fflush(stdout);
@@ -629,7 +1061,7 @@ void ScanForClass(const char* className) {
 
     DebugGUObjectArray();
 
-    if (!Paradise_hook || driver_stat.load(std::memory_order_relaxed) <= 0) {
+    if (driver_stat.load(std::memory_order_relaxed) <= 0) {
         printf("ERROR: Driver not initialized\n");
         fflush(stdout);
         return;
@@ -642,8 +1074,8 @@ void ScanForClass(const char* className) {
     uint64_t GUObjectArrayBase = sLibUE4 + 0x147063A0;
 
     // 读取 NumElements (GUObjectArray + 0x19C)
-    int32_t NumElements = Paradise_hook->read<int32_t>(GUObjectArrayBase + 0x19C);
-    int32_t MaxElements = Paradise_hook->read<int32_t>(GUObjectArrayBase + 0x1A0);
+    int32_t NumElements = GetDriverManager().read<int32_t>(GUObjectArrayBase + 0x19C);
+    int32_t MaxElements = GetDriverManager().read<int32_t>(GUObjectArrayBase + 0x1A0);
 
     printf("NumElements: %d, MaxElements: %d\n", NumElements, MaxElements);
     fflush(stdout);
@@ -658,7 +1090,7 @@ void ScanForClass(const char* className) {
     uint64_t ObjObjectsBase = GUObjectArrayBase + 0xE0;
 
     // 读取第一个 chunk 指针 (ObjObjects + 0xC8)
-    uint64_t FirstChunkPtr = Paradise_hook->read<uint64_t>(ObjObjectsBase + 0xC8);
+    uint64_t FirstChunkPtr = GetDriverManager().read<uint64_t>(ObjObjectsBase + 0xC8);
 
     printf("ObjObjectsBase: 0x%lx\n", ObjObjectsBase);
     printf("FirstChunkPtr: 0x%lx\n", FirstChunkPtr);
@@ -671,7 +1103,7 @@ void ScanForClass(const char* className) {
         // 尝试备用方法：直接从 offset.GUObject 读取
         printf("Trying alternative method...\n");
         fflush(stdout);
-        uint64_t altChunkPtr = Paradise_hook->read<uint64_t>(sLibUE4 + offset.GUObject);
+        uint64_t altChunkPtr = GetDriverManager().read<uint64_t>(sLibUE4 + offset.GUObject);
         printf("Alternative chunk pointer: 0x%lx\n", altChunkPtr);
         fflush(stdout);
 
@@ -696,7 +1128,7 @@ void ScanForClass(const char* className) {
     for (int i = 0; i < NumElements && i < 500000; i++) {
         // FUObjectItem 大小 = 0x18 (24 字节)
         // +0x00: UObject* Object
-        uint64_t objectPtr = Paradise_hook->read<uint64_t>(FirstChunkPtr + i * 0x18);
+        uint64_t objectPtr = GetDriverManager().read<uint64_t>(FirstChunkPtr + i * 0x18);
 
         if (objectPtr == 0 || objectPtr < 0x10000ULL || objectPtr > 0x800000000000ULL) {
             continue;
@@ -710,10 +1142,10 @@ void ScanForClass(const char* className) {
         // 打印前 50 个有效对象的详细信息
         if (sampleCount < 50 && !objName.empty()) {
             // 读取对象的类指针
-            uint64_t classPtr = Paradise_hook->read<uint64_t>(objectPtr + 0x10);
+            uint64_t classPtr = GetDriverManager().read<uint64_t>(objectPtr + 0x10);
             std::string className_actual;
             if (classPtr != 0) {
-                int32_t classNameIdx = Paradise_hook->read<int32_t>(classPtr + 0x18);
+                int32_t classNameIdx = GetDriverManager().read<int32_t>(classPtr + 0x18);
                 className_actual = GetNameByIndex(classNameIdx, sLibUE4);
             }
 
@@ -731,10 +1163,10 @@ void ScanForClass(const char* className) {
 
         if (objNameLower.find(targetLower) != std::string::npos) {
             // 读取类名进行验证
-            uint64_t classPtr = Paradise_hook->read<uint64_t>(objectPtr + 0x10);
+            uint64_t classPtr = GetDriverManager().read<uint64_t>(objectPtr + 0x10);
             std::string className_actual;
             if (classPtr != 0) {
-                int32_t classNameIdx = Paradise_hook->read<int32_t>(classPtr + 0x18);
+                int32_t classNameIdx = GetDriverManager().read<int32_t>(classPtr + 0x18);
                 className_actual = GetNameByIndex(classNameIdx, sLibUE4);
             }
 
@@ -786,7 +1218,7 @@ void FindUClass(const char* className) {
     printf("=== FindUClass called for: %s ===\n", className);
     fflush(stdout);
 
-    if (!Paradise_hook || driver_stat.load(std::memory_order_relaxed) <= 0) {
+    if (driver_stat.load(std::memory_order_relaxed) <= 0) {
         printf("ERROR: Driver not initialized\n");
         fflush(stdout);
         return;
@@ -795,9 +1227,9 @@ void FindUClass(const char* className) {
     std::vector<std::pair<uint64_t, std::string>> results;
 
     uint64_t GUObjectArrayBase = sLibUE4 + 0x147063A0;
-    int32_t NumElements = Paradise_hook->read<int32_t>(GUObjectArrayBase + 0x19C);
+    int32_t NumElements = GetDriverManager().read<int32_t>(GUObjectArrayBase + 0x19C);
     uint64_t ObjObjectsBase = GUObjectArrayBase + 0xE0;
-    uint64_t FirstChunkPtr = Paradise_hook->read<uint64_t>(ObjObjectsBase + 0xC8);
+    uint64_t FirstChunkPtr = GetDriverManager().read<uint64_t>(ObjObjectsBase + 0xC8);
 
     if (FirstChunkPtr == 0) {
         printf("ERROR: FirstChunkPtr is NULL!\n");
@@ -813,18 +1245,18 @@ void FindUClass(const char* className) {
     std::transform(targetClassName.begin(), targetClassName.end(), targetClassName.begin(), ::tolower);
 
     for (int i = 0; i < NumElements && i < 500000; i++) {
-        uint64_t objectPtr = Paradise_hook->read<uint64_t>(FirstChunkPtr + i * 0x18);
+        uint64_t objectPtr = GetDriverManager().read<uint64_t>(FirstChunkPtr + i * 0x18);
 
         if (objectPtr == 0 || objectPtr < 0x10000ULL || objectPtr > 0x800000000000ULL) {
             continue;
         }
 
         // 读取对象的类指针
-        uint64_t classPtr = Paradise_hook->read<uint64_t>(objectPtr + 0x10);
+        uint64_t classPtr = GetDriverManager().read<uint64_t>(objectPtr + 0x10);
         if (classPtr == 0) continue;
 
         // 获取类的名称
-        int32_t classNameIdx = Paradise_hook->read<int32_t>(classPtr + 0x18);
+        int32_t classNameIdx = GetDriverManager().read<int32_t>(classPtr + 0x18);
         std::string className_actual = GetNameByIndex(classNameIdx, sLibUE4);
 
         // 检查这个对象的类是否是 "Class"（即这个对象本身是一个 UClass）
@@ -871,37 +1303,37 @@ void FindSettingConfigViaGameInstance() {
     printf("=== Reading Game FPS Level ===\n");
     fflush(stdout);
 
-    if (!Paradise_hook || driver_stat.load(std::memory_order_relaxed) <= 0) {
+    if (driver_stat.load(std::memory_order_relaxed) <= 0) {
         printf("ERROR: Driver not initialized\n");
         fflush(stdout);
         return;
     }
 
     // 1. 从 UWorld 获取 GameInstance
-    uint64_t uworld = Paradise_hook->read<uint64_t>(sLibUE4 + offset.Gworld);
+    uint64_t uworld = GetDriverManager().read<uint64_t>(sLibUE4 + offset.Gworld);
     if (uworld == 0) {
         printf("ERROR: UWorld is NULL\n");
         fflush(stdout);
         return;
     }
 
-    uint64_t gameInstance = Paradise_hook->read<uint64_t>(uworld + 0xb00);
+    uint64_t gameInstance = GetDriverManager().read<uint64_t>(uworld + offset.GameInstance);
     if (gameInstance == 0) {
         printf("ERROR: GameInstance not found\n");
         fflush(stdout);
         return;
     }
 
-    // 2. 从 GameInstance 获取 AssociatedFrontendHUD (offset 0x4a8)
-    uint64_t frontendHUD = Paradise_hook->read<uint64_t>(gameInstance + 0x4a8);
+    // 2. 从 GameInstance 获取 AssociatedFrontendHUD
+    uint64_t frontendHUD = GetDriverManager().read<uint64_t>(gameInstance + offset.AssociatedFrontendHUD);
     if (frontendHUD == 0) {
         printf("ERROR: AssociatedFrontendHUD is NULL\n");
         fflush(stdout);
         return;
     }
 
-    // 3. 从 FrontendHUD 读取 UserSettings (offset 0xbc8)
-    uint64_t userSettings = Paradise_hook->read<uint64_t>(frontendHUD + 0xbc8);
+    // 3. 从 FrontendHUD 读取 UserSettings
+    uint64_t userSettings = GetDriverManager().read<uint64_t>(frontendHUD + offset.FrontendHUDUserSettings);
     if (userSettings == 0) {
         printf("ERROR: UserSettings is NULL\n");
         fflush(stdout);
@@ -909,7 +1341,7 @@ void FindSettingConfigViaGameInstance() {
     }
 
     // 4. 读取 FPS Level (offset 0x120)
-    int fpsLevel = Paradise_hook->read<int32_t>(userSettings + 0x120);
+    int fpsLevel = GetDriverManager().read<int32_t>(userSettings + 0x120);
 
     // FPS Level 映射
     const char* fpsMapping[] = {

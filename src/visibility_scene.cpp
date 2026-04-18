@@ -4,7 +4,14 @@
 #include <cmath>
 #include <limits>
 #include <shared_mutex>
+#include <time.h>
 #include <utility>
+
+static double GetMonotoneSec() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
 
 #if defined(__ARM_NEON) || defined(__aarch64__)
 #include <arm_neon.h>
@@ -60,27 +67,41 @@ static bool BoundsLaneOverlaps(const VisibilityRaycastQuery& query,
 }
 
 #if defined(__ARM_NEON) || defined(__aarch64__)
-static uint32_t BoundsOverlapMask4(const VisibilityRaycastQuery& query,
+struct NeonQueryBounds {
+    float32x4_t minX, minY, minZ, maxX, maxY, maxZ;
+};
+
+static NeonQueryBounds PrebroadcastQueryBounds(const VisibilityRaycastQuery& query) {
+    return {
+        vdupq_n_f32(query.SegmentBounds.Min.X),
+        vdupq_n_f32(query.SegmentBounds.Min.Y),
+        vdupq_n_f32(query.SegmentBounds.Min.Z),
+        vdupq_n_f32(query.SegmentBounds.Max.X),
+        vdupq_n_f32(query.SegmentBounds.Max.Y),
+        vdupq_n_f32(query.SegmentBounds.Max.Z),
+    };
+}
+
+static uint32_t BoundsOverlapMask4(const NeonQueryBounds& qb,
                                    const float* minX, const float* minY, const float* minZ,
                                    const float* maxX, const float* maxY, const float* maxZ) {
-    const float32x4_t queryMinX = vdupq_n_f32(query.SegmentBounds.Min.X);
-    const float32x4_t queryMinY = vdupq_n_f32(query.SegmentBounds.Min.Y);
-    const float32x4_t queryMinZ = vdupq_n_f32(query.SegmentBounds.Min.Z);
-    const float32x4_t queryMaxX = vdupq_n_f32(query.SegmentBounds.Max.X);
-    const float32x4_t queryMaxY = vdupq_n_f32(query.SegmentBounds.Max.Y);
-    const float32x4_t queryMaxZ = vdupq_n_f32(query.SegmentBounds.Max.Z);
-
-    uint32x4_t overlap = vcleq_f32(vld1q_f32(minX), queryMaxX);
-    overlap = vandq_u32(overlap, vcgeq_f32(vld1q_f32(maxX), queryMinX));
-    overlap = vandq_u32(overlap, vcleq_f32(vld1q_f32(minY), queryMaxY));
-    overlap = vandq_u32(overlap, vcgeq_f32(vld1q_f32(maxY), queryMinY));
-    overlap = vandq_u32(overlap, vcleq_f32(vld1q_f32(minZ), queryMaxZ));
-    overlap = vandq_u32(overlap, vcgeq_f32(vld1q_f32(maxZ), queryMinZ));
+    uint32x4_t overlap = vcleq_f32(vld1q_f32(minX), qb.maxX);
+    overlap = vandq_u32(overlap, vcgeq_f32(vld1q_f32(maxX), qb.minX));
+    overlap = vandq_u32(overlap, vcleq_f32(vld1q_f32(minY), qb.maxY));
+    overlap = vandq_u32(overlap, vcgeq_f32(vld1q_f32(maxY), qb.minY));
+    overlap = vandq_u32(overlap, vcleq_f32(vld1q_f32(minZ), qb.maxZ));
+    overlap = vandq_u32(overlap, vcgeq_f32(vld1q_f32(maxZ), qb.minZ));
 
     return ((vgetq_lane_u32(overlap, 0) != 0u) ? 1u : 0u) |
            ((vgetq_lane_u32(overlap, 1) != 0u) ? 2u : 0u) |
            ((vgetq_lane_u32(overlap, 2) != 0u) ? 4u : 0u) |
            ((vgetq_lane_u32(overlap, 3) != 0u) ? 8u : 0u);
+}
+
+static uint32_t BoundsOverlapMask4(const VisibilityRaycastQuery& query,
+                                   const float* minX, const float* minY, const float* minZ,
+                                   const float* maxX, const float* maxY, const float* maxZ) {
+    return BoundsOverlapMask4(PrebroadcastQueryBounds(query), minX, minY, minZ, maxX, maxY, maxZ);
 }
 #endif
 
@@ -158,12 +179,12 @@ static void AppendTriangle(VisibilityScene::SceneMesh& mesh,
     mesh.Triangles.Edge2Y.push_back(edge2.Y);
     mesh.Triangles.Edge2Z.push_back(edge2.Z);
 
-    const float minX = std::min({a.X, b.X, c.X}) - kBoundsInflate;
-    const float minY = std::min({a.Y, b.Y, c.Y}) - kBoundsInflate;
-    const float minZ = std::min({a.Z, b.Z, c.Z}) - kBoundsInflate;
-    const float maxX = std::max({a.X, b.X, c.X}) + kBoundsInflate;
-    const float maxY = std::max({a.Y, b.Y, c.Y}) + kBoundsInflate;
-    const float maxZ = std::max({a.Z, b.Z, c.Z}) + kBoundsInflate;
+    const float minX = std::min(a.X, std::min(b.X, c.X)) - kBoundsInflate;
+    const float minY = std::min(a.Y, std::min(b.Y, c.Y)) - kBoundsInflate;
+    const float minZ = std::min(a.Z, std::min(b.Z, c.Z)) - kBoundsInflate;
+    const float maxX = std::max(a.X, std::max(b.X, c.X)) + kBoundsInflate;
+    const float maxY = std::max(a.Y, std::max(b.Y, c.Y)) + kBoundsInflate;
+    const float maxZ = std::max(a.Z, std::max(b.Z, c.Z)) + kBoundsInflate;
 
     mesh.Triangles.MinX.push_back(minX);
     mesh.Triangles.MinY.push_back(minY);
@@ -261,7 +282,7 @@ VisibilityScene::SceneMesh VisibilityScene::BuildSceneMesh(const VisibilityMeshD
 }
 
 std::shared_ptr<VisibilityScene::SceneSnapshot> VisibilityScene::BuildSnapshot(
-    const std::unordered_map<uint64_t, SceneMesh>& meshes) {
+    const std::unordered_map<uint64_t, std::shared_ptr<SceneMesh>>& meshes) {
     auto snapshot = std::make_shared<SceneSnapshot>();
     snapshot->Meshes.reserve(meshes.size());
     snapshot->MeshMinX.reserve(meshes.size());
@@ -271,16 +292,16 @@ std::shared_ptr<VisibilityScene::SceneSnapshot> VisibilityScene::BuildSnapshot(
     snapshot->MeshMaxY.reserve(meshes.size());
     snapshot->MeshMaxZ.reserve(meshes.size());
 
-    for (const auto& [key, mesh] : meshes) {
+    for (const auto& [key, meshPtr] : meshes) {
         (void)key;
-        if (!IsBoundsValid(mesh.Bounds) || mesh.Triangles.V0X.empty()) continue;
-        snapshot->MeshMinX.push_back(mesh.Bounds.Min.X);
-        snapshot->MeshMinY.push_back(mesh.Bounds.Min.Y);
-        snapshot->MeshMinZ.push_back(mesh.Bounds.Min.Z);
-        snapshot->MeshMaxX.push_back(mesh.Bounds.Max.X);
-        snapshot->MeshMaxY.push_back(mesh.Bounds.Max.Y);
-        snapshot->MeshMaxZ.push_back(mesh.Bounds.Max.Z);
-        snapshot->Meshes.push_back(mesh);
+        if (!IsBoundsValid(meshPtr->Bounds) || meshPtr->Triangles.V0X.empty()) continue;
+        snapshot->MeshMinX.push_back(meshPtr->Bounds.Min.X);
+        snapshot->MeshMinY.push_back(meshPtr->Bounds.Min.Y);
+        snapshot->MeshMinZ.push_back(meshPtr->Bounds.Min.Z);
+        snapshot->MeshMaxX.push_back(meshPtr->Bounds.Max.X);
+        snapshot->MeshMaxY.push_back(meshPtr->Bounds.Max.Y);
+        snapshot->MeshMaxZ.push_back(meshPtr->Bounds.Max.Z);
+        snapshot->Meshes.push_back(meshPtr);
     }
     return snapshot;
 }
@@ -288,12 +309,65 @@ std::shared_ptr<VisibilityScene::SceneSnapshot> VisibilityScene::BuildSnapshot(
 void VisibilityScene::UpdateMeshes(const std::vector<VisibilityMeshData>& adds,
                                    const std::vector<uint64_t>& removes) {
     std::vector<SceneMesh> builtAdds;
-    builtAdds.reserve(adds.size());
-    for (const VisibilityMeshData& mesh : adds) {
-        if (mesh.Key == 0 || mesh.Vertices.empty() || mesh.Indices.size() < 3) continue;
+    builtAdds.reserve(adds.size() + PendingRetries_.size());
+
+    const double now = GetMonotoneSec();
+
+    // First, retry pending meshes (priority over new adds)
+    for (auto it = PendingRetries_.begin(); it != PendingRetries_.end(); ) {
+        if (now - it->LastAttemptTime < 1.0) {
+            ++it;
+            continue;
+        }
+
+        const VisibilityMeshData& mesh = it->MeshData;
+        if (mesh.Key == 0 || mesh.Vertices.empty() || mesh.Indices.size() < 3) {
+            it->RetryCount++;
+            it->LastAttemptTime = now;
+            if (it->RetryCount >= kMaxRetriesPerMesh) {
+                PendingKeys_.erase(it->MeshData.Key);
+                it = PendingRetries_.erase(it);
+            } else {
+                ++it;
+            }
+            continue;
+        }
+
         SceneMesh built = BuildSceneMesh(mesh);
         if (IsBoundsValid(built.Bounds) && !built.Triangles.V0X.empty()) {
             builtAdds.push_back(std::move(built));
+            PendingKeys_.erase(it->MeshData.Key);
+            it = PendingRetries_.erase(it);
+        } else {
+            it->RetryCount++;
+            it->LastAttemptTime = now;
+            if (it->RetryCount >= kMaxRetriesPerMesh) {
+                PendingKeys_.erase(it->MeshData.Key);
+                it = PendingRetries_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // Then process new adds
+    for (const VisibilityMeshData& mesh : adds) {
+        if (mesh.Key == 0) continue;
+
+        if (mesh.Vertices.empty() || mesh.Indices.size() < 3) {
+            if (PendingKeys_.insert(mesh.Key).second) {
+                PendingRetries_.push_back({mesh, 0, now});
+            }
+            continue;
+        }
+
+        SceneMesh built = BuildSceneMesh(mesh);
+        if (IsBoundsValid(built.Bounds) && !built.Triangles.V0X.empty()) {
+            builtAdds.push_back(std::move(built));
+        } else {
+            if (PendingKeys_.insert(mesh.Key).second) {
+                PendingRetries_.push_back({mesh, 0, now});
+            }
         }
     }
 
@@ -302,9 +376,15 @@ void VisibilityScene::UpdateMeshes(const std::vector<VisibilityMeshData>& adds,
         std::unique_lock<std::shared_mutex> lock(Mutex_);
         for (uint64_t key : removes) {
             Meshes_.erase(key);
+            if (PendingKeys_.erase(key)) {
+                PendingRetries_.erase(
+                    std::remove_if(PendingRetries_.begin(), PendingRetries_.end(),
+                        [key](const PendingMeshRetry& r) { return r.MeshData.Key == key; }),
+                    PendingRetries_.end());
+            }
         }
         for (SceneMesh& mesh : builtAdds) {
-            Meshes_[mesh.Key] = std::move(mesh);
+            Meshes_[mesh.Key] = std::make_shared<SceneMesh>(std::move(mesh));
         }
         nextSnapshot = BuildSnapshot(Meshes_);
         Snapshot_ = nextSnapshot;
@@ -314,6 +394,8 @@ void VisibilityScene::UpdateMeshes(const std::vector<VisibilityMeshData>& adds,
 void VisibilityScene::Clear() {
     std::unique_lock<std::shared_mutex> lock(Mutex_);
     Meshes_.clear();
+    PendingRetries_.clear();
+    PendingKeys_.clear();
     Snapshot_.reset();
 }
 
@@ -350,8 +432,9 @@ VisibilityRaycastHit VisibilityScene::Raycast(const VisibilityRaycastQuery& quer
     size_t meshIndex = 0;
 
 #if defined(__ARM_NEON) || defined(__aarch64__)
+    const NeonQueryBounds qb = PrebroadcastQueryBounds(query);
     for (; meshIndex + 4 <= meshCount; meshIndex += 4) {
-        const uint32_t mask = BoundsOverlapMask4(query,
+        const uint32_t mask = BoundsOverlapMask4(qb,
                                                  snapshot->MeshMinX.data() + meshIndex,
                                                  snapshot->MeshMinY.data() + meshIndex,
                                                  snapshot->MeshMinZ.data() + meshIndex,
@@ -362,7 +445,7 @@ VisibilityRaycastHit VisibilityScene::Raycast(const VisibilityRaycastQuery& quer
 
         for (size_t lane = 0; lane < 4; ++lane) {
             if ((mask & (1u << lane)) == 0u) continue;
-            const SceneMesh& mesh = snapshot->Meshes[meshIndex + lane];
+            const SceneMesh& mesh = *snapshot->Meshes[meshIndex + lane];
 #else
     for (; meshIndex < meshCount; ++meshIndex) {
         if (!BoundsLaneOverlaps(query,
@@ -375,14 +458,14 @@ VisibilityRaycastHit VisibilityScene::Raycast(const VisibilityRaycastQuery& quer
                                 meshIndex)) {
             continue;
         }
-        const SceneMesh& mesh = snapshot->Meshes[meshIndex];
+        const SceneMesh& mesh = *snapshot->Meshes[meshIndex];
 #endif
             const size_t chunkCount = mesh.Chunks.size();
             size_t chunkIndex = 0;
 
 #if defined(__ARM_NEON) || defined(__aarch64__)
             for (; chunkIndex + 4 <= chunkCount; chunkIndex += 4) {
-                const uint32_t chunkMask = BoundsOverlapMask4(query,
+                const uint32_t chunkMask = BoundsOverlapMask4(qb,
                                                               mesh.ChunkMinX.data() + chunkIndex,
                                                               mesh.ChunkMinY.data() + chunkIndex,
                                                               mesh.ChunkMinZ.data() + chunkIndex,
@@ -413,7 +496,7 @@ VisibilityRaycastHit VisibilityScene::Raycast(const VisibilityRaycastQuery& quer
 
 #if defined(__ARM_NEON) || defined(__aarch64__)
                     for (; triangleIndex + 4 <= triangleEnd; triangleIndex += 4) {
-                        const uint32_t triangleMask = BoundsOverlapMask4(query,
+                        const uint32_t triangleMask = BoundsOverlapMask4(qb,
                                                                          mesh.Triangles.MinX.data() + triangleIndex,
                                                                          mesh.Triangles.MinY.data() + triangleIndex,
                                                                          mesh.Triangles.MinZ.data() + triangleIndex,
@@ -552,7 +635,7 @@ VisibilityRaycastHit VisibilityScene::Raycast(const VisibilityRaycastQuery& quer
             continue;
         }
 
-        const SceneMesh& mesh = snapshot->Meshes[meshIndex];
+        const SceneMesh& mesh = *snapshot->Meshes[meshIndex];
         for (size_t chunkIndex = 0; chunkIndex < mesh.Chunks.size(); ++chunkIndex) {
             if (!BoundsLaneOverlaps(query,
                                     mesh.ChunkMinX.data(),
@@ -606,4 +689,237 @@ VisibilityRaycastHit VisibilityScene::Raycast(const VisibilityRaycastQuery& quer
 size_t VisibilityScene::Size() const {
     std::shared_lock<std::shared_mutex> lock(Mutex_);
     return Snapshot_ ? Snapshot_->Meshes.size() : 0;
+}
+
+std::shared_ptr<VisibilityScene::SceneSnapshot> VisibilityScene::AcquireSnapshot() const {
+    std::shared_lock<std::shared_mutex> lock(Mutex_);
+    return Snapshot_;
+}
+
+bool VisibilityScene::RaycastAny(const VisibilityRaycastQuery& query) const {
+    return RaycastAnyWithSnapshot(query, AcquireSnapshot());
+}
+
+bool VisibilityScene::RaycastAnyWithSnapshot(const VisibilityRaycastQuery& query,
+                                              const std::shared_ptr<SceneSnapshot>& snapshot) const {
+    if (!query.Valid) return false;
+    if (!snapshot || snapshot->Meshes.empty()) return false;
+
+    const size_t meshCount = snapshot->Meshes.size();
+    size_t meshIndex = 0;
+
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    const NeonQueryBounds qb = PrebroadcastQueryBounds(query);
+    for (; meshIndex + 4 <= meshCount; meshIndex += 4) {
+        const uint32_t mask = BoundsOverlapMask4(qb,
+                                                 snapshot->MeshMinX.data() + meshIndex,
+                                                 snapshot->MeshMinY.data() + meshIndex,
+                                                 snapshot->MeshMinZ.data() + meshIndex,
+                                                 snapshot->MeshMaxX.data() + meshIndex,
+                                                 snapshot->MeshMaxY.data() + meshIndex,
+                                                 snapshot->MeshMaxZ.data() + meshIndex);
+        if (mask == 0u) continue;
+
+        for (size_t lane = 0; lane < 4; ++lane) {
+            if ((mask & (1u << lane)) == 0u) continue;
+            const SceneMesh& mesh = *snapshot->Meshes[meshIndex + lane];
+#else
+    for (; meshIndex < meshCount; ++meshIndex) {
+        if (!BoundsLaneOverlaps(query,
+                                snapshot->MeshMinX.data(),
+                                snapshot->MeshMinY.data(),
+                                snapshot->MeshMinZ.data(),
+                                snapshot->MeshMaxX.data(),
+                                snapshot->MeshMaxY.data(),
+                                snapshot->MeshMaxZ.data(),
+                                meshIndex)) {
+            continue;
+        }
+        const SceneMesh& mesh = *snapshot->Meshes[meshIndex];
+#endif
+            const size_t chunkCount = mesh.Chunks.size();
+            size_t chunkIndex = 0;
+
+#if defined(__ARM_NEON) || defined(__aarch64__)
+            for (; chunkIndex + 4 <= chunkCount; chunkIndex += 4) {
+                const uint32_t chunkMask = BoundsOverlapMask4(qb,
+                                                              mesh.ChunkMinX.data() + chunkIndex,
+                                                              mesh.ChunkMinY.data() + chunkIndex,
+                                                              mesh.ChunkMinZ.data() + chunkIndex,
+                                                              mesh.ChunkMaxX.data() + chunkIndex,
+                                                              mesh.ChunkMaxY.data() + chunkIndex,
+                                                              mesh.ChunkMaxZ.data() + chunkIndex);
+                if (chunkMask == 0u) continue;
+
+                for (size_t chunkLane = 0; chunkLane < 4; ++chunkLane) {
+                    if ((chunkMask & (1u << chunkLane)) == 0u) continue;
+                    const ChunkRange& chunk = mesh.Chunks[chunkIndex + chunkLane];
+#else
+            for (; chunkIndex < chunkCount; ++chunkIndex) {
+                if (!BoundsLaneOverlaps(query,
+                                        mesh.ChunkMinX.data(),
+                                        mesh.ChunkMinY.data(),
+                                        mesh.ChunkMinZ.data(),
+                                        mesh.ChunkMaxX.data(),
+                                        mesh.ChunkMaxY.data(),
+                                        mesh.ChunkMaxZ.data(),
+                                        chunkIndex)) {
+                    continue;
+                }
+                const ChunkRange& chunk = mesh.Chunks[chunkIndex];
+#endif
+                    const size_t triangleEnd = static_cast<size_t>(chunk.TriangleOffset) + chunk.TriangleCount;
+                    size_t triangleIndex = chunk.TriangleOffset;
+
+#if defined(__ARM_NEON) || defined(__aarch64__)
+                    for (; triangleIndex + 4 <= triangleEnd; triangleIndex += 4) {
+                        const uint32_t triangleMask = BoundsOverlapMask4(qb,
+                                                                         mesh.Triangles.MinX.data() + triangleIndex,
+                                                                         mesh.Triangles.MinY.data() + triangleIndex,
+                                                                         mesh.Triangles.MinZ.data() + triangleIndex,
+                                                                         mesh.Triangles.MaxX.data() + triangleIndex,
+                                                                         mesh.Triangles.MaxY.data() + triangleIndex,
+                                                                         mesh.Triangles.MaxZ.data() + triangleIndex);
+                        if (triangleMask == 0u) continue;
+
+                        for (size_t triangleLane = 0; triangleLane < 4; ++triangleLane) {
+                            if ((triangleMask & (1u << triangleLane)) == 0u) continue;
+                            const size_t tri = triangleIndex + triangleLane;
+#else
+                    for (; triangleIndex < triangleEnd; ++triangleIndex) {
+                        if (!BoundsLaneOverlaps(query,
+                                                mesh.Triangles.MinX.data(),
+                                                mesh.Triangles.MinY.data(),
+                                                mesh.Triangles.MinZ.data(),
+                                                mesh.Triangles.MaxX.data(),
+                                                mesh.Triangles.MaxY.data(),
+                                                mesh.Triangles.MaxZ.data(),
+                                                triangleIndex)) {
+                            continue;
+                        }
+                        const size_t tri = triangleIndex;
+#endif
+                            float distance = 0.0f;
+                            if (IntersectTriangle(query,
+                                                  mesh.Triangles.V0X[tri], mesh.Triangles.V0Y[tri], mesh.Triangles.V0Z[tri],
+                                                  mesh.Triangles.Edge1X[tri], mesh.Triangles.Edge1Y[tri], mesh.Triangles.Edge1Z[tri],
+                                                  mesh.Triangles.Edge2X[tri], mesh.Triangles.Edge2Y[tri], mesh.Triangles.Edge2Z[tri],
+                                                  distance)) {
+                                return true;  // any-hit: 立即返回
+                            }
+                        }
+                    }
+
+                    // scalar tail for triangles
+                    for (; triangleIndex < triangleEnd; ++triangleIndex) {
+                        if (!BoundsLaneOverlaps(query,
+                                                mesh.Triangles.MinX.data(),
+                                                mesh.Triangles.MinY.data(),
+                                                mesh.Triangles.MinZ.data(),
+                                                mesh.Triangles.MaxX.data(),
+                                                mesh.Triangles.MaxY.data(),
+                                                mesh.Triangles.MaxZ.data(),
+                                                triangleIndex)) {
+                            continue;
+                        }
+                        float distance = 0.0f;
+                        if (IntersectTriangle(query,
+                                              mesh.Triangles.V0X[triangleIndex], mesh.Triangles.V0Y[triangleIndex], mesh.Triangles.V0Z[triangleIndex],
+                                              mesh.Triangles.Edge1X[triangleIndex], mesh.Triangles.Edge1Y[triangleIndex], mesh.Triangles.Edge1Z[triangleIndex],
+                                              mesh.Triangles.Edge2X[triangleIndex], mesh.Triangles.Edge2Y[triangleIndex], mesh.Triangles.Edge2Z[triangleIndex],
+                                              distance)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            // scalar tail for chunks
+            for (; chunkIndex < chunkCount; ++chunkIndex) {
+                if (!BoundsLaneOverlaps(query,
+                                        mesh.ChunkMinX.data(),
+                                        mesh.ChunkMinY.data(),
+                                        mesh.ChunkMinZ.data(),
+                                        mesh.ChunkMaxX.data(),
+                                        mesh.ChunkMaxY.data(),
+                                        mesh.ChunkMaxZ.data(),
+                                        chunkIndex)) {
+                    continue;
+                }
+                const ChunkRange& chunk = mesh.Chunks[chunkIndex];
+                const size_t triangleEnd = static_cast<size_t>(chunk.TriangleOffset) + chunk.TriangleCount;
+                for (size_t triangleIndex = chunk.TriangleOffset; triangleIndex < triangleEnd; ++triangleIndex) {
+                    if (!BoundsLaneOverlaps(query,
+                                            mesh.Triangles.MinX.data(),
+                                            mesh.Triangles.MinY.data(),
+                                            mesh.Triangles.MinZ.data(),
+                                            mesh.Triangles.MaxX.data(),
+                                            mesh.Triangles.MaxY.data(),
+                                            mesh.Triangles.MaxZ.data(),
+                                            triangleIndex)) {
+                        continue;
+                    }
+                    float distance = 0.0f;
+                    if (IntersectTriangle(query,
+                                          mesh.Triangles.V0X[triangleIndex], mesh.Triangles.V0Y[triangleIndex], mesh.Triangles.V0Z[triangleIndex],
+                                          mesh.Triangles.Edge1X[triangleIndex], mesh.Triangles.Edge1Y[triangleIndex], mesh.Triangles.Edge1Z[triangleIndex],
+                                          mesh.Triangles.Edge2X[triangleIndex], mesh.Triangles.Edge2Y[triangleIndex], mesh.Triangles.Edge2Z[triangleIndex],
+                                          distance)) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    // scalar tail for meshes
+    for (; meshIndex < meshCount; ++meshIndex) {
+        if (!BoundsLaneOverlaps(query,
+                                snapshot->MeshMinX.data(),
+                                snapshot->MeshMinY.data(),
+                                snapshot->MeshMinZ.data(),
+                                snapshot->MeshMaxX.data(),
+                                snapshot->MeshMaxY.data(),
+                                snapshot->MeshMaxZ.data(),
+                                meshIndex)) {
+            continue;
+        }
+        const SceneMesh& mesh = *snapshot->Meshes[meshIndex];
+        for (size_t chunkIndex = 0; chunkIndex < mesh.Chunks.size(); ++chunkIndex) {
+            if (!BoundsLaneOverlaps(query,
+                                    mesh.ChunkMinX.data(),
+                                    mesh.ChunkMinY.data(),
+                                    mesh.ChunkMinZ.data(),
+                                    mesh.ChunkMaxX.data(),
+                                    mesh.ChunkMaxY.data(),
+                                    mesh.ChunkMaxZ.data(),
+                                    chunkIndex)) {
+                continue;
+            }
+            const ChunkRange& chunk = mesh.Chunks[chunkIndex];
+            const size_t triangleEnd = static_cast<size_t>(chunk.TriangleOffset) + chunk.TriangleCount;
+            for (size_t triangleIndex = chunk.TriangleOffset; triangleIndex < triangleEnd; ++triangleIndex) {
+                if (!BoundsLaneOverlaps(query,
+                                        mesh.Triangles.MinX.data(),
+                                        mesh.Triangles.MinY.data(),
+                                        mesh.Triangles.MinZ.data(),
+                                        mesh.Triangles.MaxX.data(),
+                                        mesh.Triangles.MaxY.data(),
+                                        mesh.Triangles.MaxZ.data(),
+                                        triangleIndex)) {
+                    continue;
+                }
+                float distance = 0.0f;
+                if (IntersectTriangle(query,
+                                      mesh.Triangles.V0X[triangleIndex], mesh.Triangles.V0Y[triangleIndex], mesh.Triangles.V0Z[triangleIndex],
+                                      mesh.Triangles.Edge1X[triangleIndex], mesh.Triangles.Edge1Y[triangleIndex], mesh.Triangles.Edge1Z[triangleIndex],
+                                      mesh.Triangles.Edge2X[triangleIndex], mesh.Triangles.Edge2Y[triangleIndex], mesh.Triangles.Edge2Z[triangleIndex],
+                                      distance)) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
 }
