@@ -123,6 +123,12 @@ struct RecoilDebugInfo {
     float realtimeVerticalRecoilSpeed = 0.0f;
     float realtimeHorizontalRecoilSpeed = 0.0f;
     float realtimeRecoverySpeed = 0.0f;
+
+    uint64_t weapon = 0;
+    uint8_t sightType = 0;
+    int32_t angledSightID = 0;
+    int32_t curSightTypeID = 0;
+    int32_t curScopeID = 0;
 };
 
 struct FireStateDebugInfo {
@@ -206,9 +212,10 @@ public:
     void Update(float deltaTime);
     void ResetTarget();
     void Stop();
-    void SetDisplaySize(float w, float h) {
+    void SetDisplayState(float w, float h, int orientation) {
         displayWidth_.store(w, std::memory_order_relaxed);
         displayHeight_.store(h, std::memory_order_relaxed);
+        displayOrientation_.store(orientation, std::memory_order_relaxed);
     }
     void DrawDebug();
 
@@ -229,11 +236,12 @@ private:
 
     std::atomic<float> displayWidth_{1920.0f};
     std::atomic<float> displayHeight_{1080.0f};
+    std::atomic<int> displayOrientation_{0};
 
     bool SelectTarget(const Vec2& screenCenter, bool requireVisibility,
                       uint64_t& outActorAddr, int& outBoneID, Vec2& outScreenPos);
     Vec2 ComputePDOutput(const Vec2& targetPos, const Vec2& screenCenter,
-                         const Vec2& feedforward, float deltaTime, float fovRatio);
+                         const Vec2& feedforward, float deltaTime, float fovScale);
     float DistanceToScreenCenter(const Vec2& pos, const Vec2& center) const;
     bool IsInFOV(const Vec2& pos, const Vec2& center) const;
     bool ShouldSwitchTarget(const Vec2& currentPos, const Vec2& newPos, const Vec2& center) const;

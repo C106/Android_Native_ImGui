@@ -380,6 +380,44 @@ static bool DrawProgressSliderInt(const char* label, int* value, int min_value, 
     return changed;
 }
 
+static std::string BuildMultiBoolPreviewText(const std::vector<MenuMultiBoolOption>& options) {
+    std::string preview;
+    for (const auto& option : options) {
+        if (!option.value || !*option.value) continue;
+        if (!preview.empty()) {
+            preview += ", ";
+        }
+        preview += option.label;
+    }
+    return preview.empty() ? std::string("未选择") : preview;
+}
+
+static bool DrawMultiBoolChoice(const char* label, std::vector<MenuMultiBoolOption>& options) {
+    ImGui::TextUnformatted(label);
+    const std::string preview = BuildMultiBoolPreviewText(options);
+    bool changed = false;
+
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.10f, 0.18f, 0.30f, 0.95f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.14f, 0.26f, 0.42f, 0.98f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0.16f, 0.30f, 0.48f, 1.00f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 14.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f, 8.0f));
+    if (ImGui::BeginCombo((std::string("##") + label).c_str(), preview.c_str())) {
+        for (auto& option : options) {
+            if (!option.value) continue;
+            bool value = *option.value;
+            if (ImGui::Checkbox(option.label.c_str(), &value)) {
+                *option.value = value;
+                changed = true;
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(3);
+    return changed;
+}
+
 static bool GetObjectMember(const JsonValue& parent, const std::string& key, const JsonValue*& out) {
     if (parent.type != JsonValue::Type::Object) return false;
     auto it = parent.object_value.find(key);
@@ -673,6 +711,11 @@ MenuSettingSpec& MenuSettingSpec::ShortcutSupported(bool value) {
     return *this;
 }
 
+MenuSettingSpec& MenuSettingSpec::DebugOnly(bool value) {
+    debug_only_ = value;
+    return *this;
+}
+
 bool MenuSettingSpec::IsVisible() const {
     return !visible_if_ || visible_if_();
 }
@@ -727,6 +770,17 @@ MenuSettingSpec& MenuSectionSpec::AddChoice(const std::string& key, const std::s
     return setting;
 }
 
+MenuSettingSpec& MenuSectionSpec::AddMultiBoolChoice(const std::string& key, const std::string& label,
+                                                     std::vector<MenuMultiBoolOption> options) {
+    settings_.emplace_back(MenuSettingKind::MultiBoolChoice, key, label);
+    auto& setting = settings_.back();
+    for (auto& option : options) {
+        option.default_value = option.value ? *option.value : false;
+    }
+    setting.multi_bool_choices_ = std::move(options);
+    return setting;
+}
+
 MenuSettingSpec& MenuSectionSpec::AddButton(const std::string& key, const std::string& label,
                                             std::function<void()> action) {
     settings_.emplace_back(MenuSettingKind::Button, key, label);
@@ -752,6 +806,11 @@ MenuSectionSpec& MenuSectionSpec::VisibleIf(std::function<bool()> predicate) {
 
 MenuSectionSpec& MenuSectionSpec::FooterDraw(std::function<void()> callback) {
     footer_draw_ = std::move(callback);
+    return *this;
+}
+
+MenuSectionSpec& MenuSectionSpec::DebugOnly(bool value) {
+    debug_only_ = value;
     return *this;
 }
 
@@ -795,7 +854,7 @@ const MenuPageSpec* MenuRegistry::FindPage(const std::string& id) const {
     return nullptr;
 }
 
-void MenuRegistry::RenderPage(const std::string& id) {
+void MenuRegistry::RenderPage(const std::string& id, MenuRenderMode mode) {
     const MenuPageSpec* page = FindPage(id);
     if (!page) {
         ImGui::TextDisabled("Page '%s' not registered", id.c_str());
@@ -813,10 +872,27 @@ void MenuRegistry::RenderPage(const std::string& id) {
         for (const auto& section : page->sections_) {
             if (section.column_ != column || !section.IsVisible()) continue;
 
+            bool has_visible_content = false;
+            for (const auto& setting : section.settings_) {
+                if (!setting.IsVisible()) continue;
+                const bool is_debug_item = section.debug_only_ || setting.debug_only_;
+                const bool render_in_mode =
+                    (mode == MenuRenderMode::DebugOnly) ? is_debug_item : !is_debug_item;
+                if (render_in_mode) {
+                    has_visible_content = true;
+                    break;
+                }
+            }
+            if (!has_visible_content) continue;
+
             ImVec2 section_start;
             BeginSectionFrame(section.title_.c_str(), section_start);
             for (auto& setting : const_cast<std::vector<MenuSettingSpec>&>(section.settings_)) {
                 if (!setting.IsVisible()) continue;
+                const bool is_debug_item = section.debug_only_ || setting.debug_only_;
+                const bool render_in_mode =
+                    (mode == MenuRenderMode::DebugOnly) ? is_debug_item : !is_debug_item;
+                if (!render_in_mode) continue;
 
                 bool changed = false;
                 const bool disable_setting = IsShortcutEditorActive() && g_active_shortcut_editor != &setting;
@@ -871,6 +947,10 @@ void MenuRegistry::RenderPage(const std::string& id) {
                                 DrawTooltip(setting.tooltip_);
                             }
                         }
+                        break;
+                    case MenuSettingKind::MultiBoolChoice:
+                        changed = DrawMultiBoolChoice(setting.label_.c_str(), setting.multi_bool_choices_);
+                        DrawTooltip(setting.tooltip_);
                         break;
                     case MenuSettingKind::Button:
                         changed = ImGui::Button(setting.label_.c_str());
@@ -1005,6 +1085,19 @@ MenuConfigResult MenuRegistry::ExportToFile(const std::filesystem::path& path) c
                         case MenuSettingKind::Float:
                             out << *setting.float_value_;
                             break;
+                        case MenuSettingKind::MultiBoolChoice: {
+                            out << "{ ";
+                            bool first_option = true;
+                            for (const auto& option : setting.multi_bool_choices_) {
+                                if (!option.value) continue;
+                                if (!first_option) out << ", ";
+                                first_option = false;
+                                out << "\"" << EscapeJsonString(option.key) << "\": "
+                                    << (*option.value ? "true" : "false");
+                            }
+                            out << " }";
+                            break;
+                        }
                         case MenuSettingKind::Button:
                         case MenuSettingKind::Text:
                             out << "null";
@@ -1175,6 +1268,22 @@ MenuConfigResult MenuRegistry::ImportFromFile(const std::filesystem::path& path)
                             ++result.errors;
                         }
                         break;
+                    case MenuSettingKind::MultiBoolChoice:
+                        if (setting_value->type == JsonValue::Type::Object) {
+                            for (auto& option : setting.multi_bool_choices_) {
+                                const JsonValue* option_value = nullptr;
+                                if (!option.value || !GetObjectMember(*setting_value, option.key, option_value)) continue;
+                                if (option_value->type == JsonValue::Type::Bool) {
+                                    *option.value = option_value->bool_value;
+                                    changed = true;
+                                } else {
+                                    ++result.errors;
+                                }
+                            }
+                        } else {
+                            ++result.errors;
+                        }
+                        break;
                     case MenuSettingKind::Button:
                     case MenuSettingKind::Text:
                         break;
@@ -1234,6 +1343,13 @@ MenuConfigResult MenuRegistry::ResetToDefaults() {
                     case MenuSettingKind::Float:
                         if (setting.float_value_) {
                             *setting.float_value_ = setting.default_float_;
+                            ++result.applied;
+                        }
+                        break;
+                    case MenuSettingKind::MultiBoolChoice:
+                        for (auto& option : setting.multi_bool_choices_) {
+                            if (!option.value) continue;
+                            *option.value = option.default_value;
                             ++result.applied;
                         }
                         break;

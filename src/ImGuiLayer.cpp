@@ -2,6 +2,8 @@
 #include "ImGuiLayer.h"
 #include "Utils.h"
 #include "misc/freetype/imgui_freetype.h"
+#include "IconsFontAwesome7.h"
+#include "fa_regular_400_otf.h"
 #include "font1.h"
 #include "font2.h"
 #include "imgui_spectrum.h"
@@ -18,6 +20,7 @@
 
 VkExtent2D gSwapchainExtent;
 ImFont* gIconFont = nullptr;
+ImFont* gBannerIconFont = nullptr;
 
 
 
@@ -122,11 +125,27 @@ void ImGuiLayer::uploadFonts(VulkanApp& app) {
         emoji_ranges
     );
     // ImGui 已接管 emoji_font_data，DestroyContext 时会正确 free() 堆内存。
+
     void* icon_font_data = malloc(font1_ttf_len);
     memcpy(icon_font_data, font1_ttf, font1_ttf_len);
     gIconFont = io.Fonts->AddFontFromMemoryTTF(
         icon_font_data, (int)font1_ttf_len,
         32.0f
+    );
+
+    static const ImWchar fa_icon_ranges[] = {ICON_MIN_FA, ICON_MAX_16_FA, 0};
+    void* banner_icon_font_data = malloc(Font_Awesome_7_Free_Regular_400_otf_len);
+    memcpy(banner_icon_font_data,
+           Font_Awesome_7_Free_Regular_400_otf,
+           Font_Awesome_7_Free_Regular_400_otf_len);
+    ImFontConfig banner_icon_config;
+    banner_icon_config.GlyphMinAdvanceX = 32.0f;
+    gBannerIconFont = io.Fonts->AddFontFromMemoryTTF(
+        banner_icon_font_data,
+        (int)Font_Awesome_7_Free_Regular_400_otf_len,
+        30.0f,
+        &banner_icon_config,
+        fa_icon_ranges
     );
     io.FontDefault = font;
 

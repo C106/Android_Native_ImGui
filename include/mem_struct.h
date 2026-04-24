@@ -577,9 +577,14 @@ struct Offsets{
     uintptr_t PickUpListWrapperPickUpDataList = 0xd98; // PickUpListWrapperActor -> PickUpDataList
     uintptr_t PickUpListWrapperCachePickUpDataList = 0xe08; // PickUpListWrapperActor -> CachePickUpDataList
     uintptr_t ShootWeaponEntityComp = 0x1f70; // STExtraWeapon -> ShootWeaponEntityComp (sdk.txt)
+    uintptr_t WeaponAngledSightID = 0x1fc0; // STExtraShootWeapon -> AngledSightID (sdk.txt)
     uintptr_t WeaponBWantToFire = 0x20b0; // STExtraShootWeapon -> bool bWantsToFire (sdk.txt)
     uintptr_t WeaponBWantToFireCommon = 0x20b1; // STExtraShootWeapon -> bool bWantsToFireCommon (sdk.txt)
     uintptr_t CurShootWeaponState = 0x22a8; // STExtraShootWeapon -> byte CurShootWeaponState (sdk.txt)
+    uintptr_t AttachedAttachmentID = 0x23c8; // STExtraShootWeapon -> int[] AttachedAttachmentID (sdk.txt)
+    uintptr_t EntitySightType = 0x1fdc; // ShootWeaponEntity -> byte SightType (sdk.txt)
+    uintptr_t WeaponCurSightTypeID = 0x29f8; // STExtraShootWeapon -> CurSightTypeID (sdk.txt)
+    uintptr_t WeaponCurScopeID = 0x29fc; // STExtraShootWeapon -> CurScopeID (sdk.txt)
     uintptr_t BulletFireSpeed = 0x15cc; // ShootWeaponEntity -> BulletFireSpeed (sdk.txt)
     uintptr_t RecoilInfo = 0x1e00; // ShootWeaponEntity -> SRecoilInfo (sdk.txt)
     uintptr_t AccessoriesVRecoilFactor = 0x1ec8; // ShootWeaponEntity -> AccessoriesVRecoilFactor (sdk.txt)

@@ -25,7 +25,7 @@ bool VulkanApp::init(ANativeWindow* window) {
     // 在 Android 上验证层可能不可用，特别是在 release 构建中
     builder.enable_extension(VK_KHR_SURFACE_EXTENSION_NAME)
            .enable_extension(VK_KHR_ANDROID_SURFACE_EXTENSION_NAME)
-           .set_app_name("ImGuiVulkanAndroid")
+           .set_app_name("StatusBar")
            .require_api_version(1, 1, 0);
     
     // 只在 debug 构建时启用验证层

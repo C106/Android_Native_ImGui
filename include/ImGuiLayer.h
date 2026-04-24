@@ -7,6 +7,7 @@
 
 // 全局纹理加载函数（可在任意位置使用）
 extern ImFont* gIconFont;
+extern ImFont* gBannerIconFont;
 void ImGui_InitTextureLoader(VulkanApp* app);
 void ImGui_TextureLoaderShutdown(VulkanApp& app);
 void ImGui_RequestTextureLoad(const unsigned char* data, int data_size,

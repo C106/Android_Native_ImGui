@@ -17,6 +17,7 @@
 #include "driver_manager.h"
 #include "cpu_affinity.h"
 #include "game_fps_monitor.h"
+#include "ImGuiNotify.hpp"
 #ifdef NDEBUG
 #define LOGD(...) ((void)0)
 #define LOGE(...) ((void)0)
@@ -261,6 +262,12 @@ int main() {
     gImGui.init(gWindow, gApp);
     ImGui_InitTextureLoader(&gApp);
     LOGD("ImGui init OK\n");
+    {
+        ImGuiToast toast(ImGuiToastType::Info, 3500);
+        toast.setTitle("%s", "程序启动");
+        toast.setContent("%s", "Android_Native_ImGui 已加载");
+        ImGui::InsertNotification(toast);
+    }
     gRunning = true;
 
     Gyro_Controller = new Gyro;
@@ -400,7 +407,9 @@ int main() {
         gImGui.beginFrame(gWindow, displayInfo.width, displayInfo.height, renderStepDeltaTime);
 
         if (gAutoAim) {
-            gAutoAim->SetDisplaySize(static_cast<float>(displayInfo.width), static_cast<float>(displayInfo.height));
+            gAutoAim->SetDisplayState(static_cast<float>(displayInfo.width),
+                                     static_cast<float>(displayInfo.height),
+                                     displayInfo.orientation);
         }
 
         // 统计 FPS（每秒更新一次）— 只统计同步到游戏帧的渲染
@@ -435,6 +444,7 @@ int main() {
             Draw_Menu();
 
         DrawFPSCounter(gameStats);  // 显示 FPS 计数器（左下角）
+        ImGui::RenderNotifications();
 
         if (IsToolActive == 0) {
             gImGui.endFrame();

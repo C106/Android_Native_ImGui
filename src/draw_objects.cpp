@@ -100,6 +100,8 @@ bool gPhysXManualSceneIndexEnabled = false;
 int gPhysXManualSceneIndex = 0;
 bool gPhysXUseLocalModelData = false;
 bool gPhysXAutoExport = false;          // 自动导出未缓存的模型到磁盘
+int gPhysXMaxPrunerObjectsPerFrame = 20000;
+int gPhysXMaxPrunerObjectCount = 200000;
 
 // 骨骼可视性判断
 bool gUseDepthBufferVisibility = false;  // 默认关闭，需手动开启
@@ -107,6 +109,12 @@ float gDepthBufferBias = 0.002f;         // 深度比较偏移（避免 z-fighti
 float gDepthBufferTolerance = 0.005f;    // 深度容差（骨骼 vs 场景）
 int gDepthBufferDownscale = 4;           // 降采样倍率（1/4 分辨率）
 bool gDrawDepthBuffer = false;           // 调试：直接绘制深度缓冲
+
+bool gDrawMiniMap = false;
+float gMiniMapPosX = 36.0f;
+float gMiniMapPosY = 140.0f;
+float gMiniMapSizePx = 220.0f;
+float gMiniMapZoomMeters = 120.0f;
 
 // 骨骼屏幕坐标缓存（主线程整帧发布只读快照，auto-aim 线程无锁读取）
 static BoneScreenCacheSnapshot gBoneScreenCacheSnapshot =
@@ -1137,6 +1145,8 @@ static void DrawPhysXGeometry(
     float screenH);
 static void InvalidateVisibilityCache();
 static void DrawDepthBufferOverlay();
+static void DrawMiniMapOverlay(const ClassifiedActors& classified, const Vec3& localPlayerPos,
+                               float screenW, float screenH);
 static void BatchBoneVisibilityCheck(const Vec3& cameraWorldPos,
                                      const Vec3 boneWorldPos[],
                                      const bool boneHasData[],
@@ -1151,6 +1161,45 @@ static bool AppendTriangleMeshSceneTriangles(uint64_t geometryAddr, const PxTran
 static bool AppendHeightFieldSceneTriangles(uint64_t geometryAddr, const PxTransformData& worldPose,
                                             std::vector<GpuSceneTriangle>& triangles, size_t maxTriangles);
 static bool EnsureGpuSceneTriangles(const Vec3& cameraWorldPos);
+
+static bool TryReadActorWorldTransform(const CachedActor& actor, FTransform& outTransform) {
+    const uint64_t transformAddr = actor.rootCompAddr != 0
+        ? (actor.rootCompAddr + offset.ComponentToWorld)
+        : (actor.skelMeshCompAddr != 0 ? actor.skelMeshCompAddr + offset.ComponentToWorld : 0);
+    if (transformAddr == 0) {
+        return false;
+    }
+    return GetDriverManager().read(transformAddr, &outTransform, sizeof(FTransform));
+}
+
+static bool TryReadLocalPlayerMapBasis(Vec3& outForward, Vec3& outRight) {
+    if (address.LocalPlayerActor == 0) {
+        return false;
+    }
+
+    const uint64_t rootComp = GetDriverManager().read<uint64_t>(address.LocalPlayerActor + offset.RootComponent);
+    if (rootComp == 0) {
+        return false;
+    }
+
+    FTransform transform{};
+    if (!GetDriverManager().read(rootComp + offset.ComponentToWorld, &transform, sizeof(FTransform))) {
+        return false;
+    }
+
+    Vec3 forward = QuatRotateVector(transform.Rotation, Vec3(1.0f, 0.0f, 0.0f));
+    const float forwardLen = std::sqrt(forward.X * forward.X + forward.Y * forward.Y);
+    if (forwardLen <= 1e-3f) {
+        return false;
+    }
+
+    forward.X /= forwardLen;
+    forward.Y /= forwardLen;
+    forward.Z = 0.0f;
+    outForward = forward;
+    outRight = Vec3(-forward.Y, forward.X, 0.0f);
+    return true;
+}
 
 static D4DVector NormalizeQuat(const D4DVector& q) {
     float len = std::sqrt(q.X * q.X + q.Y * q.Y + q.Z * q.Z + q.W * q.W);
@@ -2601,7 +2650,9 @@ bool ExportStablePhysXMeshes() {
         if (pruner != 0 && pool != 0) {
             const uint32_t objectCount = GetDriverManager().read<uint32_t>(pool + offset.PruningPoolNbObjects);
             const uint64_t objectsAddr = GetDriverManager().read<uint64_t>(pool + offset.PruningPoolObjects);
-            if (objectCount > 0 && objectCount <= 200000 && objectsAddr != 0) {
+            if (objectCount > 0 &&
+                objectCount <= static_cast<uint32_t>(std::max(gPhysXMaxPrunerObjectCount, 1)) &&
+                objectsAddr != 0) {
                 std::vector<PhysXPrunerPayload> payloads(objectCount);
                 if (ReadRemoteBufferRobust(objectsAddr, payloads.data(), payloads.size() * sizeof(PhysXPrunerPayload))) {
                     for (uint32_t i = 0; i < objectCount; ++i) {
@@ -4619,6 +4670,11 @@ void DrawObjectsWithData(const GameFrameData& data, float gameStepDeltaTime) {
                                     nextBoneScreenCache.get());
     }
 
+    if (gDrawMiniMap) {
+        ImGuiIO& io = ImGui::GetIO();
+        DrawMiniMapOverlay(*classified, data.localPlayerPos, io.DisplaySize.x, io.DisplaySize.y);
+    }
+
     std::atomic_store_explicit(&gBoneScreenCacheSnapshot,
                                BoneScreenCacheSnapshot(nextBoneScreenCache),
                                std::memory_order_release);
@@ -4626,6 +4682,93 @@ void DrawObjectsWithData(const GameFrameData& data, float gameStepDeltaTime) {
 }
 
 // Compute Shader 诊断叠加层（在 DrawObjectsWithData 后由 main loop 调用）
+
+static void DrawMiniMapOverlay(const ClassifiedActors& classified, const Vec3& localPlayerPos,
+                               float screenW, float screenH) {
+    const float sizePx = std::clamp(gMiniMapSizePx, 120.0f, 420.0f);
+    const float zoomMeters = std::clamp(gMiniMapZoomMeters, 20.0f, 400.0f);
+    const float x = std::clamp(gMiniMapPosX, 8.0f, std::max(8.0f, screenW - sizePx - 8.0f));
+    const float y = std::clamp(gMiniMapPosY, 8.0f, std::max(8.0f, screenH - sizePx - 8.0f));
+    const ImVec2 min(x, y);
+    const ImVec2 max(x + sizePx, y + sizePx);
+    const ImVec2 center((min.x + max.x) * 0.5f, (min.y + max.y) * 0.5f);
+    const float radius = sizePx * 0.5f;
+    const float innerRadius = radius - 12.0f;
+    const float pixelsPerMeter = innerRadius / zoomMeters;
+
+    Vec3 forward;
+    Vec3 right;
+    if (!TryReadLocalPlayerMapBasis(forward, right)) {
+        forward = Vec3(1.0f, 0.0f, 0.0f);
+        right = Vec3(0.0f, -1.0f, 0.0f);
+    }
+
+    ImDrawList* drawList = ImGui::GetBackgroundDrawList();
+    drawList->AddRectFilled(min, max, IM_COL32(8, 16, 28, 168), 14.0f);
+    drawList->AddRect(min, max, IM_COL32(110, 190, 255, 180), 14.0f, 0, 1.8f);
+    drawList->AddCircleFilled(center, innerRadius, IM_COL32(12, 24, 38, 208), 64);
+    drawList->AddCircle(center, innerRadius, IM_COL32(125, 210, 255, 110), 64, 1.4f);
+    drawList->AddCircle(center, innerRadius * 0.5f, IM_COL32(125, 210, 255, 56), 64, 1.0f);
+    drawList->AddLine(ImVec2(center.x - innerRadius, center.y), ImVec2(center.x + innerRadius, center.y),
+                      IM_COL32(125, 210, 255, 42), 1.0f);
+    drawList->AddLine(ImVec2(center.x, center.y - innerRadius), ImVec2(center.x, center.y + innerRadius),
+                      IM_COL32(125, 210, 255, 42), 1.0f);
+
+    char zoomLabel[64];
+    std::snprintf(zoomLabel, sizeof(zoomLabel), "Radar %.0fm", zoomMeters);
+    drawList->AddText(ImVec2(min.x + 10.0f, min.y + 8.0f), IM_COL32(220, 240, 255, 220), zoomLabel);
+
+    auto drawActors = [&](const std::vector<CachedActor>& actors) {
+        for (const CachedActor& actor : actors) {
+            if (actor.actorAddr == 0 || actor.actorAddr == address.LocalPlayerActor) {
+                continue;
+            }
+            if (address.LocalPlayerKey != 0 && actor.playerKey == address.LocalPlayerKey) {
+                continue;
+            }
+            if (address.LocalPlayerTeamID >= 0 &&
+                actor.teamID >= 0 &&
+                actor.teamID == address.LocalPlayerTeamID) {
+                continue;
+            }
+
+            FTransform actorTransform{};
+            if (!TryReadActorWorldTransform(actor, actorTransform)) {
+                continue;
+            }
+
+            const Vec3 deltaCm = actorTransform.Translation - localPlayerPos;
+            const Vec3 deltaMeters(deltaCm.X / 100.0f, deltaCm.Y / 100.0f, 0.0f);
+            const float localX = Vec3::Dot(deltaMeters, right);
+            const float localY = Vec3::Dot(deltaMeters, forward);
+            const float distanceSq = localX * localX + localY * localY;
+            if (distanceSq > zoomMeters * zoomMeters) {
+                continue;
+            }
+
+            const ImVec2 point(center.x + localX * pixelsPerMeter,
+                               center.y - localY * pixelsPerMeter);
+            const float dx = point.x - center.x;
+            const float dy = point.y - center.y;
+            if (dx * dx + dy * dy > innerRadius * innerRadius) {
+                continue;
+            }
+
+            drawList->AddCircleFilled(point, 3.6f, IM_COL32(255, 72, 72, 235), 16);
+            drawList->AddCircle(point, 4.8f, IM_COL32(255, 160, 160, 160), 16, 1.0f);
+        }
+    };
+
+    drawActors(classified.players);
+    drawActors(classified.bots);
+    drawActors(classified.npcs);
+
+    const ImVec2 tip(center.x, center.y - 10.0f);
+    const ImVec2 left(center.x - 7.0f, center.y + 8.0f);
+    const ImVec2 rightPt(center.x + 7.0f, center.y + 8.0f);
+    drawList->AddTriangleFilled(tip, left, rightPt, IM_COL32(255, 255, 255, 235));
+    drawList->AddCircleFilled(center, 2.8f, IM_COL32(255, 255, 255, 220), 12);
+}
 
 static void DrawPhysXGeometry(const FMatrix& vpMat, const Vec3& localPlayerPos, ImDrawList* drawList,
                               float screenW, float screenH) {
@@ -6192,7 +6335,7 @@ static bool EnsurePrunerDataCached() {
     CollectActivePxScenes(address.libUE4, uworld, pxScenes);
     if (pxScenes.empty()) return false;
 
-    constexpr uint32_t kMaxPrunerObjects = 100000;
+    const uint32_t kMaxPrunerObjects = static_cast<uint32_t>(std::max(gPhysXMaxPrunerObjectCount, 1));
     uint32_t totalObjectCount = 0;
     for (uint64_t pxScene : pxScenes) {
         const uint64_t sqm = pxScene + offset.NpSceneQueriesSceneQueryManager;
@@ -6219,7 +6362,8 @@ static bool EnsurePrunerDataCached() {
     if (totalObjectCount == 0) return false;
 
     // 限制单帧读取时间，防止大场景导致 1-2s 卡顿
-    constexpr uint32_t kMaxPrunerObjectsPerFrame = 20000;
+    const uint32_t kMaxPrunerObjectsPerFrame =
+        static_cast<uint32_t>(std::max(gPhysXMaxPrunerObjectsPerFrame, 1));
     const uint32_t readLimit = std::min(totalObjectCount, kMaxPrunerObjectsPerFrame);
 
     gPrunerCache.payloads.clear();

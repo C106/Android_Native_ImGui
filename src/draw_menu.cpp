@@ -13,6 +13,8 @@
 #include "TouchScrollable.h"
 #include "menu_framework.h"
 #include "hook_touch_event.h"
+#include "ImGuiNotify.hpp"
+#include "IconsFontAwesome7.h"
 #include <cstring>
 #include <filesystem>
 #include <thread>
@@ -31,6 +33,7 @@ extern std::atomic<bool> IsMenuOpen;
 extern Gyro* Gyro_Controller;
 extern VulkanApp gApp;
 extern int gTargetFPS;
+extern android::ANativeWindowCreator::DisplayInfo displayInfo;
 
 // Logo 纹理
 static ImTextureID gLogoTexture = (ImTextureID)0;
@@ -53,18 +56,27 @@ static uint64_t libUE4 = 0;
 static bool gShowPhysXDebugWindow = false;
 static bool gShowBulletSpreadDebugWindow = false;
 static int gBulletBreakpointTargetUi = 0;
-static int gMainTabIndex = 0;
+static int gMainTabIndex = 2;
 static bool gMenuFrameworkRegistered = false;
 static std::string gConfigStatusMessage;
 static std::string gTouchTestStatusMessage;
 static int gDriverTypeUi = DRIVER_RT_HOOK;
+static bool gDriverLockEnabledUi = true;
 static bool gTriggerBotFireButtonPickerActive = false;
 static ImVec2 gLastMenuPos(-1.0f, -1.0f);  // 记录 menu 关闭时的位置
+static bool gShowExitConfirmDialog = false;
+static bool gShowDebugOptionsDialog = false;
+static ImVec2 gDebugOptionsWindowPos(-1.0f, -1.0f);
 
 static bool IsAnyActiveTouchInsideRect(const ImVec2& min, const ImVec2& max);
+static void DrawExitConfirmOverlay();
+static void DrawDebugOptionsOverlay();
+static void PushMenuWindowStyle();
+static void PopMenuWindowStyle();
 
 static bool DrawIconActionButton(const char* id, const char* icon, const ImVec2& pos, const ImVec2& size,
-                                 const ImVec4& fill_color, const ImVec4& border_color) {
+                                 const ImVec4& fill_color, const ImVec4& border_color,
+                                 ImFont* icon_font = nullptr) {
     ImGui::PushID(id);
     ImGui::SetCursorPos(pos);
     const ImVec2 min = ImGui::GetCursorScreenPos();
@@ -90,14 +102,90 @@ static bool DrawIconActionButton(const char* id, const char* icon, const ImVec2&
     draw_list->AddRectFilled(min, max, ImGui::GetColorU32(fill), size.y * 0.35f);
     draw_list->AddRect(min, max, ImGui::GetColorU32(border_color), size.y * 0.35f, 0, hovered ? 2.2f : 1.4f);
 
-    const float icon_font_size = ImGui::GetFontSize() * 1.15f;
-    const ImVec2 icon_size = ImGui::CalcTextSize(icon);
-    draw_list->AddText(ImVec2(min.x + (size.x - icon_size.x) * 0.5f,
-                              min.y + (size.y - icon_size.y) * 0.5f - 1.0f),
+    ImFont* draw_font = icon_font ? icon_font : ImGui::GetFont();
+    const float icon_font_size = size.y * 0.54f;
+    const ImVec2 icon_size = draw_font->CalcTextSizeA(icon_font_size, FLT_MAX, 0.0f, icon);
+    draw_list->AddText(draw_font, icon_font_size,
+                       ImVec2(min.x + (size.x - icon_size.x) * 0.5f,
+                              min.y + (size.y - icon_size.y) * 0.5f - 2.0f),
                        IM_COL32(248, 252, 255, 255), icon);
 
     ImGui::PopID();
     return pressed;
+}
+
+static bool DrawDialogActionButton(const char* id, const char* icon, const char* label,
+                                   const ImVec2& pos, const ImVec2& size,
+                                   const ImVec4& fill_color, const ImVec4& border_color) {
+    ImGui::PushID(id);
+    ImGui::SetCursorScreenPos(pos);
+    const bool pressed = ImGui::InvisibleButton("##dialog_action", size);
+    const bool hovered = ImGui::IsItemHovered();
+
+    const ImVec2 min = ImGui::GetItemRectMin();
+    const ImVec2 max = ImGui::GetItemRectMax();
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+
+    ImVec4 fill = fill_color;
+    if (hovered) {
+        fill.x = std::min(fill.x + 0.05f, 1.0f);
+        fill.y = std::min(fill.y + 0.05f, 1.0f);
+        fill.z = std::min(fill.z + 0.05f, 1.0f);
+        fill.w = std::min(fill.w + 0.10f, 1.0f);
+    }
+
+    draw_list->AddRectFilled(min, max, ImGui::GetColorU32(fill), size.y * 0.32f);
+    draw_list->AddRect(min, max, ImGui::GetColorU32(border_color), size.y * 0.32f, 0, hovered ? 2.2f : 1.4f);
+
+    ImFont* icon_font = gBannerIconFont ? gBannerIconFont : ImGui::GetFont();
+    ImFont* text_font = ImGui::GetFont();
+    const float icon_font_size = size.y * 0.46f;
+    const float text_font_size = ImGui::GetFontSize() * 0.95f;
+    const ImVec2 icon_size = icon_font->CalcTextSizeA(icon_font_size, FLT_MAX, 0.0f, icon);
+    const ImVec2 text_size = text_font->CalcTextSizeA(text_font_size, FLT_MAX, 0.0f, label);
+    const float gap = 10.0f;
+    const float content_width = icon_size.x + gap + text_size.x;
+    const float start_x = min.x + (size.x - content_width) * 0.5f;
+    const float icon_y = min.y + (size.y - icon_size.y) * 0.5f - 1.0f;
+    const float text_y = min.y + (size.y - text_size.y) * 0.5f - 1.0f;
+
+    draw_list->AddText(icon_font, icon_font_size, ImVec2(start_x, icon_y),
+                       IM_COL32(248, 252, 255, 255), icon);
+    draw_list->AddText(text_font, text_font_size, ImVec2(start_x + icon_size.x + gap, text_y),
+                       IM_COL32(232, 242, 255, 255), label);
+
+    ImGui::PopID();
+    return pressed;
+}
+
+static void PushMenuWindowStyle() {
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 15.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
+    ImGui::PushStyleVar(ImGuiStyleVar_TabRounding, 8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.0f, 8.0f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.06f, 0.09f, 0.15f, 0.72f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.12f, 0.20f, 0.38f));
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(0.07f, 0.10f, 0.17f, 0.82f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.10f, 0.16f, 0.26f, 0.56f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.14f, 0.22f, 0.34f, 0.68f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0.16f, 0.26f, 0.40f, 0.78f));
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.24f, 0.40f, 0.58f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.18f, 0.34f, 0.56f, 0.76f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.20f, 0.40f, 0.66f, 0.86f));
+    ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.12f, 0.22f, 0.38f, 0.52f));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.18f, 0.32f, 0.54f, 0.70f));
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0.22f, 0.38f, 0.62f, 0.82f));
+    ImGui::PushStyleColor(ImGuiCol_CheckMark, ImVec4(0.58f, 0.84f, 1.00f, 0.98f));
+    ImGui::PushStyleColor(ImGuiCol_SliderGrab, ImVec4(0.42f, 0.78f, 1.00f, 0.92f));
+    ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, ImVec4(0.56f, 0.86f, 1.00f, 1.00f));
+    ImGui::PushStyleColor(ImGuiCol_Tab, ImVec4(0.10f, 0.18f, 0.30f, 0.58f));
+    ImGui::PushStyleColor(ImGuiCol_TabHovered, ImVec4(0.18f, 0.32f, 0.50f, 0.78f));
+    ImGui::PushStyleColor(ImGuiCol_TabActive, ImVec4(0.16f, 0.30f, 0.48f, 0.88f));
+}
+
+static void PopMenuWindowStyle() {
+    ImGui::PopStyleColor(18);
+    ImGui::PopStyleVar(4);
 }
 
 static void DrawFloatingMenuBall() {
@@ -287,15 +375,60 @@ static std::string GetConfigPathString() {
     return MenuRegistry::Instance().GetDefaultConfigPath().string();
 }
 
+static void ShowToast(ImGuiToastType type, const char* title, const std::string& content, int dismiss_ms = 3000) {
+    ImGuiToast toast(type, dismiss_ms);
+    if (title && title[0] != '\0') {
+        toast.setTitle("%s", title);
+    }
+    toast.setContent("%s", content.c_str());
+    ImGui::InsertNotification(toast);
+}
+
+static void ShowConfigToast(const MenuConfigResult& result) {
+    ImGuiToastType type = result.success ? ImGuiToastType::Success : ImGuiToastType::Error;
+    ShowToast(type, "配置", result.message.empty() ? std::string("操作完成") : result.message,
+              result.success ? 2500 : 4000);
+}
+
+static std::string GetScreenOrientationText() {
+    const int width = displayInfo.width;
+    const int height = displayInfo.height;
+    const char* rotationText = "Unknown";
+    switch (displayInfo.orientation) {
+        case 0: rotationText = "Rotation 0"; break;
+        case 1: rotationText = "Rotation 90"; break;
+        case 2: rotationText = "Rotation 180"; break;
+        case 3: rotationText = "Rotation 270"; break;
+        default: break;
+    }
+
+    const char* layoutText = "Unknown";
+    if (width > 0 && height > 0) {
+        if (width > height) {
+            layoutText = "Landscape";
+        } else if (width < height) {
+            layoutText = "Portrait";
+        } else {
+            layoutText = "Square";
+        }
+    }
+
+    char buffer[96];
+    snprintf(buffer, sizeof(buffer), "%s (%s, %dx%d)", rotationText, layoutText, width, height);
+    return buffer;
+}
+
 static void SetConfigStatus(const MenuConfigResult& result) {
     gConfigStatusMessage = result.message;
     if (!result.success) {
         gConfigStatusMessage += " [errors=" + std::to_string(result.errors) + "]";
+        ShowConfigToast(result);
         return;
     }
     if (result.applied > 0) {
         gConfigStatusMessage += " [applied=" + std::to_string(result.applied) + "]";
     }
+    ShowConfigToast(result);
 }
 
 static std::string GetAutoAimStatusText() {
@@ -316,6 +449,172 @@ static std::string GetAutoAimStatusText() {
     std::snprintf(buffer, sizeof(buffer), "状态: 锁定目标\nActor: 0x%llX",
                   static_cast<unsigned long long>(state.actorAddr));
     return buffer;
+}
+
+static void DrawExitConfirmOverlay() {
+    if (!gShowExitConfirmDialog) return;
+
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(io.DisplaySize, ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.08f, 0.09f, 0.11f, 0.58f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    const ImGuiWindowFlags overlayFlags =
+        ImGuiWindowFlags_NoDecoration |
+        ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoScrollWithMouse;
+    if (ImGui::Begin("##ExitConfirmOverlay", nullptr, overlayFlags)) {
+        ImDrawList* draw_list = ImGui::GetWindowDrawList();
+        const ImVec2 center(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
+        const ImVec2 dialogSize(360.0f, 180.0f);
+        const ImVec2 dialogMin(center.x - dialogSize.x * 0.5f, center.y - dialogSize.y * 0.5f);
+        const ImVec2 dialogMax(center.x + dialogSize.x * 0.5f, center.y + dialogSize.y * 0.5f);
+        draw_list->AddRectFilled(dialogMin, dialogMax, IM_COL32(24, 32, 42, 242), 18.0f);
+        draw_list->AddRect(dialogMin, dialogMax, IM_COL32(88, 160, 220, 220), 18.0f, 0, 2.0f);
+
+        ImGui::SetCursorScreenPos(ImVec2(dialogMin.x + 28.0f, dialogMin.y + 26.0f));
+        ImGui::PushTextWrapPos(dialogMax.x - 28.0f);
+        ImGui::TextColored(ImVec4(0.94f, 0.97f, 1.00f, 1.00f), "是否要退出");
+        ImGui::Dummy(ImVec2(0.0f, 10.0f));
+        ImGui::TextColored(ImVec4(0.76f, 0.84f, 0.92f, 1.00f), "确认后将关闭当前工具。");
+        ImGui::PopTextWrapPos();
+
+        const ImVec2 buttonSize(138.0f, 48.0f);
+        const float buttonGap = 18.0f;
+        const float buttonY = dialogMax.y - 64.0f;
+        const float buttonStartX = center.x - (buttonSize.x * 2.0f + buttonGap) * 0.5f;
+        const ImVec4 buttonFill(0.08f, 0.18f, 0.30f, 0.86f);
+        const ImVec4 buttonBorder(0.34f, 0.72f, 1.00f, 0.92f);
+
+        if (DrawDialogActionButton("exit_cancel", ICON_FA_CROSS, "取消",
+                                   ImVec2(buttonStartX, buttonY), buttonSize,
+                                   buttonFill, buttonBorder)) {
+            gShowExitConfirmDialog = false;
+        }
+        if (DrawDialogActionButton("exit_confirm", ICON_FA_CIRCLE_XMARK, "确认退出",
+                                   ImVec2(buttonStartX + buttonSize.x + buttonGap, buttonY), buttonSize,
+                                   buttonFill, buttonBorder)) {
+            gShowExitConfirmDialog = false;
+            IsToolActive.store(false, std::memory_order_relaxed);
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar();
+}
+
+static void DrawDebugOptionsOverlay() {
+    if (!gShowDebugOptionsDialog) return;
+
+    ImGuiIO& io = ImGui::GetIO();
+    const ImVec2 windowSize(860.0f, 720.0f);
+    if (gDebugOptionsWindowPos.x < 0.0f || gDebugOptionsWindowPos.y < 0.0f) {
+        gDebugOptionsWindowPos = ImVec2((io.DisplaySize.x - windowSize.x) * 0.5f + 36.0f,
+                                        (io.DisplaySize.y - windowSize.y) * 0.5f + 24.0f);
+    }
+    gDebugOptionsWindowPos.x = std::clamp(gDebugOptionsWindowPos.x, 12.0f,
+                                          std::max(12.0f, io.DisplaySize.x - windowSize.x - 12.0f));
+    gDebugOptionsWindowPos.y = std::clamp(gDebugOptionsWindowPos.y, 12.0f,
+                                          std::max(12.0f, io.DisplaySize.y - windowSize.y - 12.0f));
+
+    ImGui::SetNextWindowPos(gDebugOptionsWindowPos, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(windowSize, ImGuiCond_Always);
+    PushMenuWindowStyle();
+    if (ImGui::Begin("###DebugOptionsWindow", nullptr,
+                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                     ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoCollapse |
+                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove)) {
+            static bool was_mouse_down = false;
+            static bool is_dragging_window = false;
+            static ImVec2 drag_offset;
+            static ImVec2 drag_start_pos;
+            static bool drag_start_in_area = false;
+            const bool original_mouse_down = io.MouseDown[0];
+            const ImVec2 original_mouse_pos = io.MousePos;
+            const ImVec2 window_pos = ImGui::GetWindowPos();
+            const ImVec2 drag_area_min = window_pos;
+            const ImVec2 drag_area_max(window_pos.x + windowSize.x, window_pos.y + 96.0f);
+            const bool in_drag_area = ImGui::IsMouseHoveringRect(drag_area_min, drag_area_max);
+
+            if (original_mouse_down && !was_mouse_down) {
+                drag_start_pos = original_mouse_pos;
+                drag_start_in_area = in_drag_area;
+                drag_offset = ImVec2(original_mouse_pos.x - window_pos.x,
+                                     original_mouse_pos.y - window_pos.y);
+            }
+            if (drag_start_in_area && original_mouse_down && !is_dragging_window) {
+                const float dx = original_mouse_pos.x - drag_start_pos.x;
+                const float dy = original_mouse_pos.y - drag_start_pos.y;
+                if (sqrtf(dx * dx + dy * dy) > 5.0f && !TouchScrollable::IsScrolling()) {
+                    is_dragging_window = true;
+                }
+            }
+            if (is_dragging_window) {
+                if (original_mouse_down) {
+                    gDebugOptionsWindowPos = ImVec2(original_mouse_pos.x - drag_offset.x,
+                                                    original_mouse_pos.y - drag_offset.y);
+                    ImGui::SetWindowPos(gDebugOptionsWindowPos);
+                } else {
+                    is_dragging_window = false;
+                    drag_start_in_area = false;
+                }
+            }
+            was_mouse_down = original_mouse_down;
+
+            const ImVec2 actionButtonSize(48.0f, 48.0f);
+            const ImVec4 actionFill(0.08f, 0.18f, 0.30f, 0.72f);
+            const ImVec4 actionBorder(0.34f, 0.72f, 1.00f, 0.90f);
+            if (DrawIconActionButton("debug_options_close", ICON_FA_XMARK,
+                                     ImVec2(windowSize.x - actionButtonSize.x - 20.0f, 18.0f),
+                                     actionButtonSize, actionFill, actionBorder, gBannerIconFont)) {
+                gShowDebugOptionsDialog = false;
+            }
+
+            ImDrawList* drawList = ImGui::GetWindowDrawList();
+            const float titleY = 26.0f;
+            const char* title = "Debug Options";
+            ImGui::SetWindowFontScale(1.45f);
+            ImVec2 titleSize = ImGui::CalcTextSize(title);
+            ImVec2 titlePos((windowSize.x - titleSize.x) * 0.5f, titleY);
+            ImVec2 titleScreenPos(window_pos.x + titlePos.x, window_pos.y + titlePos.y);
+            drawList->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 1.45f,
+                              ImVec2(titleScreenPos.x + 2.0f, titleScreenPos.y + 3.0f),
+                              ImGui::GetColorU32(ImVec4(0.02f, 0.08f, 0.16f, 0.75f)), title);
+            drawList->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 1.45f,
+                              titleScreenPos, ImGui::GetColorU32(ImVec4(0.90f, 0.97f, 1.00f, 1.00f)), title);
+            drawList->AddRectFilledMultiColor(
+                ImVec2(titleScreenPos.x, titleScreenPos.y + titleSize.y + 8.0f),
+                ImVec2(titleScreenPos.x + titleSize.x + 18.0f, titleScreenPos.y + titleSize.y + 12.0f),
+                ImGui::GetColorU32(ImVec4(0.10f, 0.45f, 0.95f, 0.20f)),
+                ImGui::GetColorU32(ImVec4(0.22f, 0.68f, 1.00f, 0.95f)),
+                ImGui::GetColorU32(ImVec4(0.22f, 0.68f, 1.00f, 0.95f)),
+                ImGui::GetColorU32(ImVec4(0.10f, 0.45f, 0.95f, 0.20f)));
+            ImGui::SetWindowFontScale(1.0f);
+
+            const float dividerY = 92.0f;
+            drawList->AddRectFilledMultiColor(
+                ImVec2(window_pos.x + 18.0f, window_pos.y + dividerY),
+                ImVec2(window_pos.x + windowSize.x - 18.0f, window_pos.y + dividerY + 6.0f),
+                ImGui::GetColorU32(ImVec4(0.10f, 0.45f, 0.95f, 0.25f)),
+                ImGui::GetColorU32(ImVec4(0.22f, 0.68f, 1.00f, 0.92f)),
+                ImGui::GetColorU32(ImVec4(0.22f, 0.68f, 1.00f, 0.92f)),
+                ImGui::GetColorU32(ImVec4(0.10f, 0.45f, 0.95f, 0.25f)));
+
+            const float contentStartY = dividerY + 18.0f;
+            ImGui::SetCursorPos(ImVec2(16.0f, contentStartY));
+            if (ImGui::BeginChild("DebugOptionsContentRegion",
+                                  ImVec2(windowSize.x - 32.0f, windowSize.y - contentStartY - 16.0f),
+                                  false, ImGuiWindowFlags_NoBackground)) {
+                MenuRegistry::Instance().RenderPage("config", MenuRenderMode::DebugOnly);
+                MenuRegistry::Instance().RenderPage("objects", MenuRenderMode::DebugOnly);
+            }
+            ImGui::EndChild();
+    }
+    PopMenuWindowStyle();
+    ImGui::End();
 }
 
 static std::string GetDisplaySyncStatusText() {
@@ -376,6 +675,10 @@ static void ApplyDriverTypeSelection() {
     StopReadThread();
     driver_stat.store(0, std::memory_order_release);
     GetDriverManager().switchDriver(desired);
+}
+
+static void ApplyDriverLockSelection() {
+    GetDriverManager().setLockEnabled(gDriverLockEnabledUi);
 }
 
 static bool HasGyroSocketConnection() {
@@ -572,7 +875,7 @@ static void RegisterCameraPage(MenuRegistry& registry) {
     autoAim.AddChoice("target_bone", "目标骨骼", &cfg.targetBone,
                       {{"头部", BONE_HEAD}, {"颈部", BONE_NECK}, {"胸部", BONE_CHEST}, {"骨盆", BONE_PELVIS}});
     autoAim.AddFloat("max_distance", "最大距离 (米)", &cfg.maxDistance, 10.0f, 500.0f, "%.0f");
-    autoAim.AddFloat("fov_limit", "FOV 限制 (度)", &cfg.fovLimit, 5.0f, 90.0f, "%.0f");
+    autoAim.AddFloat("fov_limit", "FOV 限制 (度)", &cfg.fovLimit, 0.1f, 5.0f, "%.0f");
     autoAim.AddFloat("update_rate", "更新频率 (Hz)", &cfg.updateRate, 30.0f, 500.0f, "%.0f");
     autoAim.AddFloat("switch_threshold", "目标切换阈值", &cfg.hysteresisThreshold, 10.0f, 200.0f, "%.0f");
     autoAim.AddBool("filter_teammates", "过滤队友", &cfg.filterTeammates);
@@ -586,14 +889,12 @@ static void RegisterCameraPage(MenuRegistry& registry) {
     triggerBot.VisibleIf([] { return CurrentDriverSupportsTouch(); });
     triggerBot.AddBool("trigger_bot_enabled", "启用", &cfg.triggerBotEnabled)
         .Tooltip("当目标可视且位于准星中心附近时，自动按下你配置的开火键触点");
-    triggerBot.AddBool("trigger_bot_hitscan_head", "Hit Scan 头部", &cfg.triggerBotHitScanHead)
-        .Tooltip("勾选后，头部进入 Trigger Bot 判定范围时也会自动开火");
-    triggerBot.AddBool("trigger_bot_hitscan_neck", "Hit Scan 颈部", &cfg.triggerBotHitScanNeck)
-        .Tooltip("勾选后，颈部进入 Trigger Bot 判定范围时也会自动开火");
-    triggerBot.AddBool("trigger_bot_hitscan_chest", "Hit Scan 胸部", &cfg.triggerBotHitScanChest)
-        .Tooltip("勾选后，胸部进入 Trigger Bot 判定范围时也会自动开火");
-    triggerBot.AddBool("trigger_bot_hitscan_pelvis", "Hit Scan 骨盆", &cfg.triggerBotHitScanPelvis)
-        .Tooltip("勾选后，骨盆进入 Trigger Bot 判定范围时也会自动开火");
+    triggerBot.AddMultiBoolChoice("trigger_bot_hitscan_bones", "Hit Scan",
+                                  {{"head", "头部", &cfg.triggerBotHitScanHead},
+                                   {"neck", "颈部", &cfg.triggerBotHitScanNeck},
+                                   {"chest", "胸部", &cfg.triggerBotHitScanChest},
+                                   {"pelvis", "骨盆", &cfg.triggerBotHitScanPelvis}})
+        .Tooltip("可多选。勾选的部位进入 Trigger Bot 判定范围时会自动开火");
     triggerBot.AddFloat("trigger_bot_radius", "中心触发半径", &cfg.triggerBotCenterRadius, 4.0f, 80.0f, "%.0f");
     triggerBot.AddText("trigger_bot_fire_button_status", "", [] {
         return GetTriggerBotFireButtonStatusText();
@@ -613,10 +914,10 @@ static void RegisterCameraPage(MenuRegistry& registry) {
     }).Persisted(false);
 
     MenuSectionSpec& pd = page.AddSection("pd_controller", "PD 控制器", MenuColumn::Right);
-    pd.AddFloat("kp_x", "X Kp", &cfg.KpX, 0.0f, 2.0f, "%.2f");
-    pd.AddFloat("kd_x", "X Kd", &cfg.KdX, 0.0f, 1.0f, "%.2f");
-    pd.AddFloat("kp_y", "Y Kp", &cfg.KpY, 0.0f, 2.0f, "%.2f");
-    pd.AddFloat("kd_y", "Y Kd", &cfg.KdY, 0.0f, 1.0f, "%.2f");
+    pd.AddFloat("kp_x", "X Kp", &cfg.KpX, 0.0f, 1.0f, "%.2f");
+    pd.AddFloat("kd_x", "X Kd", &cfg.KdX, 0.0f, 0.2f, "%.2f");
+    pd.AddFloat("kp_y", "Y Kp", &cfg.KpY, 0.0f, 1.0f, "%.2f");
+    pd.AddFloat("kd_y", "Y Kd", &cfg.KdY, 0.0f, 0.5f, "%.2f");
     pd.AddFloat("output_scale_x", "X 输出倍率", &cfg.outputScaleX, 0.5f, 1.8f, "%.2f");
     pd.AddFloat("output_scale_y", "Y 输出倍率", &cfg.outputScaleY, 0.5f, 1.8f, "%.2f");
 
@@ -663,30 +964,43 @@ static void RegisterObjectsPage(MenuRegistry& registry) {
     objects.AddBool("draw_name", "名称 (Name)", &gDrawName).ShortcutSupported(false);
     objects.AddBool("draw_distance", "距离 (Distance)", &gDrawDistance).ShortcutSupported(false);
     objects.AddBool("draw_box", "包围盒 (Box)", &gDrawBox).Tooltip("预留").ShortcutSupported(false);
+    objects.AddBool("draw_skeleton", "骨骼 (Skeleton)", &gDrawSkeleton).ShortcutSupported(false);
+    objects.AddBool("depth_visibility", "骨骼可视性射线检测", &gUseDepthBufferVisibility)
+        .ShortcutSupported(false)
+        .VisibleIf([] { return gDrawSkeleton; });
     objects.AddBool("draw_predicted_aim", "预判点 (Prediction)", &gDrawPredictedAimPoint)
         .ShortcutSupported(false)
         .Tooltip("准星在目标附近停留一小段时间后，显示该目标的预判点");
 
-    MenuSectionSpec& skeleton = page.AddSection("skeleton_matrix", "骨骼与矩阵", MenuColumn::Left);
-    skeleton.AddBool("draw_skeleton", "骨骼 (Skeleton)", &gDrawSkeleton).ShortcutSupported(false);
-    skeleton.AddBool("depth_visibility", "骨骼可视性射线检测", &gUseDepthBufferVisibility).ShortcutSupported(false);
+    MenuSectionSpec& skeleton = page.AddSection("skeleton_matrix", "骨骼与矩阵", MenuColumn::Left).DebugOnly();
     skeleton.AddBool("bone_smoothing", "骨骼平滑", &gEnableBoneSmoothing).ShortcutSupported(false);
     skeleton.AddBool("use_camera_cache_vp", "使用 CameraCache VP 矩阵", &gUseCameraCacheVPMatrix)
         .ShortcutSupported(false)
         .Tooltip("切换主矩阵来源: CanvasMap 或 CameraCache->MinimalViewInfo");
 
+    MenuSectionSpec& minimap = page.AddSection("mini_map", "小地图", MenuColumn::Right);
+    minimap.AddBool("draw_mini_map", "显示小地图", &gDrawMiniMap).ShortcutSupported(false);
+    minimap.AddFloat("mini_map_pos_x", "位置 X", &gMiniMapPosX, 8.0f, 2400.0f, "%.0f");
+    minimap.AddFloat("mini_map_pos_y", "位置 Y", &gMiniMapPosY, 8.0f, 2400.0f, "%.0f");
+    minimap.AddFloat("mini_map_size", "边长", &gMiniMapSizePx, 120.0f, 420.0f, "%.0f");
+    minimap.AddFloat("mini_map_zoom", "缩放半径 (米)", &gMiniMapZoomMeters, 20.0f, 400.0f, "%.0f")
+        .Tooltip("数值越大，显示的范围越大，地图上的红点越密集");
+
     MenuSectionSpec& physx = page.AddSection("physx_geometry", "PhysX 几何体", MenuColumn::Right);
     physx.AddBool("draw_physx_geometry", "显示 PhysX 几何", &gDrawPhysXGeometry).ShortcutSupported(false);
     physx.AddBool("show_physx_debug_window", "显示 PhysX 调试窗口", &gShowPhysXDebugWindow)
         .Persisted(false)
-        .ShortcutSupported(false);
+        .ShortcutSupported(false)
+        .DebugOnly();
     physx.AddBool("show_bullet_spread_debug_window", "显示子弹扩散调试窗口", &gShowBulletSpreadDebugWindow)
         .Persisted(false)
         .ShortcutSupported(false)
+        .DebugOnly()
         .OnChange([] { SetBulletSpreadMonitorEnabled(gShowBulletSpreadDebugWindow); });
     physx.AddChoice("bullet_breakpoint_target", "子弹断点目标", &gBulletBreakpointTargetUi,
                     {{"BulletSpreadFuncEntry", 0}, {"EngineLoopProbe", 1}})
         .Persisted(false)
+        .DebugOnly()
         .OnChange([] { SetBulletBreakpointTarget(static_cast<BulletBreakpointTarget>(gBulletBreakpointTargetUi)); });
     physx.AddBool("draw_physx_meshes", "绘制 Mesh", &gPhysXDrawMeshes).ShortcutSupported(false);
     physx.AddBool("draw_physx_primitives", "绘制基础体", &gPhysXDrawPrimitives).ShortcutSupported(false);
@@ -695,17 +1009,21 @@ static void RegisterObjectsPage(MenuRegistry& registry) {
         .ShortcutSupported(false)
         .Tooltip("内存读取到新模型时自动保存到磁盘，下次优先从磁盘加载");
     physx.AddBool("manual_scene_index_enabled", "手动 SceneIndex", &gPhysXManualSceneIndexEnabled)
-        .ShortcutSupported(false);
+        .ShortcutSupported(false)
+        .DebugOnly();
     physx.AddInt("manual_scene_index", "PxScene Index", &gPhysXManualSceneIndex, 0, 15, "%d")
+        .DebugOnly()
         .VisibleIf([] { return gPhysXManualSceneIndexEnabled; });
     physx.AddFloat("physx_radius_meters", "PhysX 半径 (米)", &gPhysXDrawRadiusMeters, 20.0f, 300.0f, "%.0f");
     physx.AddFloat("physx_refresh_interval", "几何缓存刷新间隔 (秒)", &gPhysXGeomRefreshInterval, 5.0f, 120.0f, "%.0f");
     physx.AddFloat("physx_center_region", "准星区域", &gPhysXCenterRegionFovDegrees, 5.0f, 60.0f, "%.0f");
 
-    MenuSectionSpec& limits = page.AddSection("export_limits", "导出与限制", MenuColumn::Right);
+    MenuSectionSpec& limits = page.AddSection("export_limits", "导出与限制", MenuColumn::Right).DebugOnly();
     limits.AddInt("physx_max_actors", "最大 Actor", &gPhysXMaxActorsPerFrame, 32, 512, "%d");
     limits.AddInt("physx_max_shapes_per_actor", "每 Actor 最大 Shape", &gPhysXMaxShapesPerActor, 1, 64, "%d");
     limits.AddInt("physx_max_triangles_per_mesh", "每 Mesh 最大三角形", &gPhysXMaxTrianglesPerMesh, 64, 8000, "%d");
+    limits.AddInt("physx_max_pruner_per_frame", "每帧最大 Pruner 读取", &gPhysXMaxPrunerObjectsPerFrame, 1000, 200000, "%d");
+    limits.AddInt("physx_max_pruner_total", "Pruner 总数上限", &gPhysXMaxPrunerObjectCount, 10000, 400000, "%d");
     limits.AddButton("export_stable_obj", "导出稳定 OBJ", [] {
         ExportStablePhysXMeshes();
     });
@@ -720,38 +1038,43 @@ static void RegisterConfigPage(MenuRegistry& registry) {
     MenuSectionSpec& display = page.AddSection("display_sync", "显示与同步", MenuColumn::Left);
     display.AddBool("show_all_class_names", "显示所有类名", &gShowAllClassNames);
     display.AddBool("use_batch_bone_read", "批量读取（优化）", &gUseBatchBoneRead)
-        .Tooltip("批量读取: 1次ioctl读取整个骨骼数组（推荐）\n逐个读取: 每个骨骼1次ioctl（调试用）");
+        .Tooltip("批量读取: 1次ioctl读取整个骨骼数组（推荐）\n逐个读取: 每个骨骼1次ioctl（调试用）")
+        .DebugOnly();
     display.AddFloat("max_skeleton_distance", "最大距离 (米)", &gMaxSkeletonDistance, 50.0f, 500.0f, "%.0f")
         .Tooltip("超过此距离的角色不绘制骨骼，减少性能开销");
-    display.AddText("display_sync_status", "", [] { return GetDisplaySyncStatusText(); }).Persisted(false);
 
     MenuSectionSpec& driver = page.AddSection("driver_memory", "驱动与内存", MenuColumn::Left);
     driver.AddChoice("driver_type", "驱动类型", &gDriverTypeUi,
                      {{"RT Hook", DRIVER_RT_HOOK}, {"Paradise Hook", DRIVER_PARADISE}})
         .Persisted(false)
         .OnChange([] { ApplyDriverTypeSelection(); });
-    driver.AddButton("init_mem", "mem", [] {
+    driver.AddBool("driver_lock_enabled", "驱动多线程加锁", &gDriverLockEnabledUi)
+        .Persisted(false)
+        .Tooltip("对所有驱动类型的读写/初始化操作应用互斥锁。关闭后并发访问延迟更低，但更容易出现线程竞争。")
+        .OnChange([] { ApplyDriverLockSelection(); })
+        .DebugOnly();
+    driver.AddButton("init_mem", "初始化", [] {
         InitDriver("com.tencent.tmgp.pubgmhd", libUE4);
     }).Persisted(false);
     driver.AddButton("dump_tarray", "Dump TArray", [] {
         DumpTArray();
-    }).Persisted(false).VisibleIf([] {
+    }).Persisted(false).DebugOnly().VisibleIf([] {
         return driver_stat.load(std::memory_order_relaxed) > 0;
     });
     driver.AddButton("dump_bones", "Dump Bones", [] {
         DumpBones();
-    }).Persisted(false).VisibleIf([] {
+    }).Persisted(false).DebugOnly().VisibleIf([] {
         return driver_stat.load(std::memory_order_relaxed) > 0;
     });
     driver.AddButton("test_touch", "测试 Touch", [] {
         RunTouchTest();
-    }).Persisted(false);
+    }).Persisted(false).DebugOnly();
     driver.AddText("touch_test_status", "", [] {
         return GetTouchTestStatusText();
-    }).Persisted(false);
-    driver.AddText("driver_status", "", [] { return GetDriverMemoryStatusText(); }).Persisted(false);
+    }).Persisted(false).DebugOnly();
+    driver.AddText("driver_status", "", [] { return GetDriverMemoryStatusText(); }).Persisted(false).DebugOnly();
 
-    MenuSectionSpec& scan = page.AddSection("scan_data", "扫描与数据", MenuColumn::Right);
+    MenuSectionSpec& scan = page.AddSection("scan_data", "扫描与数据", MenuColumn::Right).DebugOnly();
     scan.AddButton("scan_canvas", "扫描 Canvas", [] {
         ClearScanResults();
         ScanForClass("CustomizeCanvasPanel_BP_C");
@@ -785,15 +1108,18 @@ static void RegisterConfigPage(MenuRegistry& registry) {
 
     MenuSectionSpec& tools = page.AddSection("tools_recording", "工具与录屏", MenuColumn::Right);
     tools.AddButton("exit_tool", "退出", [] {
-        IsToolActive.store(false);
+        gShowExitConfirmDialog = true;
     }).Persisted(false);
     tools.AddButton("detect_virtual_display", "检测虚拟显示", [] {
         android::ANativeWindowCreator::DetectAndCreateVirtualDisplayMirrors();
     }).Persisted(false).Tooltip("开始录屏后点击此按钮，会检测录屏创建的虚拟显示并自动创建镜像层");
     tools.AddText("tool_status", "", [] { return GetToolStatusText(); }).Persisted(false);
 
-    MenuSectionSpec& configOps = page.AddSection("config_management", "配置管理", MenuColumn::Left);
+    MenuSectionSpec& configOps = page.AddSection("config_management", "配置管理", MenuColumn::Right);
     configOps.AddText("config_path", "配置文件", [] { return GetConfigPathString(); }).Persisted(false);
+    configOps.AddButton("debug_options", "调试选项", [] {
+        gShowDebugOptionsDialog = true;
+    }).Persisted(false);
     configOps.AddButton("export_config", "导出配置", [] {
         SetConfigStatus(MenuRegistry::Instance().ExportToFile(MenuRegistry::Instance().GetDefaultConfigPath()));
     }).Persisted(false);
@@ -814,6 +1140,7 @@ static void EnsureMenuFrameworkRegistered() {
     registry.Reset();
     registry.SetDefaultConfigPath("debugger_config.json");
     gDriverTypeUi = static_cast<int>(GetDriverManager().getType());
+    gDriverLockEnabledUi = GetDriverManager().isLockEnabled();
     RegisterCameraPage(registry);
     RegisterObjectsPage(registry);
     RegisterConfigPage(registry);
@@ -1065,35 +1392,13 @@ void Draw_Menu() {
     ImGui::SetNextWindowSize(ImVec2(windowWidth, windowHeight), ImGuiCond_Once);
     ImGui::SetNextWindowPos(ImVec2((io.DisplaySize.x - windowWidth) / 2, (io.DisplaySize.y - windowHeight) / 2), ImGuiCond_Once);
 
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 15.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
-    ImGui::PushStyleVar(ImGuiStyleVar_TabRounding, 8.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.0f, 8.0f));
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.06f, 0.09f, 0.15f, 0.72f));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.12f, 0.20f, 0.38f));
-    ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(0.07f, 0.10f, 0.17f, 0.82f));
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.10f, 0.16f, 0.26f, 0.56f));
-    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.14f, 0.22f, 0.34f, 0.68f));
-    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0.16f, 0.26f, 0.40f, 0.78f));
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.24f, 0.40f, 0.58f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.18f, 0.34f, 0.56f, 0.76f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.20f, 0.40f, 0.66f, 0.86f));
-    ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.12f, 0.22f, 0.38f, 0.52f));
-    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.18f, 0.32f, 0.54f, 0.70f));
-    ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0.22f, 0.38f, 0.62f, 0.82f));
-    ImGui::PushStyleColor(ImGuiCol_CheckMark, ImVec4(0.58f, 0.84f, 1.00f, 0.98f));
-    ImGui::PushStyleColor(ImGuiCol_SliderGrab, ImVec4(0.42f, 0.78f, 1.00f, 0.92f));
-    ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, ImVec4(0.56f, 0.86f, 1.00f, 1.00f));
-    ImGui::PushStyleColor(ImGuiCol_Tab, ImVec4(0.10f, 0.18f, 0.30f, 0.58f));
-    ImGui::PushStyleColor(ImGuiCol_TabHovered, ImVec4(0.18f, 0.32f, 0.50f, 0.78f));
-    ImGui::PushStyleColor(ImGuiCol_TabActive, ImVec4(0.16f, 0.30f, 0.48f, 0.88f));
+    PushMenuWindowStyle();
 
     if (!ImGui::Begin("###MainWindow", nullptr,
         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
         ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoCollapse |
         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove)) {
-        ImGui::PopStyleVar(4);
-        ImGui::PopStyleColor(18);
+        PopMenuWindowStyle();
         ImGui::End();
         was_mouse_down = original_mouse_down;
         return;
@@ -1165,28 +1470,32 @@ void Draw_Menu() {
         ImGui::Image(gBannerTexture, bannerSize);
     }
 
-    const ImVec2 actionButtonSize(42.0f, 42.0f);
-    const float actionSpacing = 10.0f;
+    const ImVec2 actionButtonSize(58.0f, 58.0f);
+    const float actionSpacing = 14.0f;
     const float actionStartX = windowWidth - (actionButtonSize.x * 4.0f + actionSpacing * 3.0f) - 28.0f;
     const float actionY = 18.0f;
     const ImVec4 actionFill(0.08f, 0.18f, 0.30f, 0.56f);
     const ImVec4 actionBorder(0.34f, 0.72f, 1.00f, 0.84f);
 
-    if (DrawIconActionButton("banner_save_config", "💾", ImVec2(actionStartX, actionY), actionButtonSize, actionFill, actionBorder)) {
+    if (DrawIconActionButton("banner_save_config", ICON_FA_FLOPPY_DISK, ImVec2(actionStartX, actionY),
+                             actionButtonSize, actionFill, actionBorder, gBannerIconFont)) {
         SetConfigStatus(MenuRegistry::Instance().ExportToFile(MenuRegistry::Instance().GetDefaultConfigPath()));
     }
-    if (DrawIconActionButton("banner_load_config", "📂", ImVec2(actionStartX + (actionButtonSize.x + actionSpacing), actionY),
-                             actionButtonSize, actionFill, actionBorder)) {
+    if (DrawIconActionButton("banner_load_config", ICON_FA_FOLDER_OPEN,
+                             ImVec2(actionStartX + (actionButtonSize.x + actionSpacing), actionY),
+                             actionButtonSize, actionFill, actionBorder, gBannerIconFont)) {
         SetConfigStatus(MenuRegistry::Instance().ImportFromFile(MenuRegistry::Instance().GetDefaultConfigPath()));
     }
-    if (DrawIconActionButton("banner_close_menu", "❌", ImVec2(actionStartX + (actionButtonSize.x + actionSpacing) * 2.0f, actionY),
-                             actionButtonSize, actionFill, actionBorder)) {
+    if (DrawIconActionButton("banner_close_menu", ICON_FA_WINDOW_MINIMIZE,
+                             ImVec2(actionStartX + (actionButtonSize.x + actionSpacing) * 2.0f, actionY),
+                             actionButtonSize, actionFill, actionBorder, gBannerIconFont)) {
         gLastMenuPos = ImGui::GetWindowPos();
         IsMenuOpen.store(false, std::memory_order_relaxed);
     }
-    if (DrawIconActionButton("banner_exit_tool", "🚪", ImVec2(actionStartX + (actionButtonSize.x + actionSpacing) * 3.0f, actionY),
-                             actionButtonSize, actionFill, actionBorder)) {
-        IsToolActive.store(false);
+    if (DrawIconActionButton("banner_exit_tool", ICON_FA_CIRCLE_XMARK,
+                             ImVec2(actionStartX + (actionButtonSize.x + actionSpacing) * 3.0f, actionY),
+                             actionButtonSize, actionFill, actionBorder, gBannerIconFont)) {
+        gShowExitConfirmDialog = true;
     }
 
     bool isLandscape = (io.DisplaySize.x > io.DisplaySize.y);
@@ -1267,9 +1576,10 @@ void Draw_Menu() {
     }
     ImGui::EndChild();
 
-    ImGui::PopStyleColor(18);
-    ImGui::PopStyleVar(4);
+    PopMenuWindowStyle();
     ImGui::End();
+    DrawDebugOptionsOverlay();
+    DrawExitConfirmOverlay();
     DrawPhysXDebugWindow();
     DrawBulletSpreadDebugWindow();
 }
@@ -1299,5 +1609,6 @@ void DrawObjViewTab() {
 void DrawConfigTab() {
     EnsureMenuFrameworkRegistered();
     gDriverTypeUi = static_cast<int>(GetDriverManager().getType());
+    gDriverLockEnabledUi = GetDriverManager().isLockEnabled();
     MenuRegistry::Instance().RenderPage("config");
 }

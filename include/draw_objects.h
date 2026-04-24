@@ -74,6 +74,8 @@ extern int gPhysXManualSceneIndex; // 手动指定的 PxScene index
 extern bool gPhysXUseLocalModelData; // 是否只读取本地导出的模型数据
 extern bool gPhysXAutoExport;       // 自动导出未缓存的模型到磁盘
 extern float gPhysXGeomRefreshInterval; // 几何缓存刷新间隔（秒），大间隔
+extern int gPhysXMaxPrunerObjectsPerFrame; // 每帧最多读取的 Pruner 对象数
+extern int gPhysXMaxPrunerObjectCount;     // Pruner 对象总数合法性上限
 
 // 骨骼可视性判断
 extern bool gUseDepthBufferVisibility;  // 使用 CPU raycaster + 本地 BVH 做骨骼可视性
@@ -81,6 +83,13 @@ extern float gDepthBufferBias;          // 光栅化深度偏移
 extern float gDepthBufferTolerance;     // 查询深度容差
 extern int gDepthBufferDownscale;       // 降采样倍率
 extern bool gDrawDepthBuffer;           // 调试：直接绘制深度缓冲
+
+// 小地图
+extern bool gDrawMiniMap;               // 绘制旋转小地图
+extern float gMiniMapPosX;              // 左上角 X（像素）
+extern float gMiniMapPosY;              // 左上角 Y（像素）
+extern float gMiniMapSizePx;            // 小地图边长（像素）
+extern float gMiniMapZoomMeters;        // 半径对应的世界距离（米）
 
 // 使用预读数据绘制（在 fence wait 后调用）
 // gameStepDeltaTime: 与游戏帧同步的时间步（秒），用于骨骼插值

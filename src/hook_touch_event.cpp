@@ -25,6 +25,16 @@ static bool need_refresh_touch_range = false;
 namespace {
 constexpr int kMaxTouchSlots = 10;
 
+struct TouchDeviceProbeResult {
+    bool valid = false;
+    bool has_mt_position = false;
+    bool has_single_position = false;
+    bool has_touch_key = false;
+    int max_x = 0;
+    int max_y = 0;
+    int score = -1;
+};
+
 struct TouchSlotState {
     bool active = false;
     int tracking_id = -1;
@@ -40,6 +50,65 @@ int g_active_touch_count = 0;
 int g_current_mt_slot = 0;
 int g_primary_touch_slot = -1;
 
+static bool IsBitSet(const unsigned long* bits, int bit) {
+    const int bits_per_long = static_cast<int>(sizeof(unsigned long) * 8);
+    return (bits[bit / bits_per_long] & (1UL << (bit % bits_per_long))) != 0;
+}
+
+static TouchDeviceProbeResult ProbeTouchDeviceCapabilities(int fd) {
+    TouchDeviceProbeResult result;
+    if (fd < 0) return result;
+
+    constexpr int kBitsPerLong = static_cast<int>(sizeof(unsigned long) * 8);
+    unsigned long ev_bits[(EV_MAX / kBitsPerLong) + 1] = {};
+    unsigned long abs_bits[(ABS_MAX / kBitsPerLong) + 1] = {};
+    unsigned long key_bits[(KEY_MAX / kBitsPerLong) + 1] = {};
+
+    if (ioctl(fd, EVIOCGBIT(0, sizeof(ev_bits)), ev_bits) < 0) return result;
+
+    const bool has_abs = IsBitSet(ev_bits, EV_ABS);
+    const bool has_key = IsBitSet(ev_bits, EV_KEY);
+    if (!has_abs) return result;
+
+    if (ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(abs_bits)), abs_bits) < 0) {
+        memset(abs_bits, 0, sizeof(abs_bits));
+    }
+    if (has_key && ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(key_bits)), key_bits) < 0) {
+        memset(key_bits, 0, sizeof(key_bits));
+    }
+
+    result.has_mt_position =
+        IsBitSet(abs_bits, ABS_MT_POSITION_X) && IsBitSet(abs_bits, ABS_MT_POSITION_Y);
+    result.has_single_position =
+        IsBitSet(abs_bits, ABS_X) && IsBitSet(abs_bits, ABS_Y);
+    result.has_touch_key =
+        has_key && (IsBitSet(key_bits, BTN_TOUCH) || IsBitSet(key_bits, BTN_TOOL_FINGER));
+
+    if (!result.has_mt_position && !result.has_single_position) return result;
+    if (!result.has_touch_key && !result.has_mt_position) return result;
+
+    input_absinfo abs_x{};
+    input_absinfo abs_y{};
+    if (result.has_single_position) {
+        if (ioctl(fd, EVIOCGABS(ABS_X), &abs_x) == 0) result.max_x = abs_x.maximum;
+        if (ioctl(fd, EVIOCGABS(ABS_Y), &abs_y) == 0) result.max_y = abs_y.maximum;
+    }
+    if ((result.max_x <= 0 || result.max_y <= 0) && result.has_mt_position) {
+        input_absinfo abs_mt_x{};
+        input_absinfo abs_mt_y{};
+        if (ioctl(fd, EVIOCGABS(ABS_MT_POSITION_X), &abs_mt_x) == 0) result.max_x = abs_mt_x.maximum;
+        if (ioctl(fd, EVIOCGABS(ABS_MT_POSITION_Y), &abs_mt_y) == 0) result.max_y = abs_mt_y.maximum;
+    }
+    if (result.max_x <= 0 || result.max_y <= 0) return result;
+
+    result.valid = true;
+    result.score = 0;
+    if (result.has_mt_position) result.score += 4;
+    if (result.has_touch_key) result.score += 2;
+    if (result.has_single_position) result.score += 1;
+    return result;
+}
+
 static void MapTouchToScreen(int raw_x, int raw_y, float& out_x, float& out_y) {
     const int screen_width = displayInfo.width;
     const int screen_height = displayInfo.height;
@@ -50,14 +119,31 @@ static void MapTouchToScreen(int raw_x, int raw_y, float& out_x, float& out_y) {
         return;
     }
 
-    const bool screen_is_landscape = (screen_width > screen_height);
-    if (screen_is_landscape) {
-        out_x = static_cast<float>(raw_y) / static_cast<float>(touch_max_y) * screen_width;
-        out_y = screen_height - static_cast<float>(raw_x) / static_cast<float>(touch_max_x) * screen_height;
-    } else {
-        out_x = static_cast<float>(raw_x) / static_cast<float>(touch_max_x) * screen_width;
-        out_y = static_cast<float>(raw_y) / static_cast<float>(touch_max_y) * screen_height;
+    const float normalized_x = static_cast<float>(raw_x) / static_cast<float>(touch_max_x);
+    const float normalized_y = static_cast<float>(raw_y) / static_cast<float>(touch_max_y);
+    float screen_u = normalized_x;
+    float screen_v = normalized_y;
+
+    switch (displayInfo.orientation) {
+        case 1:  // Rotation 90
+            screen_u = normalized_y;
+            screen_v = 1.0f - normalized_x;
+            break;
+        case 2:  // Rotation 180
+            screen_u = 1.0f - normalized_x;
+            screen_v = 1.0f - normalized_y;
+            break;
+        case 3:  // Rotation 270
+            screen_u = 1.0f - normalized_y;
+            screen_v = normalized_x;
+            break;
+        case 0:  // Rotation 0
+        default:
+            break;
     }
+
+    out_x = std::clamp(screen_u, 0.0f, 1.0f) * static_cast<float>(screen_width);
+    out_y = std::clamp(screen_v, 0.0f, 1.0f) * static_cast<float>(screen_height);
 }
 
 static void RebuildActiveTouchesFromSlots() {
@@ -97,18 +183,33 @@ bool MapScreenToTouch(float screen_x, float screen_y, int& out_raw_x, int& out_r
 
     const float clamped_x = std::clamp(screen_x, 0.0f, static_cast<float>(screen_width));
     const float clamped_y = std::clamp(screen_y, 0.0f, static_cast<float>(screen_height));
-    const bool screen_is_landscape = (screen_width > screen_height);
-    if (screen_is_landscape) {
-        out_raw_x = static_cast<int>(std::lround(
-            (1.0f - clamped_y / static_cast<float>(screen_height)) * static_cast<float>(touch_max_x)));
-        out_raw_y = static_cast<int>(std::lround(
-            (clamped_x / static_cast<float>(screen_width)) * static_cast<float>(touch_max_y)));
-    } else {
-        out_raw_x = static_cast<int>(std::lround(
-            (clamped_x / static_cast<float>(screen_width)) * static_cast<float>(touch_max_x)));
-        out_raw_y = static_cast<int>(std::lround(
-            (clamped_y / static_cast<float>(screen_height)) * static_cast<float>(touch_max_y)));
+    const float screen_u = (screen_width > 0) ? (clamped_x / static_cast<float>(screen_width)) : 0.0f;
+    const float screen_v = (screen_height > 0) ? (clamped_y / static_cast<float>(screen_height)) : 0.0f;
+    float normalized_x = screen_u;
+    float normalized_y = screen_v;
+
+    switch (displayInfo.orientation) {
+        case 1:  // Rotation 90
+            normalized_x = 1.0f - screen_v;
+            normalized_y = screen_u;
+            break;
+        case 2:  // Rotation 180
+            normalized_x = 1.0f - screen_u;
+            normalized_y = 1.0f - screen_v;
+            break;
+        case 3:  // Rotation 270
+            normalized_x = screen_v;
+            normalized_y = 1.0f - screen_u;
+            break;
+        case 0:  // Rotation 0
+        default:
+            break;
     }
+
+    out_raw_x = static_cast<int>(std::lround(
+        std::clamp(normalized_x, 0.0f, 1.0f) * static_cast<float>(touch_max_x)));
+    out_raw_y = static_cast<int>(std::lround(
+        std::clamp(normalized_y, 0.0f, 1.0f) * static_cast<float>(touch_max_y)));
 
     out_raw_x = std::clamp(out_raw_x, 0, touch_max_x);
     out_raw_y = std::clamp(out_raw_y, 0, touch_max_y);
@@ -141,7 +242,9 @@ void refresh_touch_device_range() {
 
     struct dirent* ent;
     char path[256];
-    int fd = -1;
+    int best_score = -1;
+    int best_max_x = 0;
+    int best_max_y = 0;
 
     while ((ent = readdir(dir))) {
         if (strncmp(ent->d_name, "event", 5) != 0)
@@ -151,49 +254,22 @@ void refresh_touch_device_range() {
         int tmp_fd = open(path, O_RDONLY | O_NONBLOCK);
         if (tmp_fd < 0) continue;
 
-        unsigned long evbit[EV_MAX/sizeof(long)+1];
-        memset(evbit, 0, sizeof(evbit));
-        ioctl(tmp_fd, EVIOCGBIT(0, sizeof(evbit)), evbit);
-
-        bool has_abs = evbit[EV_ABS / (8*sizeof(long))] & (1UL << (EV_ABS % (8*sizeof(long))));
-        bool has_key = evbit[EV_KEY / (8*sizeof(long))] & (1UL << (EV_KEY % (8*sizeof(long))));
-
-        if (has_abs && has_key) {
-            fd = tmp_fd;
-
-            // 重新获取触摸设备的最大坐标范围
-            input_absinfo abs_x, abs_y;
-            if (ioctl(fd, EVIOCGABS(ABS_X), &abs_x) == 0) {
-                touch_max_x = abs_x.maximum;
-            }
-            if (ioctl(fd, EVIOCGABS(ABS_Y), &abs_y) == 0) {
-                touch_max_y = abs_y.maximum;
-            }
-
-            if (touch_max_x <= 0) {
-                input_absinfo abs_mt_x;
-                if (ioctl(fd, EVIOCGABS(ABS_MT_POSITION_X), &abs_mt_x) == 0) {
-                    touch_max_x = abs_mt_x.maximum;
-                }
-            }
-            if (touch_max_y <= 0) {
-                input_absinfo abs_mt_y;
-                if (ioctl(fd, EVIOCGABS(ABS_MT_POSITION_Y), &abs_mt_y) == 0) {
-                    touch_max_y = abs_mt_y.maximum;
-                }
-            }
-
-            LOGI("Refreshed touch device range after rotation: %d x %d",
-                touch_max_x, touch_max_y);
-
-            close(fd);
-            break;
+        const TouchDeviceProbeResult probe = ProbeTouchDeviceCapabilities(tmp_fd);
+        if (probe.valid && probe.score > best_score) {
+            best_score = probe.score;
+            best_max_x = probe.max_x;
+            best_max_y = probe.max_y;
         }
 
         close(tmp_fd);
     }
 
     closedir(dir);
+    if (best_score >= 0) {
+        touch_max_x = best_max_x;
+        touch_max_y = best_max_y;
+        LOGI("Refreshed touch device range after rotation: %d x %d", touch_max_x, touch_max_y);
+    }
     need_refresh_touch_range = false;
 }
 
@@ -207,6 +283,7 @@ int find_touch_device() {
     struct dirent* ent;
     char path[256];
     int fd = -1;
+    int best_score = -1;
 
     while ((ent = readdir(dir))) {
         if (strncmp(ent->d_name, "event", 5) != 0)
@@ -220,59 +297,37 @@ int find_touch_device() {
         char name[256] = "unknown";
         ioctl(tmp_fd, EVIOCGNAME(sizeof(name)), name);
 
-        unsigned long evbit[EV_MAX/sizeof(long)+1];
-        memset(evbit, 0, sizeof(evbit));
-        ioctl(tmp_fd, EVIOCGBIT(0, sizeof(evbit)), evbit);
-
-        // 必须支持 EV_ABS 和 EV_KEY
-        bool has_abs = evbit[EV_ABS / (8*sizeof(long))] & (1UL << (EV_ABS % (8*sizeof(long))));
-        bool has_key = evbit[EV_KEY / (8*sizeof(long))] & (1UL << (EV_KEY % (8*sizeof(long))));
-
-        if (has_abs && has_key) {
-            LOGI("Found touch device: %s (%s)", path, name);
-            fd = tmp_fd;
-
-            // 如果触摸设备范围未初始化，则获取
-            if (touch_max_x <= 0 || touch_max_y <= 0) {
-                // 获取触摸设备的最大坐标范围
-                // 优先使用单点触控 ABS_X/ABS_Y，如果没有则使用多点触控 ABS_MT_POSITION_X/Y
-                input_absinfo abs_x, abs_y;
-                if (ioctl(fd, EVIOCGABS(ABS_X), &abs_x) == 0) {
-                    touch_max_x = abs_x.maximum;
-                }
-                if (ioctl(fd, EVIOCGABS(ABS_Y), &abs_y) == 0) {
-                    touch_max_y = abs_y.maximum;
-                }
-
-                // 如果单点触控没有获取到，使用多点触控
-                if (touch_max_x <= 0) {
-                    input_absinfo abs_mt_x;
-                    if (ioctl(fd, EVIOCGABS(ABS_MT_POSITION_X), &abs_mt_x) == 0) {
-                        touch_max_x = abs_mt_x.maximum;
-                    }
-                }
-                if (touch_max_y <= 0) {
-                    input_absinfo abs_mt_y;
-                    if (ioctl(fd, EVIOCGABS(ABS_MT_POSITION_Y), &abs_mt_y) == 0) {
-                        touch_max_y = abs_mt_y.maximum;
-                    }
-                }
-                LOGI("Touch device range: %d x %d", touch_max_x, touch_max_y);
-            }
-
-            break;
+        const TouchDeviceProbeResult probe = ProbeTouchDeviceCapabilities(tmp_fd);
+        if (!probe.valid) {
+            close(tmp_fd);
+            continue;
         }
 
-        close(tmp_fd);
+        if (probe.score > best_score) {
+            if (fd >= 0) close(fd);
+            fd = tmp_fd;
+            best_score = probe.score;
+            touch_max_x = probe.max_x;
+            touch_max_y = probe.max_y;
+            LOGI("Found touch device candidate: %s (%s), score=%d, range=%d x %d",
+                 path, name, probe.score, touch_max_x, touch_max_y);
+        } else {
+            close(tmp_fd);
+        }
     }
 
     closedir(dir);
+    if (fd >= 0) {
+        LOGI("Using touch device range: %d x %d", touch_max_x, touch_max_y);
+    }
     return fd;
 }
 
 void process_input_event(int fd) {
     static int x = 0, y = 0;
     static bool pressed = false;
+
+    if (fd < 0) return;
 
     // 使用 poll() 检查是否有数据可读，避免 busy-wait
     struct pollfd pfd;
@@ -343,7 +398,7 @@ void process_input_event(int fd) {
                 }
                 g_primary_touch_slot = 0;
             }
-        } else if (ev.type == EV_SYN) {
+        } else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
             ImGuiIO& io = ImGui::GetIO();
             RebuildActiveTouchesFromSlots();
 

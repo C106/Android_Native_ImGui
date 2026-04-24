@@ -18,6 +18,7 @@ enum class MenuSettingKind {
     Int,
     Float,
     Choice,
+    MultiBoolChoice,
     Button,
     Text,
 };
@@ -27,9 +28,21 @@ enum class MenuShortcutMode {
     Toggle = 1,
 };
 
+enum class MenuRenderMode {
+    Normal,
+    DebugOnly,
+};
+
 struct MenuChoiceOption {
     std::string label;
     int value = 0;
+};
+
+struct MenuMultiBoolOption {
+    std::string key;
+    std::string label;
+    bool* value = nullptr;
+    bool default_value = false;
 };
 
 struct MenuConfigResult {
@@ -48,6 +61,7 @@ public:
     MenuSettingSpec& VisibleIf(std::function<bool()> predicate);
     MenuSettingSpec& OnChange(std::function<void()> callback);
     MenuSettingSpec& ShortcutSupported(bool value);
+    MenuSettingSpec& DebugOnly(bool value = true);
 
 private:
     friend class MenuSectionSpec;
@@ -62,6 +76,7 @@ private:
     std::string label_;
     std::string tooltip_;
     bool persisted_ = true;
+    bool debug_only_ = false;
     std::function<bool()> visible_if_;
     std::function<void()> on_change_;
 
@@ -88,6 +103,7 @@ private:
     float float_max_ = 0.0f;
     std::string format_ = "%d";
     std::vector<MenuChoiceOption> choices_;
+    std::vector<MenuMultiBoolOption> multi_bool_choices_;
     std::function<void()> button_action_;
     std::function<std::string()> text_provider_;
 
@@ -107,6 +123,8 @@ public:
                               float min_value, float max_value, const char* format = "%.2f");
     MenuSettingSpec& AddChoice(const std::string& key, const std::string& label, int* value,
                                std::vector<MenuChoiceOption> choices);
+    MenuSettingSpec& AddMultiBoolChoice(const std::string& key, const std::string& label,
+                                        std::vector<MenuMultiBoolOption> options);
     MenuSettingSpec& AddButton(const std::string& key, const std::string& label,
                                std::function<void()> action);
     MenuSettingSpec& AddText(const std::string& key, const std::string& label,
@@ -114,6 +132,7 @@ public:
 
     MenuSectionSpec& VisibleIf(std::function<bool()> predicate);
     MenuSectionSpec& FooterDraw(std::function<void()> callback);
+    MenuSectionSpec& DebugOnly(bool value = true);
 
 private:
     friend class MenuPageSpec;
@@ -124,6 +143,7 @@ private:
     std::string id_;
     std::string title_;
     MenuColumn column_ = MenuColumn::Left;
+    bool debug_only_ = false;
     std::vector<MenuSettingSpec> settings_;
     std::function<bool()> visible_if_;
     std::function<void()> footer_draw_;
@@ -150,7 +170,7 @@ public:
     void Reset();
     MenuPageSpec& AddPage(const std::string& id, const std::string& title);
     void RenderShortcutWidgets();
-    void RenderPage(const std::string& id);
+    void RenderPage(const std::string& id, MenuRenderMode mode = MenuRenderMode::Normal);
 
     void SetDefaultConfigPath(std::filesystem::path path);
     const std::filesystem::path& GetDefaultConfigPath() const;

@@ -293,11 +293,17 @@ namespace android
                         __android_log_print(ANDROID_LOG_INFO, "ImGui", "[+] Loaded Android 13+ symbol: SurfaceComposerClient::CreateSurface (gui::LayerMetadata)");
                     }
                 }
-                ResolveMethod(SurfaceComposerClient, GetInternalDisplayToken, libgui, "_ZN7android21SurfaceComposerClient23getInternalDisplayTokenEv");
                 ResolveMethod(SurfaceComposerClient, GetDisplayState, libgui, "_ZN7android21SurfaceComposerClient15getDisplayStateERKNS_2spINS_7IBinderEEEPNS_2ui12DisplayStateE");
-                ResolveMethod(SurfaceComposerClient, GetDisplayInfo, libgui, "_ZN7android21SurfaceComposerClient14getDisplayInfoERKNS_2spINS_7IBinderEEEPNS_11DisplayInfoE");
-                ResolveMethod(SurfaceComposerClient, GetPhysicalDisplayIds, libgui, "_ZN7android21SurfaceComposerClient21getPhysicalDisplayIdsEv");
-                ResolveMethod(SurfaceComposerClient, GetPhysicalDisplayToken, libgui, "_ZN7android21SurfaceComposerClient23getPhysicalDisplayTokenENS_17PhysicalDisplayIdE");
+                if (11 > systemVersion) {
+                    ResolveMethod(SurfaceComposerClient, GetDisplayInfo, libgui, "_ZN7android21SurfaceComposerClient14getDisplayInfoERKNS_2spINS_7IBinderEEEPNS_11DisplayInfoE");
+                }
+                if (10 <= systemVersion) {
+                    ResolveMethod(SurfaceComposerClient, GetPhysicalDisplayIds, libgui, "_ZN7android21SurfaceComposerClient21getPhysicalDisplayIdsEv");
+                    ResolveMethod(SurfaceComposerClient, GetPhysicalDisplayToken, libgui, "_ZN7android21SurfaceComposerClient23getPhysicalDisplayTokenENS_17PhysicalDisplayIdE");
+                }
+                if (14 > systemVersion) {
+                    ResolveMethod(SurfaceComposerClient, GetInternalDisplayToken, libgui, "_ZN7android21SurfaceComposerClient23getInternalDisplayTokenEv");
+                }
 
                 ResolveMethod(SurfaceComposerClient__Transaction, Constructor, libgui, "_ZN7android21SurfaceComposerClient11TransactionC2Ev");
                 ResolveMethod(SurfaceComposerClient__Transaction, SetLayer, libgui, "_ZN7android21SurfaceComposerClient11Transaction8setLayerERKNS_2spINS_14SurfaceControlEEEi");
@@ -416,8 +422,6 @@ namespace android
                 if (nullptr == data || nullptr == surface)
                     return;
 
-                void *surfaceRef = reinterpret_cast<Surface *>(reinterpret_cast<size_t>(surface) - sizeof(std::max_align_t) / 2);
-
                 // 清理镜像层
                 if (mirrorData != nullptr) {
                     // mirrorData is retained with itself as the strong-ref id to avoid
@@ -426,7 +430,10 @@ namespace android
                     mirrorData = nullptr;
                 }
 
-                Functionals::GetInstance().RefBase__DecStrong(surfaceRef, surfaceRef);
+                // The ANativeWindow* returned from GetSurface() is released by the
+                // caller via ANativeWindow_release(). Dropping the underlying
+                // Surface ref here double-releases it and can crash during rotation
+                // teardown.
                 DisConnect();
                 Functionals::GetInstance().RefBase__DecStrong(data, data);
             }
@@ -815,39 +822,40 @@ namespace android
             {
                 StrongPointer<void> defaultDisplay;
 
-                if (9 >= Functionals::GetInstance().systemVersion)
-                    defaultDisplay = Functionals::GetInstance().SurfaceComposerClient__GetBuiltInDisplay(ui::DisplayType::DisplayIdMain);
-                else
-                {
-                    if (14 > Functionals::GetInstance().systemVersion)
-                        defaultDisplay = Functionals::GetInstance().SurfaceComposerClient__GetInternalDisplayToken();
-                    else
-                    {
-                        auto displayIds = Functionals::GetInstance().SurfaceComposerClient__GetPhysicalDisplayIds();
-                        if (displayIds.empty())
-                            return false;
-
+                if (Functionals::GetInstance().SurfaceComposerClient__GetPhysicalDisplayIds &&
+                    Functionals::GetInstance().SurfaceComposerClient__GetPhysicalDisplayToken) {
+                    auto displayIds = Functionals::GetInstance().SurfaceComposerClient__GetPhysicalDisplayIds();
+                    if (!displayIds.empty())
                         defaultDisplay = Functionals::GetInstance().SurfaceComposerClient__GetPhysicalDisplayToken(displayIds[0]);
-                    }
                 }
+
+                if (nullptr == defaultDisplay.get() &&
+                    Functionals::GetInstance().SurfaceComposerClient__GetInternalDisplayToken)
+                    defaultDisplay = Functionals::GetInstance().SurfaceComposerClient__GetInternalDisplayToken();
+
+                if (nullptr == defaultDisplay.get() &&
+                    Functionals::GetInstance().SurfaceComposerClient__GetBuiltInDisplay)
+                    defaultDisplay = Functionals::GetInstance().SurfaceComposerClient__GetBuiltInDisplay(ui::DisplayType::DisplayIdMain);
 
                 if (nullptr == defaultDisplay.get())
                     return false;
 
-                if (11 <= Functionals::GetInstance().systemVersion)
+                if (11 <= Functionals::GetInstance().systemVersion &&
+                    Functionals::GetInstance().SurfaceComposerClient__GetDisplayState)
                     return 0 == Functionals::GetInstance().SurfaceComposerClient__GetDisplayState(defaultDisplay, displayInfo);
-                else
-                {
-                    ui::DisplayInfo realDisplayInfo{};
-                    if (0 != Functionals::GetInstance().SurfaceComposerClient__GetDisplayInfo(defaultDisplay, &realDisplayInfo))
-                        return false;
 
-                    displayInfo->layerStackSpaceRect.width = realDisplayInfo.w;
-                    displayInfo->layerStackSpaceRect.height = realDisplayInfo.h;
-                    displayInfo->orientation = static_cast<ui::Rotation>(realDisplayInfo.orientation);
-                    
-                    return true;
-                }
+                if (!Functionals::GetInstance().SurfaceComposerClient__GetDisplayInfo)
+                    return false;
+
+                ui::DisplayInfo realDisplayInfo{};
+                if (0 != Functionals::GetInstance().SurfaceComposerClient__GetDisplayInfo(defaultDisplay, &realDisplayInfo))
+                    return false;
+
+                displayInfo->layerStackSpaceRect.width = realDisplayInfo.w;
+                displayInfo->layerStackSpaceRect.height = realDisplayInfo.h;
+                displayInfo->orientation = static_cast<ui::Rotation>(realDisplayInfo.orientation);
+
+                return true;
             }
         };
 
@@ -1020,8 +1028,17 @@ namespace android
             if (it == m_cachedSurfaceControl.end())
                 return;
 
-            // 重置镜像状态，让监控线程重新处理所有 LayerStack
-            __android_log_print(ANDROID_LOG_INFO, "ImGui", "[*] Resetting mirror state (clearing processed LayerStacks)");
+            // Invalidate process-wide mirror pointers before releasing the backing
+            // SurfaceControl objects. Otherwise later detection can reuse freed
+            // pointers and crash inside mirrorSurface().
+            if (detail::g_originalSurfaceControl == it->second.data) {
+                detail::g_originalSurfaceControl = nullptr;
+            }
+            if (detail::g_mirrorSurfaceControl == it->second.mirrorData) {
+                detail::g_mirrorSurfaceControl = nullptr;
+            }
+
+            __android_log_print(ANDROID_LOG_INFO, "ImGui", "[*] Resetting mirror state (clearing processed LayerStacks and stale SurfaceControls)");
             detail::g_processedLayerStacks.clear();
 
             it->second.DestroySurface(reinterpret_cast<detail::Surface *>(nativeWindow));

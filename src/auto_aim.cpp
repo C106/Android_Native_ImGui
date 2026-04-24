@@ -22,8 +22,8 @@ constexpr float kMaxGyroStrength = 20.0f;
 constexpr float kAutoAimBoost = 2.6f;
 constexpr float kMinGyroDrive = 0.55f;
 constexpr float kDerivativeClamp = 4.0f;
-constexpr float kHorizontalNearCenterThreshold = 0.02f;
-constexpr float kVerticalNearCenterThreshold = 0.02f;
+constexpr float kHorizontalNearCenterThreshold = 0.012f;
+constexpr float kVerticalNearCenterThreshold = 0.012f;
 constexpr float kHorizontalNearCenterMinScale = 0.50f;
 constexpr float kVerticalNearCenterMinScale = 0.50f;
 
@@ -31,6 +31,14 @@ constexpr float kVerticalNearCenterMinScale = 0.50f;
 constexpr float kDefaultBulletSpeed = 80000.0f;  // 默认子弹速度 cm/s (800 m/s)
 constexpr float kMaxLeadTime = 1.5f;             // 最大预判时间（秒）
 constexpr float kFeedforwardGain = 0.5f;         // 前馈增益（归一化屏幕速率 → 陀螺仪输出）
+
+static float ComputeAngularFovScale(float cameraFOV) {
+    const float clampedFOV = std::clamp(cameraFOV, 1.0f, 179.0f);
+    const float halfAngle = clampedFOV * 0.5f * static_cast<float>(M_PI) / 180.0f;
+    const float defaultHalfAngle = kDefaultFOV * 0.5f * static_cast<float>(M_PI) / 180.0f;
+    const float scale = std::tan(halfAngle) / std::tan(defaultHalfAngle);
+    return std::clamp(scale, 0.02f, 2.5f);
+}
 
 static bool HasGyroOutputChannel() {
     if (Gyro_Controller && Gyro_Controller->bGyroConnect()) return true;
@@ -58,6 +66,21 @@ static void SendGyroOutput(float x, float y) {
     }
     if (GetDriverManager().getType() == DRIVER_PARADISE) {
         GetDriverManager().gyro_update(x, y);
+    }
+}
+
+static Vec2 MapScreenAdjustToGyroOutput(const Vec2& screenAdjust, int orientation) {
+    Vec2 gyro(-screenAdjust.x, screenAdjust.y);
+    switch (orientation) {
+        case 1:  // Rotation 90
+            return Vec2(gyro.x, gyro.y);
+        case 2:  // Rotation 180
+            return Vec2(-gyro.x, -gyro.y);
+        case 3:  // Rotation 270
+            return Vec2(-gyro.x, -gyro.y);
+        case 0:  // Rotation 0
+        default:
+            return gyro;
     }
 }
 
@@ -331,37 +354,51 @@ static float ReadCameraFOV() {
     return fov;
 }
 
-// 根据当前 FOV 判断倍镜类型，选择对应灵敏度
-static float SelectGyroSensitivityScale(const UserGyroSensitivity& sens, bool isFiring, bool isADS, float cameraFOV) {
-    // 根据 FOV 范围判断倍镜等级
-    // 典型 FOV 值: 无镜~80, 红点~55, 2x~40, 3x~27, 4x~20, 6x~14, 8x~10
-    float selected;
-    if (!isADS || cameraFOV >= 70.0f) {
-        // 腰射 / 无镜
-        if (isFiring) {
-            selected = sens.fpViewSwitch ? sens.firingFP : sens.firingHipfire;
-        } else {
-            selected = sens.fpViewSwitch ? sens.hipfireFP : sens.hipfire;
-        }
-    } else if (cameraFOV >= 45.0f) {
-        // 红点 / 全息
-        selected = isFiring ? sens.firingRedDot : sens.redDot;
-    } else if (cameraFOV >= 33.0f) {
-        // 2x
-        selected = isFiring ? sens.firing2x : sens.scope2x;
-    } else if (cameraFOV >= 23.0f) {
-        // 3x
-        selected = isFiring ? sens.firing3x : sens.scope3x;
-    } else if (cameraFOV >= 16.0f) {
-        // 4x
-        selected = isFiring ? sens.firing4x : sens.scope4x;
-    } else if (cameraFOV >= 11.0f) {
-        // 6x
-        selected = isFiring ? sens.firing6x : sens.scope6x;
-    } else {
-        // 8x
-        selected = isFiring ? sens.firing8x : sens.scope8x;
+static float SelectHipfireGyroSensitivity(const UserGyroSensitivity& sens, bool isFiring) {
+    if (isFiring) {
+        return sens.fpViewSwitch ? sens.firingFP : sens.firingHipfire;
     }
+    return sens.fpViewSwitch ? sens.hipfireFP : sens.hipfire;
+}
+
+static float SelectScopedGyroSensitivity(const UserGyroSensitivity& sens, bool isFiring, float cameraFOV) {
+    struct ScopeSensitivityEntry {
+        float fov;
+        float normalSensitivity;
+        float firingSensitivity;
+    };
+
+    // ADS 状态下按当前 FOV 与各档位基准 FOV 的最近距离匹配。
+    // 已知基准: NoneSniper 70, 2x 55, 3x 44.4, 4x 26.7, 6x 20~21, 8x 13.3/11。
+    const ScopeSensitivityEntry entries[] = {
+        {70.0f, sens.hipfire, sens.firingHipfire},
+        {55.0f, sens.scope2x, sens.firing2x},
+        {44.4f, sens.scope3x, sens.firing3x},
+        {26.7f, sens.scope4x, sens.firing4x},
+        {20.5f, sens.scope6x, sens.firing6x},
+        {13.3f, sens.scope8x, sens.firing8x},
+        {11.0f, sens.scope8x, sens.firing8x},
+    };
+
+    const size_t entryCount = sizeof(entries) / sizeof(entries[0]);
+    const ScopeSensitivityEntry* bestEntry = &entries[0];
+    float bestDelta = std::fabs(cameraFOV - entries[0].fov);
+    for (size_t i = 1; i < entryCount; ++i) {
+        const float delta = std::fabs(cameraFOV - entries[i].fov);
+        if (delta < bestDelta) {
+            bestDelta = delta;
+            bestEntry = &entries[i];
+        }
+    }
+
+    return isFiring ? bestEntry->firingSensitivity : bestEntry->normalSensitivity;
+}
+
+// 根据 ADS 状态 + 当前 FOV 判断档位，选择对应灵敏度
+static float SelectGyroSensitivityScale(const UserGyroSensitivity& sens, bool isFiring, bool isADS, float cameraFOV) {
+    float selected = isADS
+        ? SelectScopedGyroSensitivity(sens, isFiring, cameraFOV)
+        : SelectHipfireGyroSensitivity(sens, isFiring);
 
     if (selected <= 0.0f) return 1.0f;
     return std::clamp(selected, 0.1f, 4.0f);
@@ -429,6 +466,21 @@ static uint64_t ReadCurrentShootWeaponEntityComp() {
     return GetDriverManager().read<uint64_t>(weapon + offset.ShootWeaponEntityComp);
 }
 
+static const char* GetSightTypeLabel(uint8_t sightType) {
+    switch (sightType) {
+        case 0: return "None";
+        case 1: return "Iron";
+        case 2: return "Holo/RedDot";
+        case 3: return "2x";
+        case 4: return "3x";
+        case 5: return "4x";
+        case 6: return "6x";
+        case 7: return "8x";
+        case 8: return "Canted";
+        default: return "Unknown";
+    }
+}
+
 static FireStateDebugInfo ReadCurrentFireStateDebugInfo() {
     FireStateDebugInfo info;
     info.localActor = address.LocalPlayerActor;
@@ -456,14 +508,25 @@ static FireStateDebugInfo ReadCurrentFireStateDebugInfo() {
 
 static RecoilDebugInfo ReadCurrentRecoilDebugInfo() {
     RecoilDebugInfo info;
-    const uint64_t entityComp = ReadCurrentShootWeaponEntityComp();
+    if (address.LocalPlayerActor == 0) return info;
+
+    const uint64_t weapon =
+        GetDriverManager().read<uint64_t>(address.LocalPlayerActor + offset.CurrentUsingWeaponSafety);
+    if (weapon == 0) return info;
+
+    const uint64_t entityComp = GetDriverManager().read<uint64_t>(weapon + offset.ShootWeaponEntityComp);
     if (entityComp == 0) return info;
 
     LocalRecoilInfo recoil{};
     GetDriverManager().read(entityComp + offset.RecoilInfo, &recoil, sizeof(recoil));
 
+    info.weapon = weapon;
     info.entityComp = entityComp;
     info.valid = true;
+    info.sightType = GetDriverManager().read<uint8_t>(entityComp + offset.EntitySightType);
+    info.angledSightID = GetDriverManager().read<int32_t>(weapon + offset.WeaponAngledSightID);
+    info.curSightTypeID = GetDriverManager().read<int32_t>(weapon + offset.WeaponCurSightTypeID);
+    info.curScopeID = GetDriverManager().read<int32_t>(weapon + offset.WeaponCurScopeID);
     info.verticalRecoilMin = recoil.verticalRecoilMin;
     info.verticalRecoilMax = recoil.verticalRecoilMax;
     info.verticalRecoilVariation = recoil.verticalRecoilVariation;
@@ -665,10 +728,10 @@ AutoAimController::AutoAimController() {
     config.maxDistance = 200.0f;
     config.fovLimit = 30.0f;
     config.updateRate = 120.0f;
-    config.KpX = 2.00f;
-    config.KdX = 0.50f;
-    config.KpY = 1.50f;
-    config.KdY = 0.50f;
+    config.KpX = 0.40f;
+    config.KdX = 0.02f;
+    config.KpY = 0.21f;
+    config.KdY = 0.01f;
     config.outputScaleX = 1.00f;
     config.outputScaleY = 1.00f;
     config.humanizeNoise = false;
@@ -994,7 +1057,7 @@ void AutoAimController::UpdateTriggerBot(const Vec2& rawScreenCenter) {
 }
 
 Vec2 AutoAimController::ComputePDOutput(const Vec2& aimPos, const Vec2& screenCenter,
-                                         const Vec2& feedforward, float deltaTime, float fovRatio) {
+                                         const Vec2& feedforward, float deltaTime, float fovScale) {
     Vec2 screenHalf(std::max(screenCenter.x, 1.0f), std::max(screenCenter.y, 1.0f));
 
     Vec2 error = aimPos - screenCenter;
@@ -1039,22 +1102,33 @@ Vec2 AutoAimController::ComputePDOutput(const Vec2& aimPos, const Vec2& screenCe
     // 近中心缩放只作用于 PD，防止近中心时位置修正过大产生抖动
     // 但自身移动时禁用缩放，让 PD 全力跟随
     if (!isLocalMoving) {
+        // 开镜后同样的角误差会占据更大的屏幕比例。
+        // 若仍使用固定屏幕阈值，减速区会在 ADS 时显得过大，导致追不上预判点。
+        const float nearCenterThresholdScale = std::clamp(fovScale, 0.35f, 1.0f);
+        const float nearCenterAssist = (1.0f - nearCenterThresholdScale) / (1.0f - 0.35f);
+        const float horizontalThreshold = kHorizontalNearCenterThreshold * nearCenterThresholdScale;
+        const float verticalThreshold = kVerticalNearCenterThreshold * nearCenterThresholdScale;
+        const float horizontalMinScale =
+            std::clamp(kHorizontalNearCenterMinScale + nearCenterAssist * 0.18f,
+                       kHorizontalNearCenterMinScale, 0.68f);
+        const float verticalMinScale =
+            std::clamp(kVerticalNearCenterMinScale + nearCenterAssist * 0.18f,
+                       kVerticalNearCenterMinScale, 0.68f);
+
         pd.x = ScaleAxisNearCenter(pd.x, std::fabs(normalizedError.x),
-            kHorizontalNearCenterThreshold, kHorizontalNearCenterMinScale);
+            horizontalThreshold, horizontalMinScale);
         pd.y = ScaleAxisNearCenter(pd.y, std::fabs(normalizedError.y),
-            kVerticalNearCenterThreshold, kVerticalNearCenterMinScale);
+            verticalThreshold, verticalMinScale);
     }
 
-    // FOV 补偿仅作用于 PD：高倍镜下 PD 环路增益 ∝ 1/tan²(FOV/2)，
-    // 乘 fovRatio 使各倍镜下位置修正速率一致，防止高倍镜震荡
-    pd.x *= fovRatio;
-    pd.y *= fovRatio;
+    // 小 FOV 下同样的角速度会投影成更大的屏幕速率，
+    // PD 和前馈都需要按角度比例缩回去，否则会明显冲过预判点。
+    pd.x *= fovScale;
+    pd.y *= fovScale;
 
-    // 前馈不受 FOV 衰减：前馈表示的归一化屏幕速率在高倍镜下自然放大，
-    // 与陀螺仪在高倍镜下的放大效果正好匹配，无需额外补偿
     Vec2 output;
-    output.x = feedforward.x * kFeedforwardGain + pd.x;
-    output.y = feedforward.y * kFeedforwardGain + pd.y;
+    output.x = feedforward.x * kFeedforwardGain * fovScale + pd.x;
+    output.y = feedforward.y * kFeedforwardGain * fovScale + pd.y;
 
     // 更新误差历史
     targetState.lastError = Vec2(normalizedError.x * screenHalf.x, normalizedError.y * screenHalf.y);
@@ -1153,7 +1227,7 @@ void AutoAimController::DrawDebugVisuals(const Vec2& targetPos, const Vec2& scre
         ImGui::Text("Holt Alpha/Beta: %.2f / %.2f", config.holtAlpha, config.holtBeta);
         ImGui::Separator();
         ImGui::Text("Camera FOV: %.1f", targetState.debugCameraFOV);
-        ImGui::Text("FOV Ratio: %.2f", targetState.debugFovScale);
+        ImGui::Text("FOV Scale: %.2f", targetState.debugFovScale);
         ImGui::Text("Gyro Sens: %.2f", targetState.debugGyroScale);
         ImGui::Text("Sens Compensate: %.2f", targetState.debugSensCompensate);
         ImGui::Text("Humanize Noise: %.2f, %.2f", targetState.debugNoise.x, targetState.debugNoise.y);
@@ -1186,9 +1260,16 @@ void AutoAimController::DrawRecoilSpeedDebugWindow() {
         const RecoilDebugInfo& recoil = targetState.debugRecoil;
         ImGui::Text("Recoil Speed");
         ImGui::Separator();
+        ImGui::Text("Weapon: 0x%llX", (unsigned long long)recoil.weapon);
         ImGui::Text("Weapon Entity: 0x%llX", (unsigned long long)recoil.entityComp);
         ImGui::Text("Valid: %s", recoil.valid ? "true" : "false");
         if (recoil.valid) {
+            ImGui::Separator();
+            ImGui::Text("Sight: %s", GetSightTypeLabel(recoil.sightType));
+            ImGui::Text("SightType / CurSightTypeID: %u / %d",
+                static_cast<unsigned>(recoil.sightType), recoil.curSightTypeID);
+            ImGui::Text("CurScopeID / AngledSightID: %d / %d",
+                recoil.curScopeID, recoil.angledSightID);
             ImGui::Separator();
             ImGui::Text("Base Recoil V/H: %.3f / %.3f",
                 recoil.recoilSpeedVertical, recoil.recoilSpeedHorizontal);
@@ -1316,6 +1397,7 @@ void AutoAimController::Update(float deltaTime) {
     }
 
     const float fovRatio = cameraFOV / kDefaultFOV;
+    const float fovScale = ComputeAngularFovScale(cameraFOV);
     const Vec2 recoilCenterOffset = UpdateRecoilCenterOffset(
         config, targetState, targetState.debugRecoil, isFiring, deltaTime, fovRatio, SH);
     Vec2 screenCenter = rawScreenCenter + recoilCenterOffset;
@@ -1406,7 +1488,7 @@ void AutoAimController::Update(float deltaTime) {
         targetState.debugTargetVel = prediction.targetVelocity;
         targetState.debugHoltPredicted = aimPos;
         targetState.debugCameraFOV = cameraFOV;
-        targetState.debugFovScale = fovRatio;
+        targetState.debugFovScale = fovScale;
 
         // l) 前馈 + PD 控制器
         Vec2 gyroAdjust(0, 0);
@@ -1421,12 +1503,12 @@ void AutoAimController::Update(float deltaTime) {
                 targetState.magnetEngaged = true;
             }
             if (targetState.magnetEngaged) {
-                gyroAdjust = ComputePDOutput(aimPos, screenCenter, feedforward, deltaTime, fovRatio);
+                gyroAdjust = ComputePDOutput(aimPos, screenCenter, feedforward, deltaTime, fovScale);
                 gyroAdjust *= std::clamp(config.magnetStrength, 0.0f, 1.0f);
             }
         } else {
             targetState.magnetEngaged = false;
-            gyroAdjust = ComputePDOutput(aimPos, screenCenter, feedforward, deltaTime, fovRatio);
+            gyroAdjust = ComputePDOutput(aimPos, screenCenter, feedforward, deltaTime, fovScale);
         }
 
         // 灵敏度补偿：灵敏度越高，同样陀螺仪值转角越大，需要缩小输出
@@ -1445,8 +1527,9 @@ void AutoAimController::Update(float deltaTime) {
         // 存储 pre-negation 值用于下一帧参考
         targetState.lastOutput = finalAdjust;
 
-        finalAdjust.x = -finalAdjust.x;
-        SendGyroOutput(finalAdjust.x, finalAdjust.y);
+        const int displayOrientation = displayOrientation_.load(std::memory_order_relaxed);
+        const Vec2 gyroOutput = MapScreenAdjustToGyroOutput(finalAdjust, displayOrientation);
+        SendGyroOutput(gyroOutput.x, gyroOutput.y);
 
         targetState.actorAddr = targetActor;
         targetState.boneID = targetBone;

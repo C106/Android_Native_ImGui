@@ -17,6 +17,7 @@ struct DriverSharedState {
     std::atomic<int> desiredType{DRIVER_RT_HOOK};
     std::atomic<pid_t> targetPid{0};
     std::atomic<uint64_t> generation{0};
+    std::atomic<bool> lockEnabled{true};
 };
 
 inline DriverSharedState& GetDriverSharedState() {
@@ -32,11 +33,10 @@ inline c_driver& GetGlobalRtHook() {
 
 inline paradise_driver& GetGlobalParadiseHook() {
     static paradise_driver instance;
-    static std::mutex initMutex;
     return instance;
 }
 
-inline std::mutex& GetParadiseMutex() {
+inline std::mutex& GetDriverOperationMutex() {
     static std::mutex mutex;
     return mutex;
 }
@@ -46,15 +46,22 @@ class DriverManager {
     uint64_t appliedGeneration_;
     pid_t initializedPid_;
 
+    std::unique_lock<std::mutex> lockIfEnabled() const {
+        if (!GetDriverSharedState().lockEnabled.load(std::memory_order_acquire)) {
+            return std::unique_lock<std::mutex>();
+        }
+        return std::unique_lock<std::mutex>(GetDriverOperationMutex());
+    }
+
     void initializeCurrentDriver(pid_t pid) {
         if (pid <= 0 || initializedPid_ == pid) {
             return;
         }
 
+        auto lock = lockIfEnabled();
         if (currentType_ == DRIVER_RT_HOOK) {
             GetGlobalRtHook().initialize(pid);
         } else {
-            std::lock_guard<std::mutex> lock(GetParadiseMutex());
             GetGlobalParadiseHook().initialize(pid);
         }
         initializedPid_ = pid;
@@ -137,8 +144,8 @@ public:
         ensureSynchronized();
 
         pid_t pid = 0;
+        auto lock = lockIfEnabled();
         if (currentType_ == DRIVER_PARADISE) {
-            std::lock_guard<std::mutex> lock(GetParadiseMutex());
             pid = GetGlobalParadiseHook().get_pid(name);
             if (pid > 0) {
                 GetGlobalParadiseHook().initialize(pid);
@@ -170,10 +177,10 @@ public:
         if (addr == 0 || addr < 0x10000 || addr >= 0x800000000000ULL || buf == nullptr || size == 0) {
             return false;
         }
+        auto lock = lockIfEnabled();
         if (currentType_ == DRIVER_RT_HOOK) {
             return GetGlobalRtHook().read(addr, buf, size);
         }
-        std::lock_guard<std::mutex> lock(GetParadiseMutex());
         return GetGlobalParadiseHook().read(addr, buf, size);
     }
 
@@ -192,10 +199,10 @@ public:
         if (addr == 0 || addr < 0x10000 || addr >= 0x800000000000ULL || buf == nullptr || size == 0) {
             return false;
         }
+        auto lock = lockIfEnabled();
         if (currentType_ == DRIVER_RT_HOOK) {
             return GetGlobalRtHook().write(addr, buf, size);
         }
-        std::lock_guard<std::mutex> lock(GetParadiseMutex());
         return GetGlobalParadiseHook().write(addr, buf, size);
     }
 
@@ -205,52 +212,52 @@ public:
 
     uintptr_t get_module_base(const char* name) {
         ensureSynchronized();
+        auto lock = lockIfEnabled();
         if (currentType_ == DRIVER_RT_HOOK) {
             return GetGlobalRtHook().get_module_base(const_cast<char*>(name), 0);
         }
-        std::lock_guard<std::mutex> lock(GetParadiseMutex());
         return GetGlobalParadiseHook().get_module_base(name);
     }
 
     bool gyro_update(float x, float y, uint32_t mask = PARADISE_GYRO_MASK_ALL, bool enable = true) {
         ensureSynchronized();
         if (currentType_ != DRIVER_PARADISE) return false;
-        std::lock_guard<std::mutex> lock(GetParadiseMutex());
+        auto lock = lockIfEnabled();
         return GetGlobalParadiseHook().gyro_update(x, y, mask, enable);
     }
 
     bool touch_init(int* max_x, int* max_y) {
         ensureSynchronized();
         if (currentType_ != DRIVER_PARADISE) return false;
-        std::lock_guard<std::mutex> lock(GetParadiseMutex());
+        auto lock = lockIfEnabled();
         return GetGlobalParadiseHook().touch_init(max_x, max_y);
     }
 
     bool touch_down(int slot, int x, int y) {
         ensureSynchronized();
         if (currentType_ != DRIVER_PARADISE) return false;
-        std::lock_guard<std::mutex> lock(GetParadiseMutex());
+        auto lock = lockIfEnabled();
         return GetGlobalParadiseHook().touch_down(slot, x, y);
     }
 
     bool touch_move(int slot, int x, int y) {
         ensureSynchronized();
         if (currentType_ != DRIVER_PARADISE) return false;
-        std::lock_guard<std::mutex> lock(GetParadiseMutex());
+        auto lock = lockIfEnabled();
         return GetGlobalParadiseHook().touch_move(slot, x, y);
     }
 
     bool touch_up(int slot) {
         ensureSynchronized();
         if (currentType_ != DRIVER_PARADISE) return false;
-        std::lock_guard<std::mutex> lock(GetParadiseMutex());
+        auto lock = lockIfEnabled();
         return GetGlobalParadiseHook().touch_up(slot);
     }
 
     bool touch_destroy() {
         ensureSynchronized();
         if (currentType_ != DRIVER_PARADISE) return false;
-        std::lock_guard<std::mutex> lock(GetParadiseMutex());
+        auto lock = lockIfEnabled();
         return GetGlobalParadiseHook().touch_destroy();
     }
 
@@ -264,6 +271,7 @@ public:
         if (currentType_ != DRIVER_RT_HOOK) {
             return ENOTSUP;
         }
+        auto lock = lockIfEnabled();
         return GetGlobalRtHook().add_breakpoint(addr, type, len);
     }
 
@@ -272,6 +280,7 @@ public:
         if (currentType_ != DRIVER_RT_HOOK) {
             return false;
         }
+        auto lock = lockIfEnabled();
         return GetGlobalRtHook().remove_breakpoint(addr);
     }
 
@@ -280,7 +289,16 @@ public:
         if (currentType_ != DRIVER_RT_HOOK) {
             return -1;
         }
+        auto lock = lockIfEnabled();
         return GetGlobalRtHook().get_breakpoint_hits(buffer, max_count);
+    }
+
+    bool isLockEnabled() const {
+        return GetDriverSharedState().lockEnabled.load(std::memory_order_acquire);
+    }
+
+    void setLockEnabled(bool enabled) {
+        GetDriverSharedState().lockEnabled.store(enabled, std::memory_order_release);
     }
 };
 
