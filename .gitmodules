@@ -16,3 +16,6 @@
 [submodule "implot3d"]
 	path = implot3d
 	url = https://github.com/brenocq/implot3d.git
+[submodule "ImGuiNotify"]
+	path = ImGuiNotify
+	url = https://github.com/TyomaVader/ImGuiNotify.git
