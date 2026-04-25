@@ -15,6 +15,8 @@
 #include "hook_touch_event.h"
 #include "ImGuiNotify.hpp"
 #include "IconsFontAwesome7.h"
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <thread>
@@ -57,6 +59,8 @@ static bool gShowPhysXDebugWindow = false;
 static bool gShowBulletSpreadDebugWindow = false;
 static int gBulletBreakpointTargetUi = 0;
 static int gMainTabIndex = 2;
+static int gPreviousMainTabIndex = 2;
+static double gMainTabTitleAnimStartTime = -1.0;
 static bool gMenuFrameworkRegistered = false;
 static std::string gConfigStatusMessage;
 static std::string gTouchTestStatusMessage;
@@ -73,6 +77,41 @@ static void DrawExitConfirmOverlay();
 static void DrawDebugOptionsOverlay();
 static void PushMenuWindowStyle();
 static void PopMenuWindowStyle();
+
+static void SyncMenuBlurRegion(bool enabled, const ImVec2& pos = ImVec2(0.0f, 0.0f),
+                               const ImVec2& size = ImVec2(0.0f, 0.0f)) {
+    static bool s_blur_enabled = false;
+    static int s_left = 0;
+    static int s_top = 0;
+    static int s_right = 0;
+    static int s_bottom = 0;
+
+    if (!enabled) {
+        if (s_blur_enabled) {
+            android::ANativeWindowCreator::ClearBlurRegionsForAll();
+            s_blur_enabled = false;
+        }
+        return;
+    }
+
+    const int left = static_cast<int>(std::floor(pos.x));
+    const int top = static_cast<int>(std::floor(pos.y));
+    const int right = static_cast<int>(std::ceil(pos.x + size.x));
+    const int bottom = static_cast<int>(std::ceil(pos.y + size.y));
+
+    if (s_blur_enabled && left == s_left && top == s_top &&
+        right == s_right && bottom == s_bottom) {
+        return;
+    }
+
+    if (android::ANativeWindowCreator::SetBlurRegionForAll(left, top, right, bottom, 36, 1.0f, 15.0f)) {
+        s_blur_enabled = true;
+        s_left = left;
+        s_top = top;
+        s_right = right;
+        s_bottom = bottom;
+    }
+}
 
 static bool DrawIconActionButton(const char* id, const char* icon, const ImVec2& pos, const ImVec2& size,
                                  const ImVec4& fill_color, const ImVec4& border_color,
@@ -163,7 +202,7 @@ static void PushMenuWindowStyle() {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
     ImGui::PushStyleVar(ImGuiStyleVar_TabRounding, 8.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.0f, 8.0f));
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.06f, 0.09f, 0.15f, 0.72f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.06f, 0.09f, 0.15f, 0.62f));
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.12f, 0.20f, 0.38f));
     ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(0.07f, 0.10f, 0.17f, 0.82f));
     ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.10f, 0.16f, 0.26f, 0.56f));
@@ -342,6 +381,10 @@ static bool DrawMainTabButton(const char* id, const char* icon, int tab_index, f
     const bool mouse_clicked = ImGui::IsItemClicked();
     const bool touch_clicked = touch_inside && !s_touch_latched[tab_index];
     if (mouse_clicked || touch_clicked) {
+        if (gMainTabIndex != tab_index) {
+            gPreviousMainTabIndex = gMainTabIndex;
+            gMainTabTitleAnimStartTime = ImGui::GetTime();
+        }
         gMainTabIndex = tab_index;
     }
     s_touch_latched[tab_index] = touch_inside;
@@ -489,12 +532,12 @@ static void DrawExitConfirmOverlay() {
         const ImVec4 buttonFill(0.08f, 0.18f, 0.30f, 0.86f);
         const ImVec4 buttonBorder(0.34f, 0.72f, 1.00f, 0.92f);
 
-        if (DrawDialogActionButton("exit_cancel", ICON_FA_CROSS, "取消",
+        if (DrawDialogActionButton("exit_cancel", ICON_FA_CIRCLE_XMARK, "取消",
                                    ImVec2(buttonStartX, buttonY), buttonSize,
                                    buttonFill, buttonBorder)) {
             gShowExitConfirmDialog = false;
         }
-        if (DrawDialogActionButton("exit_confirm", ICON_FA_CIRCLE_XMARK, "确认退出",
+        if (DrawDialogActionButton("exit_confirm", ICON_FA_CIRCLE_CHECK, "确认退出",
                                    ImVec2(buttonStartX + buttonSize.x + buttonGap, buttonY), buttonSize,
                                    buttonFill, buttonBorder)) {
             gShowExitConfirmDialog = false;
@@ -567,7 +610,7 @@ static void DrawDebugOptionsOverlay() {
             const ImVec2 actionButtonSize(48.0f, 48.0f);
             const ImVec4 actionFill(0.08f, 0.18f, 0.30f, 0.72f);
             const ImVec4 actionBorder(0.34f, 0.72f, 1.00f, 0.90f);
-            if (DrawIconActionButton("debug_options_close", ICON_FA_XMARK,
+            if (DrawIconActionButton("debug_options_close", ICON_FA_CIRCLE_CHECK,
                                      ImVec2(windowSize.x - actionButtonSize.x - 20.0f, 18.0f),
                                      actionButtonSize, actionFill, actionBorder, gBannerIconFont)) {
                 gShowDebugOptionsDialog = false;
@@ -1372,6 +1415,9 @@ void Draw_Menu_Overlay() {
     EnsureMenuFrameworkRegistered();
     MenuRegistry::Instance().RenderShortcutWidgets();
     DrawFloatingMenuBall();
+    if (!IsMenuOpen.load(std::memory_order_relaxed)) {
+        SyncMenuBlurRegion(false);
+    }
 }
 
 void Draw_Menu() {
@@ -1447,6 +1493,8 @@ void Draw_Menu() {
     }
 
     was_mouse_down = original_mouse_down;
+    window_pos = ImGui::GetWindowPos();
+    SyncMenuBlurRegion(true, window_pos, ImVec2(windowWidth, windowHeight));
 
     // Logo
     const ImVec2 logoPos(28.0f, 12.0f);
@@ -1501,33 +1549,48 @@ void Draw_Menu() {
     bool isLandscape = (io.DisplaySize.x > io.DisplaySize.y);
     float tabX = isLandscape ? 236.0f : 242.0f;
     float tabY = isLandscape ? 130.0f : 136.0f;
-    const char* tabLabels[] = {"Camera", "Objects", "Config"};
+    const char* tabLabels[] = {"瞄准", "视觉", "配置"};
     const float tabLabelY = tabY - 96.0f;
     ImGui::SetWindowFontScale(1.45f);
-    ImVec2 currentTabTextSize = ImGui::CalcTextSize(tabLabels[gMainTabIndex]);
-    float currentTabTextX = tabX + ((windowWidth - tabX - 20.0f) - currentTabTextSize.x) * 0.5f - 56.0f;
-    ImVec2 titlePos(currentTabTextX, tabLabelY);
     ImDrawList* drawList = ImGui::GetWindowDrawList();
-    ImVec2 titleScreenPos(window_pos.x + titlePos.x, window_pos.y + titlePos.y);
-    drawList->AddText(
-        ImGui::GetFont(),
-        ImGui::GetFontSize() * 1.45f,
-        ImVec2(titleScreenPos.x + 2.0f, titleScreenPos.y + 3.0f),
-        ImGui::GetColorU32(ImVec4(0.02f, 0.08f, 0.16f, 0.75f)),
-        tabLabels[gMainTabIndex]);
-    drawList->AddText(
-        ImGui::GetFont(),
-        ImGui::GetFontSize() * 1.45f,
-        titleScreenPos,
-        ImGui::GetColorU32(ImVec4(0.90f, 0.97f, 1.00f, 1.00f)),
-        tabLabels[gMainTabIndex]);
-    drawList->AddRectFilledMultiColor(
-        ImVec2(titleScreenPos.x, titleScreenPos.y + currentTabTextSize.y + 8.0f),
-        ImVec2(titleScreenPos.x + currentTabTextSize.x + 18.0f, titleScreenPos.y + currentTabTextSize.y + 12.0f),
-        ImGui::GetColorU32(ImVec4(0.10f, 0.45f, 0.95f, 0.20f)),
-        ImGui::GetColorU32(ImVec4(0.22f, 0.68f, 1.00f, 0.95f)),
-        ImGui::GetColorU32(ImVec4(0.22f, 0.68f, 1.00f, 0.95f)),
-        ImGui::GetColorU32(ImVec4(0.10f, 0.45f, 0.95f, 0.20f)));
+    ImFont* titleFont = ImGui::GetFont();
+    const float titleFontSize = ImGui::GetFontSize() * 1.45f;
+    const double now = ImGui::GetTime();
+    const float animDuration = 0.22f;
+    float animT = 1.0f;
+    if (gMainTabTitleAnimStartTime >= 0.0) {
+        animT = std::clamp(static_cast<float>((now - gMainTabTitleAnimStartTime) / animDuration), 0.0f, 1.0f);
+        if (animT >= 1.0f) {
+            gMainTabTitleAnimStartTime = -1.0;
+            gPreviousMainTabIndex = gMainTabIndex;
+        }
+    }
+
+    auto drawTitleText = [&](const char* label, float alpha) {
+        if (!label || alpha <= 0.0f) return;
+        ImVec2 textSize = titleFont->CalcTextSizeA(titleFontSize, FLT_MAX, 0.0f, label);
+        float textX = tabX + ((windowWidth - tabX - 20.0f) - textSize.x) * 0.5f - 56.0f;
+        ImVec2 screenPos(window_pos.x + textX, window_pos.y + tabLabelY);
+        drawList->AddText(
+            titleFont,
+            titleFontSize,
+            ImVec2(screenPos.x + 2.0f, screenPos.y + 3.0f),
+            ImGui::GetColorU32(ImVec4(0.02f, 0.08f, 0.16f, 0.55f * alpha)),
+            label);
+        drawList->AddText(
+            titleFont,
+            titleFontSize,
+            screenPos,
+            ImGui::GetColorU32(ImVec4(0.90f, 0.97f, 1.00f, alpha)),
+            label);
+    };
+
+    if (gMainTabTitleAnimStartTime >= 0.0 && gPreviousMainTabIndex != gMainTabIndex) {
+        drawTitleText(tabLabels[gPreviousMainTabIndex], 1.0f - animT);
+        drawTitleText(tabLabels[gMainTabIndex], animT);
+    } else {
+        drawTitleText(tabLabels[gMainTabIndex], 1.0f);
+    }
     ImGui::SetWindowFontScale(1.0f);
 
     ImGui::SetCursorPos(ImVec2(tabX, tabY));

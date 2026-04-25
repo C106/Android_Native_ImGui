@@ -22,7 +22,9 @@
 #include "imgui.h"
 #include "imgui_internal.h"
 
-#include "IconsFontAwesome6.h"
+#include "IconsFontAwesome7.h"
+
+extern ImFont* gBannerIconFont;
 
 
 
@@ -37,8 +39,8 @@
 */
 
 #define NOTIFY_MAX_MSG_LENGTH				4096		// Max message content length
-#define NOTIFY_PADDING_X					20.f		// Bottom-left X padding
-#define NOTIFY_PADDING_Y					20.f		// Bottom-left Y padding
+#define NOTIFY_PADDING_X					20.f		// Top-left X padding
+#define NOTIFY_PADDING_Y					20.f		// Top-left Y padding
 #define NOTIFY_PADDING_MESSAGE_Y			10.f		// Padding Y between each message
 #define NOTIFY_FADE_IN_OUT_TIME				150			// Fade in and out duration
 #define NOTIFY_DEFAULT_DISMISS				3000		// Auto dismiss after X ms (default, applied only of no data provided in constructors)
@@ -536,21 +538,23 @@ namespace ImGui
                 throw "Unsupported platform";
             #endif
 
-            //PushStyleColor(ImGuiCol_Text, textColor);
+            const ImVec4 toastBgColor(0.07f, 0.10f, 0.17f, opacity);
+            const ImVec4 toastBorderColor(0.24f, 0.66f, 1.00f, opacity * 0.92f);
+            const ImVec4 titleColor(0.36f, 0.76f, 1.00f, opacity);
+            const ImVec4 bodyColor(0.90f, 0.97f, 1.00f, opacity);
+            const ImVec4 iconColor(0.36f, 0.76f, 1.00f, opacity);
+
             SetNextWindowBgAlpha(opacity);
 
             #if NOTIFY_RENDER_OUTSIDE_MAIN_WINDOW
-                short mainMonitorId = static_cast<ImGuiViewportP*>(GetMainViewport())->PlatformMonitor;
+                ImGuiViewport* mainViewport = GetMainViewport();
 
-                ImGuiPlatformIO& platformIO = GetPlatformIO();
-                ImGuiPlatformMonitor& monitor = platformIO.Monitors[mainMonitorId];
-
-                // Set notification window position to bottom right corner of the monitor
-                SetNextWindowPos(ImVec2(monitor.WorkPos.x + monitor.WorkSize.x - NOTIFY_PADDING_X, monitor.WorkPos.y + monitor.WorkSize.y - NOTIFY_PADDING_Y - height), ImGuiCond_Always, ImVec2(1.0f, 1.0f));
+                // Newer Dear ImGui versions expose the host work area directly on the viewport.
+                SetNextWindowPos(ImVec2(mainViewport->WorkPos.x + NOTIFY_PADDING_X, mainViewport->WorkPos.y + NOTIFY_PADDING_Y + height), ImGuiCond_Always, ImVec2(0.0f, 0.0f));
             #else
-                // Set notification window position to bottom right corner of the main window, considering the main window size and location in relation to the display
+                // Set notification window position to top left corner of the main window, considering the main window size and location in relation to the display
                 ImVec2 mainWindowPos = GetMainViewport()->Pos;
-                SetNextWindowPos(ImVec2(mainWindowPos.x + mainWindowSize.x - NOTIFY_PADDING_X, mainWindowPos.y + mainWindowSize.y - NOTIFY_PADDING_Y - height), ImGuiCond_Always, ImVec2(1.0f, 1.0f));
+                SetNextWindowPos(ImVec2(mainWindowPos.x + NOTIFY_PADDING_X, mainWindowPos.y + NOTIFY_PADDING_Y + height), ImGuiCond_Always, ImVec2(0.0f, 0.0f));
             #endif
 
             // Set notification window flags
@@ -559,10 +563,24 @@ namespace ImGui
                 currentToast->setWindowFlags(NOTIFY_DEFAULT_TOAST_FLAGS | ImGuiWindowFlags_NoInputs);
             }
 
+            PushStyleVar(ImGuiStyleVar_WindowRounding, 15.0f);
+            PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.2f);
+            PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f, 12.0f));
+            PushStyleColor(ImGuiCol_WindowBg, toastBgColor);
+            PushStyleColor(ImGuiCol_Border, toastBorderColor);
+            PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.24f, 0.40f, opacity * 0.72f));
+            PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.18f, 0.34f, 0.56f, opacity * 0.88f));
+            PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.20f, 0.40f, 0.66f, opacity));
+            PushStyleColor(ImGuiCol_Text, bodyColor);
             Begin(windowName, nullptr, currentToast->getWindowFlags());
 
             // Render over all other windows
             BringWindowToDisplayFront(GetCurrentWindow());
+
+            ImDrawList* drawList = GetWindowDrawList();
+            const ImVec2 rectMin = GetWindowPos();
+            const ImVec2 rectMax(rectMin.x + GetWindowSize().x, rectMin.y + GetWindowSize().y);
+            drawList->AddRect(rectMin, rectMax, GetColorU32(toastBorderColor), 15.0f, 0, 1.4f);
 
             // Here we render the toast content
             {
@@ -573,8 +591,11 @@ namespace ImGui
                 // If an icon is set
                 if (!NOTIFY_NULL_OR_EMPTY(icon))
                 {
-                    //Text(icon); // Render icon text
-                    TextColored(textColor, "%s", icon);
+                    if (gBannerIconFont)
+                        PushFont(gBannerIconFont);
+                    TextColored(iconColor, "%s", icon);
+                    if (gBannerIconFont)
+                        PopFont();
                     wasTitleRendered = true;
                 }
 
@@ -585,7 +606,7 @@ namespace ImGui
                     if (!NOTIFY_NULL_OR_EMPTY(icon))
                         SameLine();
 
-                    Text("%s", title); // Render title text
+                    TextColored(titleColor, "%s", title); // Render title text
                     wasTitleRendered = true;
                 } else 
                 if (!NOTIFY_NULL_OR_EMPTY(defaultTitle))
@@ -593,7 +614,7 @@ namespace ImGui
                     if (!NOTIFY_NULL_OR_EMPTY(icon))
                         SameLine();
 
-                    Text("%s", defaultTitle); // Render default title text (ImGuiToastType_Success -> "Success", etc...)
+                    TextColored(titleColor, "%s", defaultTitle); // Render default title text (ImGuiToastType_Success -> "Success", etc...)
                     wasTitleRendered = true;
                 }
 
@@ -618,7 +639,12 @@ namespace ImGui
                     SetCursorPosX(GetCursorPosX() + (GetWindowSize().x - GetCursorPosX()) * scale);
 
                     // If the button is pressed, we want to remove the notification
-                    if (Button(ICON_FA_XMARK))
+                    if (gBannerIconFont)
+                        PushFont(gBannerIconFont);
+                    const bool dismissPressed = Button(ICON_FA_CIRCLE_XMARK);
+                    if (gBannerIconFont)
+                        PopFont();
+                    if (dismissPressed)
                     {
                         RemoveNotification(i);
                     }
@@ -661,6 +687,8 @@ namespace ImGui
 
             // End
             End();
+            PopStyleColor(6);
+            PopStyleVar(3);
         }
     }
 }

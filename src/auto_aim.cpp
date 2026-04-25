@@ -26,6 +26,7 @@ constexpr float kHorizontalNearCenterThreshold = 0.012f;
 constexpr float kVerticalNearCenterThreshold = 0.012f;
 constexpr float kHorizontalNearCenterMinScale = 0.50f;
 constexpr float kVerticalNearCenterMinScale = 0.50f;
+constexpr int kTriggerBotTouchSlot = 8;
 
 // 默认值
 constexpr float kDefaultBulletSpeed = 80000.0f;  // 默认子弹速度 cm/s (800 m/s)
@@ -211,6 +212,25 @@ static Vec2 UpdateRecoilCenterOffset(const AutoAimConfig& config, TargetState& s
 
     const float zoomScale = 1.0f / std::max(fovRatio, 0.20f);
     const float maxOffset = screenHeight * config.maxRecoilOffsetFraction;
+    if (recoil.bulletTrackValid) {
+        const float target = std::clamp(
+            SanitizeNonNegative(recoil.verticalRecoilTarget) * config.recoilKickOffsetScale * zoomScale,
+            0.0f, maxOffset);
+        const float follow = std::clamp((isFiring ? 24.0f : 14.0f) * deltaTime, 0.0f, 1.0f);
+        state.recoilBaseLiftOffset += (target - state.recoilBaseLiftOffset) * follow;
+        state.recoilKickOffset = 0.0f;
+
+        if (!isFiring) {
+            const float fallbackRecover = screenHeight * 1.50f * deltaTime;
+            state.recoilBaseLiftOffset = std::max(0.0f, state.recoilBaseLiftOffset - fallbackRecover);
+            if (state.recoilBaseLiftOffset < std::max(0.35f, screenHeight * 0.0006f)) {
+                ClearRecoilState(state);
+            }
+        }
+
+        return Vec2(0.0f, -state.recoilBaseLiftOffset);
+    }
+
     const float recoilRiseSpeed = SanitizeNonNegative(recoil.realtimeVerticalRecoilSpeed);
     const float recoilRecoverySpeed = SanitizeNonNegative(recoil.realtimeRecoverySpeed);
     const float sightReturnSpeed = SanitizeNonNegative(recoil.shootSightReturnSpeed);
@@ -368,6 +388,10 @@ static float SelectScopedGyroSensitivity(const UserGyroSensitivity& sens, bool i
         float firingSensitivity;
     };
 
+    if (std::fabs(cameraFOV - 35.0f) <= 0.2f || std::fabs(cameraFOV - 29.5f) <= 0.2f) {
+        return isFiring ? sens.firing2x : sens.scope2x;
+    }
+
     // ADS 状态下按当前 FOV 与各档位基准 FOV 的最近距离匹配。
     // 已知基准: NoneSniper 70, 2x 55, 3x 44.4, 4x 26.7, 6x 20~21, 8x 13.3/11。
     const ScopeSensitivityEntry entries[] = {
@@ -523,6 +547,18 @@ static RecoilDebugInfo ReadCurrentRecoilDebugInfo() {
     info.weapon = weapon;
     info.entityComp = entityComp;
     info.valid = true;
+    info.weaponID = GetDriverManager().read<int32_t>(weapon + offset.WeaponRepWeaponID);
+    info.bulletTrackComp = GetDriverManager().read<uint64_t>(weapon + offset.WeaponCachedBulletTrackComponent);
+    if (info.bulletTrackComp != 0) {
+        info.verticalRecoilTarget =
+            GetDriverManager().read<float>(info.bulletTrackComp + offset.BulletTrackVerticalRecoilTarget);
+        info.lastVerticalRecoilTarget =
+            GetDriverManager().read<float>(info.bulletTrackComp + offset.BulletTrackLastVerticalRecoilTarget);
+        info.accVerticalRecoilTarget =
+            GetDriverManager().read<float>(info.bulletTrackComp + offset.BulletTrackAccVerticalRecoilTarget);
+        info.verticalRecoilTargetDelta = info.verticalRecoilTarget - info.lastVerticalRecoilTarget;
+        info.bulletTrackValid = std::isfinite(info.verticalRecoilTarget);
+    }
     info.sightType = GetDriverManager().read<uint8_t>(entityComp + offset.EntitySightType);
     info.angledSightID = GetDriverManager().read<int32_t>(weapon + offset.WeaponAngledSightID);
     info.curSightTypeID = GetDriverManager().read<int32_t>(weapon + offset.WeaponCurSightTypeID);
@@ -940,9 +976,15 @@ bool AutoAimController::SelectTarget(const Vec2& screenCenter, bool requireVisib
 
 void AutoAimController::ReleaseTriggerTouch() {
     if (triggerTouchDown_ && HasTouchOutputChannel()) {
-        GetDriverManager().touch_up(9);
+        GetDriverManager().touch_up(kTriggerBotTouchSlot);
     }
     triggerTouchDown_ = false;
+    if (triggerTouchReady_ && HasTouchOutputChannel()) {
+        GetDriverManager().touch_destroy();
+    }
+    triggerTouchReady_ = false;
+    triggerTouchMaxX_ = 0;
+    triggerTouchMaxY_ = 0;
 }
 
 void AutoAimController::UpdateTriggerBot(const Vec2& rawScreenCenter) {
@@ -954,14 +996,6 @@ void AutoAimController::UpdateTriggerBot(const Vec2& rawScreenCenter) {
     if (!HasTouchOutputChannel()) {
         ReleaseTriggerTouch();
         return;
-    }
-
-    if (!triggerTouchReady_) {
-        triggerTouchReady_ = GetDriverManager().touch_init(&triggerTouchMaxX_, &triggerTouchMaxY_);
-        if (!triggerTouchReady_) {
-            ReleaseTriggerTouch();
-            return;
-        }
     }
 
     uint64_t targetActor = 0;
@@ -1046,9 +1080,18 @@ void AutoAimController::UpdateTriggerBot(const Vec2& rawScreenCenter) {
         return;
     }
 
+    if (!triggerTouchReady_) {
+        triggerTouchReady_ = GetDriverManager().touch_init(&triggerTouchMaxX_, &triggerTouchMaxY_) &&
+                             triggerTouchMaxX_ > 0 && triggerTouchMaxY_ > 0;
+        if (!triggerTouchReady_) {
+            ReleaseTriggerTouch();
+            return;
+        }
+    }
+
     const bool ok = triggerTouchDown_
-        ? GetDriverManager().touch_move(9, touchX, touchY)
-        : GetDriverManager().touch_down(9, touchX, touchY);
+        ? GetDriverManager().touch_move(kTriggerBotTouchSlot, touchX, touchY)
+        : GetDriverManager().touch_down(kTriggerBotTouchSlot, touchX, touchY);
     if (ok) {
         triggerTouchDown_ = true;
     } else {
@@ -1261,9 +1304,17 @@ void AutoAimController::DrawRecoilSpeedDebugWindow() {
         ImGui::Text("Recoil Speed");
         ImGui::Separator();
         ImGui::Text("Weapon: 0x%llX", (unsigned long long)recoil.weapon);
+        ImGui::Text("Weapon ID: %d", recoil.weaponID);
         ImGui::Text("Weapon Entity: 0x%llX", (unsigned long long)recoil.entityComp);
+        ImGui::Text("BulletTrack: 0x%llX", (unsigned long long)recoil.bulletTrackComp);
+        ImGui::Text("BulletTrack Valid: %s", recoil.bulletTrackValid ? "true" : "false");
         ImGui::Text("Valid: %s", recoil.valid ? "true" : "false");
         if (recoil.valid) {
+            ImGui::Separator();
+            ImGui::Text("VerticalRecoilTarget: %.3f", recoil.verticalRecoilTarget);
+            ImGui::Text("LastVerticalTarget / Delta: %.3f / %.3f",
+                recoil.lastVerticalRecoilTarget, recoil.verticalRecoilTargetDelta);
+            ImGui::Text("AccVerticalRecoilTarget: %.3f", recoil.accVerticalRecoilTarget);
             ImGui::Separator();
             ImGui::Text("Sight: %s", GetSightTypeLabel(recoil.sightType));
             ImGui::Text("SightType / CurSightTypeID: %u / %d",

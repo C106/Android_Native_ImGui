@@ -125,6 +125,13 @@ struct RecoilDebugInfo {
     float realtimeRecoverySpeed = 0.0f;
 
     uint64_t weapon = 0;
+    uint64_t bulletTrackComp = 0;
+    bool bulletTrackValid = false;
+    float verticalRecoilTarget = 0.0f;
+    float lastVerticalRecoilTarget = 0.0f;
+    float verticalRecoilTargetDelta = 0.0f;
+    float accVerticalRecoilTarget = 0.0f;
+    int32_t weaponID = 0;
     uint8_t sightType = 0;
     int32_t angledSightID = 0;
     int32_t curSightTypeID = 0;

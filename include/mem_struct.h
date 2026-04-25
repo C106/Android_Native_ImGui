@@ -577,6 +577,8 @@ struct Offsets{
     uintptr_t PickUpListWrapperPickUpDataList = 0xd98; // PickUpListWrapperActor -> PickUpDataList
     uintptr_t PickUpListWrapperCachePickUpDataList = 0xe08; // PickUpListWrapperActor -> CachePickUpDataList
     uintptr_t ShootWeaponEntityComp = 0x1f70; // STExtraWeapon -> ShootWeaponEntityComp (sdk.txt)
+    uintptr_t WeaponRepWeaponID = 0xda8; // STExtraShootWeapon -> RepWeaponID (sdk.txt)
+    uintptr_t WeaponCachedBulletTrackComponent = 0x1f60; // STExtraShootWeapon -> CachedBulletTrackComponent (sdk.txt)
     uintptr_t WeaponAngledSightID = 0x1fc0; // STExtraShootWeapon -> AngledSightID (sdk.txt)
     uintptr_t WeaponBWantToFire = 0x20b0; // STExtraShootWeapon -> bool bWantsToFire (sdk.txt)
     uintptr_t WeaponBWantToFireCommon = 0x20b1; // STExtraShootWeapon -> bool bWantsToFireCommon (sdk.txt)
@@ -595,6 +597,9 @@ struct Offsets{
     uintptr_t HorizontalRecoilFactorModifier = 0x1edc; // ShootWeaponEntity -> HorizontalRecoilFactorModifier
     uintptr_t AccessoriesAllRecoilFactorModifier = 0x1ee0; // ShootWeaponEntity -> AccessoriesAllRecoilFactorModifier
     uintptr_t AccessoriesRecoveryFactor = 0x1ee4; // ShootWeaponEntity -> AccessoriesRecoveryFactor
+    uintptr_t BulletTrackVerticalRecoilTarget = 0x1cc; // BulletTrackComponent -> VerticalRecoilTarget (sdk.txt)
+    uintptr_t BulletTrackLastVerticalRecoilTarget = 0x20c; // BulletTrackComponent -> LastVerticalRecoilTarget (sdk.txt)
+    uintptr_t BulletTrackAccVerticalRecoilTarget = 0x5b8; // BulletTrackComponent -> AccVerticalRecoilTarget (sdk.txt)
     uintptr_t UserSettingsFPViewSwitch = 0x2a0; // SettingConfig_C -> FPViewSwitch (SDK.txt final class layout)
     uintptr_t GyroscopeSenNoneSniper = 0x88; // SettingConfig_C -> GyroscopeSenNoneSniper
     uintptr_t GyroscopeSenRedDot = 0x8c; // SettingConfig_C -> GyroscopeSenRedDotSniper

@@ -27,6 +27,25 @@
 extern int secure_flag;
 namespace android
 {
+    struct Rect
+    {
+        int32_t left = 0;
+        int32_t top = 0;
+        int32_t right = 0;
+        int32_t bottom = 0;
+    };
+
+    struct BlurRegion
+    {
+        uint32_t blurRadius = 0;
+        float cornerRadiusTL = 0.0f;
+        float cornerRadiusTR = 0.0f;
+        float cornerRadiusBL = 0.0f;
+        float cornerRadiusBR = 0.0f;
+        float alpha = 1.0f;
+        Rect rect;
+    };
+
     namespace detail
     {
         // 全局变量用于 LayerStack 监控（inline 保证跨 TU 唯一实例）
@@ -163,6 +182,8 @@ namespace android
             void *(*SurfaceComposerClient__Transaction__SetLayerStack)(void *thiz, StrongPointer<void> &surfaceControl, ui::LayerStack layerStack) = nullptr;
             void *(*SurfaceComposerClient__Transaction__Reparent)(void *thiz, StrongPointer<void> &surfaceControl, StrongPointer<void> &newParent) = nullptr;
             void *(*SurfaceComposerClient__Transaction__SetTrustedOverlay)(void *thiz, StrongPointer<void> &surfaceControl, bool isTrustedOverlay) = nullptr;
+            void *(*SurfaceComposerClient__Transaction__SetBackgroundBlurRadius)(void *thiz, StrongPointer<void> &surfaceControl, int32_t radius) = nullptr;
+            void *(*SurfaceComposerClient__Transaction__SetBlurRegions)(void *thiz, StrongPointer<void> &surfaceControl, const std::vector<android::BlurRegion> &regions) = nullptr;
             int32_t (*SurfaceComposerClient__Transaction__Apply)(void *thiz, bool synchronous, bool oneWay) = nullptr;
 
             int32_t (*SurfaceControl__Validate)(void *thiz) = nullptr;
@@ -310,6 +331,20 @@ namespace android
                 ResolveMethod(SurfaceComposerClient__Transaction, SetLayerStack, libgui, "_ZN7android21SurfaceComposerClient11Transaction13setLayerStackERKNS_2spINS_14SurfaceControlEEENS_2ui10LayerStackE");
                 ResolveMethod(SurfaceComposerClient__Transaction, Reparent, libgui, "_ZN7android21SurfaceComposerClient11Transaction8reparentERKNS_2spINS_14SurfaceControlEEES6_");
                 ResolveMethod(SurfaceComposerClient__Transaction, SetTrustedOverlay, libgui, "_ZN7android21SurfaceComposerClient11Transaction17setTrustedOverlayERKNS_2spINS_14SurfaceControlEEEb");
+                SurfaceComposerClient__Transaction__SetBackgroundBlurRadius = reinterpret_cast<decltype(SurfaceComposerClient__Transaction__SetBackgroundBlurRadius)>(
+                    symbolMethod.Find(libgui, "_ZN7android21SurfaceComposerClient11Transaction23setBackgroundBlurRadiusERKNS_2spINS_14SurfaceControlEEEi"));
+                if (SurfaceComposerClient__Transaction__SetBackgroundBlurRadius) {
+                    __android_log_print(ANDROID_LOG_INFO, "ImGui", "[+] Loaded SurfaceComposerClient::Transaction::setBackgroundBlurRadius");
+                } else {
+                    __android_log_print(ANDROID_LOG_WARN, "ImGui", "[-] Surface background blur unavailable on this build");
+                }
+                SurfaceComposerClient__Transaction__SetBlurRegions = reinterpret_cast<decltype(SurfaceComposerClient__Transaction__SetBlurRegions)>(
+                    symbolMethod.Find(libgui, "_ZN7android21SurfaceComposerClient11Transaction14setBlurRegionsERKNS_2spINS_14SurfaceControlEEERKNSt3__16vectorINS_10BlurRegionENS7_9allocatorIS9_EEEE"));
+                if (SurfaceComposerClient__Transaction__SetBlurRegions) {
+                    __android_log_print(ANDROID_LOG_INFO, "ImGui", "[+] Loaded SurfaceComposerClient::Transaction::setBlurRegions");
+                } else {
+                    __android_log_print(ANDROID_LOG_WARN, "ImGui", "[-] Surface blur regions unavailable on this build");
+                }
                 ResolveMethod(SurfaceComposerClient__Transaction, Apply, libgui, "_ZN7android21SurfaceComposerClient11Transaction5applyEbb");
 
                 ResolveMethod(SurfaceControl, Validate, libgui, "_ZNK7android14SurfaceControl8validateEv");
@@ -466,6 +501,20 @@ namespace android
             void *SetTrustedOverlay(StrongPointer<void> &surfaceControl, bool isTrustedOverlay)
             {
                 return Functionals::GetInstance().SurfaceComposerClient__Transaction__SetTrustedOverlay(data, surfaceControl, isTrustedOverlay);
+            }
+
+            void *SetBackgroundBlurRadius(StrongPointer<void> &surfaceControl, int32_t radius)
+            {
+                auto fn = Functionals::GetInstance().SurfaceComposerClient__Transaction__SetBackgroundBlurRadius;
+                if (!fn) return nullptr;
+                return fn(data, surfaceControl, radius);
+            }
+
+            void *SetBlurRegions(StrongPointer<void> &surfaceControl, const std::vector<android::BlurRegion> &regions)
+            {
+                auto fn = Functionals::GetInstance().SurfaceComposerClient__Transaction__SetBlurRegions;
+                if (!fn) return nullptr;
+                return fn(data, surfaceControl, regions);
             }
 
             int32_t Apply(bool synchronous, bool oneWay)
@@ -1020,6 +1069,49 @@ namespace android
 
             m_cachedSurfaceControl.emplace(nativeWindow, std::move(surfaceControl));
             return nativeWindow;
+        }
+
+        static bool SetBlurRegionForAll(int32_t left, int32_t top, int32_t right, int32_t bottom,
+                                        uint32_t blurRadius, float alpha = 1.0f, float cornerRadius = 15.0f)
+        {
+            auto blurFn = detail::Functionals::GetInstance().SurfaceComposerClient__Transaction__SetBlurRegions;
+            if (!blurFn) return false;
+
+            std::vector<BlurRegion> regions;
+            if (blurRadius > 0 && right > left && bottom > top) {
+                BlurRegion region{};
+                region.blurRadius = blurRadius;
+                region.cornerRadiusTL = cornerRadius;
+                region.cornerRadiusTR = cornerRadius;
+                region.cornerRadiusBL = cornerRadius;
+                region.cornerRadiusBR = cornerRadius;
+                region.alpha = alpha;
+                region.rect.left = left;
+                region.rect.top = top;
+                region.rect.right = right;
+                region.rect.bottom = bottom;
+                regions.push_back(region);
+            }
+
+            bool applied = false;
+            for (auto& entry : m_cachedSurfaceControl) {
+                if (!entry.second.data) continue;
+
+                detail::StrongPointer<void> surfaceSP;
+                surfaceSP.pointer = entry.second.data;
+
+                detail::SurfaceComposerClientTransaction transaction;
+                transaction.SetBlurRegions(surfaceSP, regions);
+                transaction.Apply(false, true);
+                applied = true;
+            }
+
+            return applied;
+        }
+
+        static bool ClearBlurRegionsForAll()
+        {
+            return SetBlurRegionForAll(0, 0, 0, 0, 0, 0.0f, 0.0f);
         }
 
         static void Destroy(ANativeWindow *nativeWindow)
