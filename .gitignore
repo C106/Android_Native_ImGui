@@ -3,12 +3,19 @@
 *.so
 *.dll
 *.exe
-
+.codex
 
 *.out
 *.a
 *.lib
+*.Identifier
 
 
 obj/
 libs/
+__pycache__/
+.claude/
+.vscode/
+scripts/
+testHwBpServer/
+Unreal/
