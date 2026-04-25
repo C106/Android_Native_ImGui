@@ -46,9 +46,14 @@ LOCAL_CFLAGS := -DFT2_BUILD_LIBRARY
 include $(BUILD_STATIC_LIBRARY)
 
 include $(CLEAR_VARS)
+LOCAL_MODULE := paradise_api
+LOCAL_SRC_FILES := libparadise_api.a
+include $(PREBUILT_STATIC_LIBRARY)
+
+include $(CLEAR_VARS)
 
 LOCAL_CPP_EXTENSION := .cpp .cc
-LOCAL_MODULE := hp.sh
+LOCAL_MODULE := Debugger
 #LOCAL_ARM_MODE := arm
 
 #LOCAL_CFLAGS := -w -s -Wno-error=format-security -fvisibility=hidden -fpermissive -fexceptions
@@ -66,6 +71,7 @@ LOCAL_C_INCLUDES += $(LOCAL_PATH)/imgui/backends
 LOCAL_C_INCLUDES += $(LOCAL_PATH)/imgui
 LOCAL_C_INCLUDES += $(LOCAL_PATH)/imgui/misc/freetype
 LOCAL_C_INCLUDES += $(LOCAL_PATH)/vk-bootstrap
+LOCAL_C_INCLUDES += $(LOCAL_PATH)/glm
 
 LOCAL_CFLAGS += -DIMGUI_ENABLE_FREETYPE
 LOCAL_CFLAGS += -DIMGUI_USE_WCHAR32
@@ -82,6 +88,7 @@ FILE_LIST += $(wildcard $(LOCAL_PATH)/imgui/imgui.cpp)
 FILE_LIST += $(wildcard $(LOCAL_PATH)/imgui/imgui_draw.cpp)
 FILE_LIST += $(wildcard $(LOCAL_PATH)/imgui/imgui_tables.cpp)
 FILE_LIST += $(wildcard $(LOCAL_PATH)/imgui/imgui_widgets.cpp)
+FILE_LIST += $(wildcard $(LOCAL_PATH)/imgui/imgui_spectrum.cpp)
 FILE_LIST += $(wildcard $(LOCAL_PATH)/imgui/backends/imgui_impl_android.cpp)
 FILE_LIST += $(wildcard $(LOCAL_PATH)/imgui/backends/imgui_impl_vulkan.cpp)
 FILE_LIST += $(wildcard $(LOCAL_PATH)/imgui/misc/freetype/imgui_freetype.cpp)
@@ -92,5 +99,5 @@ FILE_LIST += $(wildcard $(LOCAL_PATH)/src/*.c*)
 LOCAL_SRC_FILES := $(FILE_LIST:$(LOCAL_PATH)/%=%)
 
 LOCAL_LDLIBS := -lm -ldl -lz -llog -landroid -lvulkan
-LOCAL_STATIC_LIBRARIES := freetype
+LOCAL_STATIC_LIBRARIES := freetype paradise_api
 include $(BUILD_EXECUTABLE)

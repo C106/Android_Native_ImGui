@@ -1,0 +1,91 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct VisibilityCandidate {
+    vec4 centerRadius;
+    vec4 extents;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer CandidateBuffer {
+    VisibilityCandidate items[];
+} candidates;
+
+layout(std430, set = 0, binding = 1) readonly buffer ConfigBuffer {
+    mat4 vp;
+    vec4 cameraPosMaxDistance;
+    vec4 screenSizeMarginPx;
+    vec4 minDistanceAndCount;
+} config;
+
+layout(std430, set = 0, binding = 2) writeonly buffer ResultBuffer {
+    uint visible[];
+} results;
+
+vec4 ProjectPoint(vec3 point) {
+    return config.vp * vec4(point, 1.0);
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    uint candidateCount = uint(config.minDistanceAndCount.w);
+    if (index >= candidateCount) {
+        return;
+    }
+
+    VisibilityCandidate candidate = candidates.items[index];
+    vec3 center = candidate.centerRadius.xyz;
+    vec3 extents = max(candidate.extents.xyz, vec3(1.0));
+    float distanceMeters = distance(center, config.cameraPosMaxDistance.xyz) * 0.01;
+    float minDistanceMeters = config.minDistanceAndCount.x;
+    float maxDistanceMeters = config.cameraPosMaxDistance.w;
+
+    if (distanceMeters < minDistanceMeters || distanceMeters > maxDistanceMeters) {
+        results.visible[index] = 0u;
+        return;
+    }
+
+    vec3 corners[8] = vec3[](
+        center + vec3(-extents.x, -extents.y, -extents.z),
+        center + vec3( extents.x, -extents.y, -extents.z),
+        center + vec3(-extents.x,  extents.y, -extents.z),
+        center + vec3( extents.x,  extents.y, -extents.z),
+        center + vec3(-extents.x, -extents.y,  extents.z),
+        center + vec3( extents.x, -extents.y,  extents.z),
+        center + vec3(-extents.x,  extents.y,  extents.z),
+        center + vec3( extents.x,  extents.y,  extents.z)
+    );
+
+    bool anyFront = false;
+    vec2 minScreen = vec2( 1e20);
+    vec2 maxScreen = vec2(-1e20);
+    for (int i = 0; i < 8; ++i) {
+        vec4 clip = ProjectPoint(corners[i]);
+        if (clip.w <= 0.0001) {
+            continue;
+        }
+
+        anyFront = true;
+        vec2 ndc = clip.xy / clip.w;
+        vec2 screen = vec2(
+            (config.screenSizeMarginPx.x * 0.5) + ndc.x * (config.screenSizeMarginPx.x * 0.5),
+            (config.screenSizeMarginPx.y * 0.5) - ndc.y * (config.screenSizeMarginPx.y * 0.5)
+        );
+        minScreen = min(minScreen, screen);
+        maxScreen = max(maxScreen, screen);
+    }
+
+    if (!anyFront) {
+        results.visible[index] = 0u;
+        return;
+    }
+
+    float marginPx = config.screenSizeMarginPx.z;
+    bool overlaps =
+        maxScreen.x >= -marginPx &&
+        maxScreen.y >= -marginPx &&
+        minScreen.x <= config.screenSizeMarginPx.x + marginPx &&
+        minScreen.y <= config.screenSizeMarginPx.y + marginPx;
+
+    results.visible[index] = overlaps ? 1u : 0u;
+}

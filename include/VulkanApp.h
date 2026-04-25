@@ -3,6 +3,7 @@
 #include <vulkan/vulkan.h>
 #include <android/native_window.h>
 #include "vk-bootstrap/VkBootstrap.h"
+
 struct FrameData {
     VkCommandPool   cmdPool{};
     VkCommandBuffer cmd{};
@@ -29,18 +30,19 @@ struct VulkanApp {
     std::vector<VkFramebuffer> swapchainFramebuffers;
     std::vector<VkFence> imagesInFlight;
 
+    bool initialized = false;
+
     bool rebuildSwapchain(ANativeWindow* window);
     void cleanupSwapchainResources();
     void cleanupFrameData();
     bool createFramebuffers();
     bool createFrameData();
     bool handleWindowResize(ANativeWindow* window);
-    
+
     std::vector<VkSemaphore> imageAvailableSemaphores;
     std::vector<VkSemaphore> renderFinishedSemaphores;
     std::vector<VkFence> inFlightFences;
-    uint32_t maxFramesInFlight = 2; // 限制并行帧数
-    
+    uint32_t maxFramesInFlight = 1; // 降低 pipeline 深度，减少延迟
     bool swapchainRebuildRequired = false;
 
     size_t currentFrame = 0;

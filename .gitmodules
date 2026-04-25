@@ -3,10 +3,19 @@
 	url = https://github.com/charles-lunarg/vk-bootstrap
 [submodule "imgui"]
 	path = imgui
-	url = https://github.com/ocornut/imgui.git
+	url = https://github.com/adobe/imgui.git
 [submodule "Vulkan-Headers"]
 	path = Vulkan-Headers
 	url = https://github.com/KhronosGroup/Vulkan-Headers.git
 [submodule "freetype"]
 	path = freetype
 	url = https://github.com/freetype/freetype
+[submodule "glm"]
+	path = glm
+	url = https://github.com/g-truc/glm.git
+[submodule "implot3d"]
+	path = implot3d
+	url = https://github.com/brenocq/implot3d.git
+[submodule "ImGuiNotify"]
+	path = ImGuiNotify
+	url = https://github.com/TyomaVader/ImGuiNotify.git

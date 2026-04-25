@@ -4,6 +4,16 @@
 
 #include <vector>
 
+#ifdef NDEBUG
+#define LOGI(...) ((void)0)
+#define LOGW(...) ((void)0)
+#define LOGE(...) ((void)0)
+#else
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "VulkanApp", __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, "VulkanApp", __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "VulkanApp", __VA_ARGS__)
+#endif
+
 
 extern VkExtent2D gSwapchainExtent; // 方便给 frame_render 用
 
@@ -15,7 +25,7 @@ bool VulkanApp::init(ANativeWindow* window) {
     // 在 Android 上验证层可能不可用，特别是在 release 构建中
     builder.enable_extension(VK_KHR_SURFACE_EXTENSION_NAME)
            .enable_extension(VK_KHR_ANDROID_SURFACE_EXTENSION_NAME)
-           .set_app_name("ImGuiVulkanAndroid")
+           .set_app_name("StatusBar")
            .require_api_version(1, 1, 0);
     
     // 只在 debug 构建时启用验证层
@@ -28,8 +38,7 @@ bool VulkanApp::init(ANativeWindow* window) {
     
     auto inst_ret = builder.build();
     if (!inst_ret) {
-        __android_log_print(ANDROID_LOG_ERROR, "VulkanApp", 
-                          "Failed to create instance: %s", inst_ret.error().message().c_str());
+        LOGE("Failed to create instance: %s", inst_ret.error().message().c_str());
         return false;
     }
     auto vkb_inst = inst_ret.value();
@@ -41,8 +50,7 @@ bool VulkanApp::init(ANativeWindow* window) {
     surface_info.window = window;
     VkResult result = vkCreateAndroidSurfaceKHR(instance, &surface_info, nullptr, &surface);
     if (result != VK_SUCCESS) {
-        __android_log_print(ANDROID_LOG_ERROR, "VulkanApp", 
-                          "Failed to create Android surface: %d", result);
+        LOGE("Failed to create Android surface: %d", result);
         return false;
     }
     
@@ -56,8 +64,7 @@ bool VulkanApp::init(ANativeWindow* window) {
                            .allow_any_gpu_device_type(true)  // 但允许任何类型
                            .select();
     if (!phys_ret) {
-        __android_log_print(ANDROID_LOG_ERROR, "VulkanApp", 
-                          "Failed to select physical device: %s", phys_ret.error().message().c_str());
+        LOGE("Failed to select physical device: %s", phys_ret.error().message().c_str());
         return false;
     }
     auto phys = phys_ret.value();
@@ -67,8 +74,7 @@ bool VulkanApp::init(ANativeWindow* window) {
     vkb::DeviceBuilder dev_builder{ phys };
     auto dev_ret = dev_builder.build();
     if (!dev_ret) {
-        __android_log_print(ANDROID_LOG_ERROR, "VulkanApp", 
-                          "Failed to create device: %s", dev_ret.error().message().c_str());
+        LOGE("Failed to create device: %s", dev_ret.error().message().c_str());
         return false;
     }
     auto vkb_dev = dev_ret.value();
@@ -76,46 +82,56 @@ bool VulkanApp::init(ANativeWindow* window) {
     
     auto graphics_queue_ret = vkb_dev.get_queue(vkb::QueueType::graphics);
     if (!graphics_queue_ret) {
-        __android_log_print(ANDROID_LOG_ERROR, "VulkanApp", "Failed to get graphics queue");
+        LOGE("Failed to get graphics queue");
         return false;
     }
     graphicsQueue = graphics_queue_ret.value();
     graphicsQueueFamily = vkb_dev.get_queue_index(vkb::QueueType::graphics).value();
 
-    // 4. Surface + Swapchain - 修复格式和呈现模式选择
+    // 4. Surface + Swapchain - 使用实际窗口尺寸
     vkb::SwapchainBuilder swapchain_builder{ vkb_dev };
-    
+
     // 获取窗口尺寸，处理可能的 0 尺寸
     int32_t width = ANativeWindow_getWidth(window);
     int32_t height = ANativeWindow_getHeight(window);
     if (width <= 0) width = 1;
     if (height <= 0) height = 1;
-    
+
+    // 记录实际窗口尺寸和方向（用于调试）
+    bool is_landscape = (width > height);
+    LOGI("Window size: %dx%d, landscape: %d", width, height, is_landscape);
+
     auto swap_ret = swapchain_builder.set_old_swapchain(VK_NULL_HANDLE)
                                      // 使用更通用的格式选择
                                      .add_fallback_format({ VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR })
                                      .add_fallback_format({ VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR })
-                                     // 使用更兼容的呈现模式
-                                     .add_fallback_present_mode(VK_PRESENT_MODE_FIFO_KHR)
+                                     // IMMEDIATE: 优先最低显示延迟；不支持时退回 MAILBOX/FIFO
+                                     .set_desired_present_mode(VK_PRESENT_MODE_IMMEDIATE_KHR)
                                      .add_fallback_present_mode(VK_PRESENT_MODE_MAILBOX_KHR)
-                                     .add_fallback_present_mode(VK_PRESENT_MODE_IMMEDIATE_KHR)
+                                     .add_fallback_present_mode(VK_PRESENT_MODE_FIFO_KHR)
                                      .set_desired_extent(width, height)
                                      .set_pre_transform_flags(VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
                                      .set_image_usage_flags(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
                                      .build();
     if (!swap_ret) {
-        __android_log_print(ANDROID_LOG_ERROR, "VulkanApp", 
-                          "Failed to create swapchain: %s", swap_ret.error().message().c_str());
+        LOGE("Failed to create swapchain: %s", swap_ret.error().message().c_str());
         return false;
     }
     auto vkb_swap = swap_ret.value();
+
+    // 记录实际使用的 present mode
+    LOGI("Swapchain created with present mode: %d (IMMEDIATE=0, FIFO=2, MAILBOX=3)", vkb_swap.present_mode);
 
     swapchain = vkb_swap.swapchain;
     swapchainImages = vkb_swap.get_images().value();
     swapchainImageViews = vkb_swap.get_image_views().value();
     gSwapchainExtent = vkb_swap.extent;
     imageCount = (uint32_t)swapchainImages.size();
-    imagesInFlight.resize(swapchainImages.size(), VK_NULL_HANDLE);
+    // 必须先 clear 再 assign，否则 resize 不会覆盖已有元素，
+    // reinit 后 imagesInFlight 里会残留上次已销毁的 fence 句柄，
+    // frame_render 用它调用 vkWaitForFences 导致 Segfault。
+    imagesInFlight.clear();
+    imagesInFlight.assign(imageCount, VK_NULL_HANDLE);
     
     // 5. RenderPass - 添加子通道依赖
     VkAttachmentDescription color_attachment{};
@@ -156,8 +172,7 @@ bool VulkanApp::init(ANativeWindow* window) {
     
     result = vkCreateRenderPass(device, &rp_info, nullptr, &renderPass);
     if (result != VK_SUCCESS) {
-        __android_log_print(ANDROID_LOG_ERROR, "VulkanApp", 
-                          "Failed to create render pass: %d", result);
+        LOGE("Failed to create render pass: %d", result);
         return false;
     }
     imageAvailableSemaphores.resize(maxFramesInFlight);
@@ -170,15 +185,13 @@ bool VulkanApp::init(ANativeWindow* window) {
         
         VkResult result = vkCreateSemaphore(device, &sem_info, nullptr, &imageAvailableSemaphores[i]);
         if (result != VK_SUCCESS) {
-            __android_log_print(ANDROID_LOG_ERROR, "VulkanApp", 
-                              "Failed to create imageAvailable semaphore %zu: %d", i, result);
+            LOGE("Failed to create imageAvailable semaphore %zu: %d", i, result);
             return false;
         }
         
         result = vkCreateSemaphore(device, &sem_info, nullptr, &renderFinishedSemaphores[i]);
         if (result != VK_SUCCESS) {
-            __android_log_print(ANDROID_LOG_ERROR, "VulkanApp", 
-                              "Failed to create renderFinished semaphore %zu: %d", i, result);
+            LOGE("Failed to create renderFinished semaphore %zu: %d", i, result);
             return false;
         }
         
@@ -188,14 +201,11 @@ bool VulkanApp::init(ANativeWindow* window) {
         
         result = vkCreateFence(device, &fence_info, nullptr, &inFlightFences[i]);
         if (result != VK_SUCCESS) {
-            __android_log_print(ANDROID_LOG_ERROR, "VulkanApp", 
-                              "Failed to create inFlight fence %zu: %d", i, result);
+            LOGE("Failed to create inFlight fence %zu: %d", i, result);
             return false;
         }
     }
     // 6. Framebuffers + per-frame data - 修复帧数据结构
-    frames.resize(imageCount);  
-
     frames.resize(maxFramesInFlight);
     for (uint32_t i = 0; i < maxFramesInFlight; i++) {
         // Command Pool + Buffer
@@ -240,7 +250,7 @@ bool VulkanApp::init(ANativeWindow* window) {
         }
     }
     
-    imagesInFlight.resize(imageCount, VK_NULL_HANDLE);
+    // imagesInFlight already initialized with clear+assign above
     currentFrame = 0;
 
 
@@ -267,66 +277,118 @@ bool VulkanApp::init(ANativeWindow* window) {
     
     result = vkCreateDescriptorPool(device, &pool_info, nullptr, &descriptorPool);
     if (result != VK_SUCCESS) {
-        __android_log_print(ANDROID_LOG_ERROR, "VulkanApp", 
-                          "Failed to create descriptor pool: %d", result);
+        LOGE("Failed to create descriptor pool: %d", result);
         return false;
     }
 
-    __android_log_print(ANDROID_LOG_INFO, "VulkanApp", 
-                        "Vulkan initialization successful. Swapchain: %dx%d, Images: %d", 
-                        gSwapchainExtent.width, gSwapchainExtent.height, imageCount);
-    
+    LOGI("Vulkan initialization successful. Swapchain: %dx%d, Images: %d",
+         gSwapchainExtent.width, gSwapchainExtent.height, imageCount);
+
+    initialized = true;
     return true;
 }
 
 void VulkanApp::cleanup() {
+    if (!initialized) {
+        LOGI("Not initialized, skipping cleanup");
+        return;
+    }
+
     vkDeviceWaitIdle(device);
 
-    // 销毁 per-frame
+    // 销毁 per-frame 命令池、同步对象
     for (auto& f : frames) {
-        vkDestroyFence(device, f.inFlight, nullptr);
-        vkDestroySemaphore(device, f.imageAvailable, nullptr);
-        vkDestroySemaphore(device, f.renderFinished, nullptr);
-        vkDestroyCommandPool(device, f.cmdPool, nullptr);
-        vkDestroyFramebuffer(device, f.framebuffer, nullptr);
+        if (f.inFlight != VK_NULL_HANDLE)
+            vkDestroyFence(device, f.inFlight, nullptr);
+        if (f.imageAvailable != VK_NULL_HANDLE)
+            vkDestroySemaphore(device, f.imageAvailable, nullptr);
+        if (f.renderFinished != VK_NULL_HANDLE)
+            vkDestroySemaphore(device, f.renderFinished, nullptr);
+        if (f.cmdPool != VK_NULL_HANDLE)
+            vkDestroyCommandPool(device, f.cmdPool, nullptr);
+        // f.framebuffer 在此架构下未实际使用，真正使用的是 swapchainFramebuffers
+    }
+    frames.clear();
+
+    // 销毁全局同步对象
+    for (auto s : imageAvailableSemaphores)
+        if (s != VK_NULL_HANDLE) vkDestroySemaphore(device, s, nullptr);
+    imageAvailableSemaphores.clear();
+
+    for (auto s : renderFinishedSemaphores)
+        if (s != VK_NULL_HANDLE) vkDestroySemaphore(device, s, nullptr);
+    renderFinishedSemaphores.clear();
+
+    for (auto f : inFlightFences)
+        if (f != VK_NULL_HANDLE) vkDestroyFence(device, f, nullptr);
+    inFlightFences.clear();
+
+    // 关键：清除 imagesInFlight，防止 reinit 后残留旧 fence 句柄导致 vkWaitForFences 崩溃
+    imagesInFlight.clear();
+
+    // 销毁实际使用的 swapchainFramebuffers
+    for (auto fb : swapchainFramebuffers)
+        if (fb != VK_NULL_HANDLE) vkDestroyFramebuffer(device, fb, nullptr);
+    swapchainFramebuffers.clear();
+
+    // 销毁 swapchain image views
+    for (auto view : swapchainImageViews)
+        if (view != VK_NULL_HANDLE) vkDestroyImageView(device, view, nullptr);
+    swapchainImageViews.clear();
+    swapchainImages.clear();
+
+    if (swapchain != VK_NULL_HANDLE) {
+        vkDestroySwapchainKHR(device, swapchain, nullptr);
+        swapchain = VK_NULL_HANDLE;
+    }
+    if (renderPass != VK_NULL_HANDLE) {
+        vkDestroyRenderPass(device, renderPass, nullptr);
+        renderPass = VK_NULL_HANDLE;
+    }
+    if (descriptorPool != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(device, descriptorPool, nullptr);
+        descriptorPool = VK_NULL_HANDLE;
+    }
+    if (surface != VK_NULL_HANDLE) {
+        vkDestroySurfaceKHR(instance, surface, nullptr);
+        surface = VK_NULL_HANDLE;
+    }
+    if (device != VK_NULL_HANDLE) {
+        vkDestroyDevice(device, nullptr);
+        device = VK_NULL_HANDLE;
+    }
+    if (instance != VK_NULL_HANDLE) {
+        vkDestroyInstance(instance, nullptr);
+        instance = VK_NULL_HANDLE;
     }
 
-    // 销毁 swapchain 资源
-    for (auto view : swapchainImageViews) {
-        vkDestroyImageView(device, view, nullptr);
-    }
-    vkDestroySwapchainKHR(device, swapchain, nullptr);
-
-    vkDestroyRenderPass(device, renderPass, nullptr);
-    vkDestroyDescriptorPool(device, descriptorPool, nullptr);
-    vkDestroySurfaceKHR(instance, surface, nullptr);
-
-    vkDestroyDevice(device, nullptr);
-    vkDestroyInstance(instance, nullptr);
+    physicalDevice = VK_NULL_HANDLE;
+    graphicsQueue = VK_NULL_HANDLE;
+    initialized = false;
+    LOGI("Cleanup complete");
 }
 
 
 bool VulkanApp::rebuildSwapchain(ANativeWindow* window) {
     // 等待设备空闲，确保没有正在使用的资源
     vkDeviceWaitIdle(device);
-    
-    __android_log_print(ANDROID_LOG_INFO, "VulkanApp", "Starting swapchain rebuild");
-    
+
+    LOGI("Starting swapchain rebuild");
+
     // 1. 清理旧的 framebuffers 和相关资源
     cleanupSwapchainResources();
-    
+
     // 2. 获取新的窗口尺寸
     int32_t width = ANativeWindow_getWidth(window);
     int32_t height = ANativeWindow_getHeight(window);
-    
+
     // 处理窗口最小化或无效尺寸
     if (width <= 0 || height <= 0) {
-        __android_log_print(ANDROID_LOG_WARN, "VulkanApp", 
-                          "Invalid window size: %dx%d, waiting for valid size", width, height);
+        LOGW("Invalid window size: %dx%d, waiting for valid size", width, height);
         return false; // 返回 false 但不是错误，调用者应该稍后重试
     }
-    
-    __android_log_print(ANDROID_LOG_INFO, "VulkanApp", "New window size: %dx%d", width, height);
+
+    LOGI("Rebuilding swapchain: %dx%d", width, height);
     
     // 3. 创建新的 swapchain
     // 需要重新获取 vkb::Device 来创建 swapchain builder
@@ -340,16 +402,17 @@ bool VulkanApp::rebuildSwapchain(ANativeWindow* window) {
     auto swap_ret = swapchain_builder.set_old_swapchain(swapchain) // 重用旧 swapchain
                                      .add_fallback_format({ VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR })
                                      .add_fallback_format({ VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR })
-                                     .add_fallback_present_mode(VK_PRESENT_MODE_FIFO_KHR)
+                                     // IMMEDIATE: 优先最低显示延迟；不支持时退回 MAILBOX/FIFO
+                                     .set_desired_present_mode(VK_PRESENT_MODE_IMMEDIATE_KHR)
                                      .add_fallback_present_mode(VK_PRESENT_MODE_MAILBOX_KHR)
-                                     .add_fallback_present_mode(VK_PRESENT_MODE_IMMEDIATE_KHR)
+                                     .add_fallback_present_mode(VK_PRESENT_MODE_FIFO_KHR)
                                      .set_desired_extent(width, height)
+                                     .set_pre_transform_flags(VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
                                      .set_image_usage_flags(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
                                      .build();
     
     if (!swap_ret) {
-        __android_log_print(ANDROID_LOG_ERROR, "VulkanApp", 
-                          "Failed to rebuild swapchain: %s", swap_ret.error().message().c_str());
+        LOGE("Failed to rebuild swapchain: %s", swap_ret.error().message().c_str());
         return false;
     }
     
@@ -367,15 +430,13 @@ bool VulkanApp::rebuildSwapchain(ANativeWindow* window) {
     
     uint32_t newImageCount = (uint32_t)swapchainImages.size();
     
-    __android_log_print(ANDROID_LOG_INFO, "VulkanApp", 
-                        "New swapchain created: %dx%d, %d images", 
-                        gSwapchainExtent.width, gSwapchainExtent.height, newImageCount);
+    LOGI("New swapchain created: %dx%d, %d images",
+         gSwapchainExtent.width, gSwapchainExtent.height, newImageCount);
     
     // 6. 如果图像数量变化，需要调整帧数据
     if (newImageCount != imageCount) {
-        __android_log_print(ANDROID_LOG_INFO, "VulkanApp", 
-                          "Image count changed from %d to %d, recreating frame data", 
-                          imageCount, newImageCount);
+        LOGI("Image count changed from %d to %d, recreating frame data",
+             imageCount, newImageCount);
         
         // 清理旧的帧数据
         cleanupFrameData();
@@ -395,7 +456,7 @@ bool VulkanApp::rebuildSwapchain(ANativeWindow* window) {
         return false;
     }
     
-    __android_log_print(ANDROID_LOG_INFO, "VulkanApp", "Swapchain rebuild completed successfully");
+    LOGI("Swapchain rebuild completed successfully");
     return true;
 }
 
@@ -454,8 +515,7 @@ bool VulkanApp::createFrameData() {
         
         VkResult result = vkCreateCommandPool(device, &pool_info, nullptr, &frames[i].cmdPool);
         if (result != VK_SUCCESS) {
-            __android_log_print(ANDROID_LOG_ERROR, "VulkanApp", 
-                              "Failed to create command pool %d: %d", i, result);
+            LOGE("Failed to create command pool %d: %d", i, result);
             return false;
         }
 
@@ -467,8 +527,7 @@ bool VulkanApp::createFrameData() {
         
         result = vkAllocateCommandBuffers(device, &alloc_info, &frames[i].cmd);
         if (result != VK_SUCCESS) {
-            __android_log_print(ANDROID_LOG_ERROR, "VulkanApp", 
-                              "Failed to allocate command buffer %d: %d", i, result);
+            LOGE("Failed to allocate command buffer %d: %d", i, result);
             return false;
         }
 
@@ -478,15 +537,13 @@ bool VulkanApp::createFrameData() {
         
         result = vkCreateSemaphore(device, &sem_info, nullptr, &frames[i].imageAvailable);
         if (result != VK_SUCCESS) {
-            __android_log_print(ANDROID_LOG_ERROR, "VulkanApp", 
-                              "Failed to create image available semaphore %d: %d", i, result);
+            LOGE("Failed to create image available semaphore %d: %d", i, result);
             return false;
         }
         
         result = vkCreateSemaphore(device, &sem_info, nullptr, &frames[i].renderFinished);
         if (result != VK_SUCCESS) {
-            __android_log_print(ANDROID_LOG_ERROR, "VulkanApp", 
-                              "Failed to create render finished semaphore %d: %d", i, result);
+            LOGE("Failed to create render finished semaphore %d: %d", i, result);
             return false;
         }
 
@@ -496,8 +553,7 @@ bool VulkanApp::createFrameData() {
         
         result = vkCreateFence(device, &fence_info, nullptr, &frames[i].inFlight);
         if (result != VK_SUCCESS) {
-            __android_log_print(ANDROID_LOG_ERROR, "VulkanApp", 
-                              "Failed to create in flight fence %d: %d", i, result);
+            LOGE("Failed to create in flight fence %d: %d", i, result);
             return false;
         }
     }
@@ -519,8 +575,7 @@ bool VulkanApp::createFramebuffers() {
         
         VkResult result = vkCreateFramebuffer(device, &fb_info, nullptr, &frames[i].framebuffer);
         if (result != VK_SUCCESS) {
-            __android_log_print(ANDROID_LOG_ERROR, "VulkanApp", 
-                              "Failed to create framebuffer %d: %d", i, result);
+            LOGE("Failed to create framebuffer %d: %d", i, result);
             return false;
         }
     }
@@ -531,13 +586,13 @@ bool VulkanApp::createFramebuffers() {
 bool VulkanApp::handleWindowResize(ANativeWindow* window) {
     int32_t width = ANativeWindow_getWidth(window);
     int32_t height = ANativeWindow_getHeight(window);
-    
+
     // 检查是否需要重建
-    if (width == (int32_t)gSwapchainExtent.width && 
+    if (width == (int32_t)gSwapchainExtent.width &&
         height == (int32_t)gSwapchainExtent.height) {
         return true; // 尺寸没有变化，无需重建
     }
-    
+    LOGI("Window resize: %dx%d -> %dx%d",
+         gSwapchainExtent.width, gSwapchainExtent.height, width, height);
     return rebuildSwapchain(window);
-
 }

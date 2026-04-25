@@ -1,0 +1,82 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct SceneTriangle {
+    vec4 a;
+    vec4 b;
+    vec4 c;
+};
+
+struct VisibilityRayQuery {
+    vec4 start;
+    vec4 end;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer TriangleBuffer {
+    SceneTriangle items[];
+} triangles;
+
+layout(std430, set = 0, binding = 1) readonly buffer QueryBuffer {
+    VisibilityRayQuery items[];
+} queries;
+
+layout(std430, set = 0, binding = 2) readonly buffer ConfigBuffer {
+    vec4 counts;
+} config;
+
+layout(std430, set = 0, binding = 3) writeonly buffer ResultBuffer {
+    uint visible[];
+} results;
+
+bool RayIntersectsTriangle(vec3 start, vec3 end, vec3 a, vec3 b, vec3 c) {
+    vec3 dir = end - start;
+    vec3 edge1 = b - a;
+    vec3 edge2 = c - a;
+    vec3 pvec = cross(dir, edge2);
+    float det = dot(edge1, pvec);
+    const float epsilon = 1e-4;
+    if (abs(det) < epsilon) {
+        return false;
+    }
+
+    float invDet = 1.0 / det;
+    vec3 tvec = start - a;
+    float u = dot(tvec, pvec) * invDet;
+    if (u < 0.0 || u > 1.0) {
+        return false;
+    }
+
+    vec3 qvec = cross(tvec, edge1);
+    float v = dot(dir, qvec) * invDet;
+    if (v < 0.0 || u + v > 1.0) {
+        return false;
+    }
+
+    float t = dot(edge2, qvec) * invDet;
+    return t >= 0.0 && t <= 1.0;
+}
+
+void main() {
+    uint queryIndex = gl_GlobalInvocationID.x;
+    uint queryCount = uint(config.counts.x);
+    uint triangleCount = uint(config.counts.y);
+    if (queryIndex >= queryCount) {
+        return;
+    }
+
+    VisibilityRayQuery query = queries.items[queryIndex];
+    vec3 start = query.start.xyz;
+    vec3 end = query.end.xyz;
+    uint visible = 1u;
+
+    for (uint triangleIndex = 0u; triangleIndex < triangleCount; ++triangleIndex) {
+        SceneTriangle tri = triangles.items[triangleIndex];
+        if (RayIntersectsTriangle(start, end, tri.a.xyz, tri.b.xyz, tri.c.xyz)) {
+            visible = 0u;
+            break;
+        }
+    }
+
+    results.visible[queryIndex] = visible;
+}
