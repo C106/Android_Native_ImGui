@@ -16,6 +16,7 @@
 #include <atomic>
 #include <chrono>
 #include <algorithm>
+#include <initializer_list>
 #include <unistd.h>
 #include <jni.h>
 #define ResolveMethod(ClassName, MethodName, Handle, MethodSignature)                                                                    \
@@ -151,6 +152,7 @@ namespace android
             };
 
             size_t systemVersion = 13;
+            bool SurfaceBlurRegionsAllowed = false;
 
             void (*RefBase__IncStrong)(void *thiz, void *id) = nullptr;
             void (*RefBase__DecStrong)(void *thiz, void *id) = nullptr;
@@ -174,6 +176,8 @@ namespace android
             StrongPointer<void> (*SurfaceComposerClient__GetBuiltInDisplay)(ui::DisplayType type) = nullptr;
             int32_t (*SurfaceComposerClient__GetDisplayState)(StrongPointer<void> &display, ui::DisplayState *displayState) = nullptr;
             int32_t (*SurfaceComposerClient__GetDisplayInfo)(StrongPointer<void> &display, ui::DisplayInfo *displayInfo) = nullptr;
+            // Avoid calling this across libgui's C++ ABI. Some vendor builds abort
+            // with libc++ length_error("vector") when returning std::vector here.
             std::vector<ui::PhysicalDisplayId> (*SurfaceComposerClient__GetPhysicalDisplayIds)() = nullptr;
             StrongPointer<void> (*SurfaceComposerClient__GetPhysicalDisplayToken)(ui::PhysicalDisplayId displayId) = nullptr;
 
@@ -190,15 +194,83 @@ namespace android
             StrongPointer<Surface> (*SurfaceControl__GetSurface)(void *thiz) = nullptr;
             void (*SurfaceControl__DisConnect)(void *thiz) = nullptr;
 
+            static std::string ReadSystemProperty(const char *name)
+            {
+                char value[PROP_VALUE_MAX] = {};
+                const int length = __system_property_get(name, value);
+                return length > 0 ? std::string(value, static_cast<size_t>(length)) : std::string();
+            }
+
+            static std::string ToLower(std::string value)
+            {
+                std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+                    return static_cast<char>(std::tolower(ch));
+                });
+                return value;
+            }
+
+            static bool PropertyEquals(const char *name, const char *expected)
+            {
+                return ToLower(ReadSystemProperty(name)) == expected;
+            }
+
+            static bool PropertyContainsAny(const char *name, const std::initializer_list<const char *> &needles)
+            {
+                const std::string value = ToLower(ReadSystemProperty(name));
+                if (value.empty()) return false;
+
+                for (const char *needle : needles) {
+                    if (value.find(needle) != std::string::npos) return true;
+                }
+                return false;
+            }
+
+            bool IsBlurRegionsDeviceSupported(const SymbolMethod &symbolMethod, void *libgui) const
+            {
+                if (PropertyEquals("persist.hpjy.force_blur_regions", "1") ||
+                    PropertyEquals("debug.hpjy.force_blur_regions", "1")) {
+                    __android_log_print(ANDROID_LOG_WARN, "ImGui",
+                                        "[*] Surface blur regions force-enabled by property");
+                    return true;
+                }
+
+                if (PropertyEquals("persist.hpjy.disable_blur_regions", "1") ||
+                    PropertyEquals("debug.hpjy.disable_blur_regions", "1")) {
+                    __android_log_print(ANDROID_LOG_WARN, "ImGui",
+                                        "[-] Surface blur regions disabled by property");
+                    return false;
+                }
+
+                if (systemVersion < 12) {
+                    __android_log_print(ANDROID_LOG_WARN, "ImGui",
+                                        "[-] Surface blur regions disabled: Android %zu is unsupported",
+                                        systemVersion);
+                    return false;
+                }
+
+                const bool hasMiuiLibgui =
+                    symbolMethod.Find(libgui, "_ZN7android15MiuiTransaction19getMiuiDisplayStateERKNS_2spINS_7IBinderEEE") ||
+                    symbolMethod.Find(libgui, "_ZN7android21MiSurfaceComposerStub23setMiuiTransactionStateERKNS_6VectorINS_16MiuiDisplayStateEEEjlRKNS_2spINS_7IBinderEEERKNS_8String16Ej");
+                if (hasMiuiLibgui ||
+                    !ReadSystemProperty("ro.miui.ui.version.name").empty() ||
+                    !ReadSystemProperty("ro.mi.os.version.name").empty() ||
+                    PropertyContainsAny("ro.product.manufacturer", {"xiaomi", "redmi", "poco", "blackshark"}) ||
+                    PropertyContainsAny("ro.product.brand", {"xiaomi", "redmi", "poco", "blackshark"})) {
+                    __android_log_print(ANDROID_LOG_WARN, "ImGui",
+                                        "[-] Surface blur regions disabled: non-standard MIUI/libgui vector ABI");
+                    return false;
+                }
+
+                return true;
+            }
+
             Functionals(const SymbolMethod &symbolMethod)
             {
-                std::string systemVersionString(128, 0);
-
-               // systemVersionString.resize(__system_property_get("ro.build.version.release", systemVersionString.data()));
-				
-				systemVersionString.resize(__system_property_get("ro.build.version.release", (char*)systemVersionString.data()));
-  if (!systemVersionString.empty())
-                    systemVersion = std::stoi(systemVersionString);
+                char systemVersionBuffer[PROP_VALUE_MAX] = {};
+                const int versionLength = __system_property_get("ro.build.version.release", systemVersionBuffer);
+                if (versionLength > 0) {
+                    systemVersion = static_cast<size_t>(strtoul(systemVersionBuffer, nullptr, 10));
+                }
 
                 if (9 > systemVersion)
                 {
@@ -345,6 +417,11 @@ namespace android
                 } else {
                     __android_log_print(ANDROID_LOG_WARN, "ImGui", "[-] Surface blur regions unavailable on this build");
                 }
+                SurfaceBlurRegionsAllowed = SurfaceComposerClient__Transaction__SetBlurRegions &&
+                                            IsBlurRegionsDeviceSupported(symbolMethod, libgui);
+                if (!SurfaceBlurRegionsAllowed) {
+                    SurfaceComposerClient__Transaction__SetBlurRegions = nullptr;
+                }
                 ResolveMethod(SurfaceComposerClient__Transaction, Apply, libgui, "_ZN7android21SurfaceComposerClient11Transaction5applyEbb");
 
                 ResolveMethod(SurfaceControl, Validate, libgui, "_ZNK7android14SurfaceControl8validateEv");
@@ -363,8 +440,12 @@ namespace android
                     }
                 }
 
-                symbolMethod.Close(libutils);
-                symbolMethod.Close(libgui);
+                // Keep libgui/libutils loaded for the lifetime of this process.
+                // Some vendor builds unload code/data after dlclose even though we
+                // keep raw function pointers, causing a segfault immediately after
+                // symbol resolution when SurfaceComposerClient is constructed.
+                (void)libutils;
+                (void)libgui;
             }
 
             static const Functionals &GetInstance(const SymbolMethod &symbolMethod = {.Open = dlopen, .Find = dlsym, .Close = dlclose}) {
@@ -700,19 +781,33 @@ namespace android
         {
             char data[1024];
             void *strongRefId = nullptr;
+            bool valid = false;
 
             SurfaceComposerClient()
             {
+                if (!Functionals::GetInstance().SurfaceComposerClient__Constructor ||
+                    !Functionals::GetInstance().RefBase__IncStrong ||
+                    !Functionals::GetInstance().RefBase__DecStrong) {
+                    __android_log_print(ANDROID_LOG_ERROR, "ImGui",
+                                        "[-] SurfaceComposerClient constructor/refbase symbols unavailable");
+                    return;
+                }
+
+                __android_log_print(ANDROID_LOG_INFO, "ImGui",
+                                    "[*] Constructing SurfaceComposerClient");
                 Functionals::GetInstance().SurfaceComposerClient__Constructor(data);
                 // Use a heap token as the strong-ref id. tempClient is often stack-allocated
                 // in DetectAndCreateVirtualDisplayMirrors(), and RefBase rejects stack ids.
                 strongRefId = new char;
                 Functionals::GetInstance().RefBase__IncStrong(data, strongRefId);
+                valid = true;
+                __android_log_print(ANDROID_LOG_INFO, "ImGui",
+                                    "[+] SurfaceComposerClient constructed");
             }
 
             ~SurfaceComposerClient()
             {
-                if (strongRefId != nullptr) {
+                if (valid && strongRefId != nullptr && Functionals::GetInstance().RefBase__DecStrong) {
                     Functionals::GetInstance().RefBase__DecStrong(data, strongRefId);
                     delete static_cast<char *>(strongRefId);
                     strongRefId = nullptr;
@@ -720,6 +815,26 @@ namespace android
             }
 
             SurfaceControl CreateSurface(const char *name, int32_t width, int32_t height, bool skipScrenshot) {
+                if (!valid) {
+                    __android_log_print(ANDROID_LOG_ERROR, "ImGui",
+                                        "[-] CreateSurface skipped: SurfaceComposerClient invalid");
+                    return {};
+                }
+
+                if (width <= 0 || height <= 0 ||
+                    (Functionals::GetInstance().systemVersion == 9 &&
+                     !Functionals::GetInstance().SurfaceComposerClient__CreateSurface_and9) ||
+                    (Functionals::GetInstance().systemVersion >= 10 &&
+                     !Functionals::GetInstance().SurfaceComposerClient__CreateSurface)) {
+                    __android_log_print(ANDROID_LOG_ERROR, "ImGui",
+                                        "[-] CreateSurface unavailable or invalid size: %dx%d",
+                                        width, height);
+                    return {};
+                }
+
+                __android_log_print(ANDROID_LOG_INFO, "ImGui",
+                                    "[*] SurfaceComposerClient::CreateSurface enter: %s %dx%d",
+                                    name ? name : "(null)", width, height);
                 String8 windowName(name);
                 LayerMetadata layerMetadata;
 
@@ -770,6 +885,10 @@ namespace android
                     // Android 10+: 使用 LayerMetadata (包含 2038 身份)
                     result = Functionals::GetInstance().SurfaceComposerClient__CreateSurface(data, windowName, width, height, 1, flags, parentHandle, layerMetadata, nullptr);
                 }
+
+                __android_log_print(ANDROID_LOG_INFO, "ImGui",
+                                    "[*] SurfaceComposerClient::CreateSurface result=%p",
+                                    result.get());
 
                 SurfaceControl sc{result.get()};
 
@@ -869,6 +988,8 @@ namespace android
 
             bool GetDisplayInfo(ui::DisplayState *displayInfo)
             {
+                if (!valid) return false;
+
                 StrongPointer<void> defaultDisplay;
 
                 if (Functionals::GetInstance().SurfaceComposerClient__GetPhysicalDisplayIds &&
@@ -1064,8 +1185,24 @@ namespace android
                 break;
             }
 
+            if (width <= 0 || height <= 0) {
+                DisplayInfo fallback = GetDisplayInfo();
+                width = fallback.width > 0 ? fallback.width : 1920;
+                height = fallback.height > 0 ? fallback.height : 1080;
+            }
+
             auto surfaceControl = surfaceComposerClient.CreateSurface(name, width, height, skipScrenshot_);
+            if (!surfaceControl.data) {
+                __android_log_print(ANDROID_LOG_ERROR, "ImGui",
+                                    "[-] CreateSurface returned null SurfaceControl");
+                return nullptr;
+            }
             auto nativeWindow = reinterpret_cast<ANativeWindow *>(surfaceControl.GetSurface());
+            if (!nativeWindow) {
+                __android_log_print(ANDROID_LOG_ERROR, "ImGui",
+                                    "[-] SurfaceControl::GetSurface returned null");
+                return nullptr;
+            }
 
             m_cachedSurfaceControl.emplace(nativeWindow, std::move(surfaceControl));
             return nativeWindow;
