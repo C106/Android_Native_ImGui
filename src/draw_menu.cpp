@@ -964,6 +964,15 @@ static void RegisterCameraPage(MenuRegistry& registry) {
     pd.AddFloat("output_scale_x", "X 输出倍率", &cfg.outputScaleX, 0.5f, 1.8f, "%.2f");
     pd.AddFloat("output_scale_y", "Y 输出倍率", &cfg.outputScaleY, 0.5f, 1.8f, "%.2f");
 
+    MenuSectionSpec& assistMotion = page.AddSection("assist_motion", "Assist 移动曲线", MenuColumn::Right);
+    assistMotion.VisibleIf([&cfg] { return cfg.aimMode == AUTO_AIM_MODE_ASSIST; });
+    assistMotion.AddBool("assist_humanized_motion", "启用移动曲线", &cfg.assistHumanizedMotion)
+        .Tooltip("Assist 模式下对靠近目标的过程加入起步/收尾减速和轻微弧线，模拟真实手动拉枪");
+    assistMotion.AddFloat("assist_speed_curve", "速度曲线强度", &cfg.assistSpeedCurveStrength, 0.0f, 1.0f, "%.2f")
+        .Tooltip("越高起步和接近目标时越慢，中段移动速度保持更高");
+    assistMotion.AddFloat("assist_trajectory_curve", "轨迹弯曲强度", &cfg.assistTrajectoryCurveStrength, 0.0f, 0.35f, "%.2f")
+        .Tooltip("越高路径中段越偏离直线，收尾会回到真实目标点");
+
     MenuSectionSpec& humanize = page.AddSection("humanize", "人手噪声", MenuColumn::Right);
     humanize.AddBool("humanize_noise", "启用人手噪声", &cfg.humanizeNoise)
         .Tooltip("为最终陀螺仪输出增加平滑随机漂移和轻微颤动，模拟真实手搓微调");

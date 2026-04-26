@@ -126,6 +126,65 @@ static Vec2 ApplyHumanizeNoise(const AutoAimConfig& config, TargetState& state,
     return state.debugNoise;
 }
 
+static Vec2 ApplyAssistMotionCurve(const AutoAimConfig& config, TargetState& state,
+                                   uint64_t targetActor, int targetBone,
+                                   const Vec2& aimPos, const Vec2& screenCenter,
+                                   float shortSide, float& outSpeedScale) {
+    outSpeedScale = 1.0f;
+    state.debugAssistMotionAim = aimPos;
+    state.debugAssistSpeedScale = 1.0f;
+    state.debugAssistCurveOffset = 0.0f;
+
+    if (!config.assistHumanizedMotion) {
+        state.assistMotionActor = 0;
+        state.assistMotionBone = -1;
+        state.assistMotionInitialDistance = 0.0f;
+        state.assistMotionProgress = 0.0f;
+        return aimPos;
+    }
+
+    const Vec2 toTarget = aimPos - screenCenter;
+    const float distance = std::sqrt(toTarget.x * toTarget.x + toTarget.y * toTarget.y);
+    if (distance < 1.0f) {
+        state.assistMotionProgress = 1.0f;
+        return aimPos;
+    }
+
+    const bool newMotion =
+        state.assistMotionActor != targetActor ||
+        state.assistMotionBone != targetBone ||
+        state.assistMotionInitialDistance < 1.0f ||
+        distance > state.assistMotionInitialDistance * 1.35f;
+    if (newMotion) {
+        state.assistMotionActor = targetActor;
+        state.assistMotionBone = targetBone;
+        state.assistMotionInitialDistance = std::max(distance, 1.0f);
+        state.assistMotionProgress = 0.0f;
+        state.assistMotionCurveSign = NextNoiseUnit(state.noiseSeed) >= 0.0f ? 1.0f : -1.0f;
+    }
+
+    const float initialDistance = std::max(state.assistMotionInitialDistance, distance);
+    const float progress = std::clamp(1.0f - distance / std::max(initialDistance, 1.0f), 0.0f, 1.0f);
+    state.assistMotionProgress = std::max(state.assistMotionProgress * 0.92f, progress);
+    const float t = std::clamp(state.assistMotionProgress, 0.0f, 1.0f);
+    const float midEnvelope = std::sin(t * static_cast<float>(M_PI));
+
+    const float speedStrength = std::clamp(config.assistSpeedCurveStrength, 0.0f, 1.0f);
+    const float curvedSpeed = 0.55f + 0.45f * std::pow(std::max(midEnvelope, 0.0f), 0.70f);
+    outSpeedScale = 1.0f + (curvedSpeed - 1.0f) * speedStrength;
+
+    const float curveStrength = std::clamp(config.assistTrajectoryCurveStrength, 0.0f, 0.35f);
+    const float curveBase = std::min(initialDistance, shortSide * 0.35f);
+    const float curveOffset = curveBase * curveStrength * (4.0f * t * (1.0f - t));
+    const Vec2 perpendicular(-toTarget.y / distance, toTarget.x / distance);
+    const Vec2 curvedAim = aimPos + perpendicular * (curveOffset * state.assistMotionCurveSign);
+
+    state.debugAssistMotionAim = curvedAim;
+    state.debugAssistSpeedScale = outSpeedScale;
+    state.debugAssistCurveOffset = curveOffset * state.assistMotionCurveSign;
+    return curvedAim;
+}
+
 struct RecoilArrayHeader {
     uint64_t data = 0;
     int32_t num = 0;
@@ -770,6 +829,9 @@ AutoAimController::AutoAimController() {
     config.KdY = 0.01f;
     config.outputScaleX = 1.00f;
     config.outputScaleY = 1.00f;
+    config.assistHumanizedMotion = true;
+    config.assistSpeedCurveStrength = 0.40f;
+    config.assistTrajectoryCurveStrength = 0.10f;
     config.humanizeNoise = false;
     config.noiseStrengthX = 0.18f;
     config.noiseStrengthY = 0.12f;
@@ -814,6 +876,14 @@ void AutoAimController::ResetTarget() {
     targetState.noiseCurrent = Vec2(0, 0);
     targetState.noiseTarget = Vec2(0, 0);
     targetState.debugNoise = Vec2(0, 0);
+    targetState.assistMotionActor = 0;
+    targetState.assistMotionBone = -1;
+    targetState.assistMotionInitialDistance = 0.0f;
+    targetState.assistMotionProgress = 0.0f;
+    targetState.assistMotionCurveSign = 1.0f;
+    targetState.debugAssistMotionAim = Vec2(0, 0);
+    targetState.debugAssistSpeedScale = 1.0f;
+    targetState.debugAssistCurveOffset = 0.0f;
     targetState.magnetEngaged = false;
     targetState.debugMagnetDistance = 0.0f;
     targetState.valid = false;
@@ -1219,6 +1289,18 @@ void AutoAimController::DrawDebugVisuals(const Vec2& targetPos, const Vec2& scre
         ImVec2(hp.x, hp.y + d), ImVec2(hp.x - d, hp.y),
         IM_COL32(0, 255, 255, 160));
 
+    if (config.aimMode == AUTO_AIM_MODE_ASSIST && config.assistHumanizedMotion) {
+        const Vec2& ap = targetState.debugAssistMotionAim;
+        draw_list->AddCircle(
+            ImVec2(ap.x, ap.y),
+            6.0f,
+            IM_COL32(255, 128, 0, 190), 12, 2.0f);
+        draw_list->AddLine(
+            ImVec2(targetPos.x, targetPos.y),
+            ImVec2(ap.x, ap.y),
+            IM_COL32(255, 128, 0, 120), 1.0f);
+    }
+
     // 绘制中心到目标连线
     draw_list->AddLine(
         ImVec2(screenCenter.x, screenCenter.y),
@@ -1274,6 +1356,10 @@ void AutoAimController::DrawDebugVisuals(const Vec2& targetPos, const Vec2& scre
         ImGui::Text("Gyro Sens: %.2f", targetState.debugGyroScale);
         ImGui::Text("Sens Compensate: %.2f", targetState.debugSensCompensate);
         ImGui::Text("Humanize Noise: %.2f, %.2f", targetState.debugNoise.x, targetState.debugNoise.y);
+        ImGui::Text("Assist Curve: speed %.2f / offset %.1f / progress %.2f",
+            targetState.debugAssistSpeedScale,
+            targetState.debugAssistCurveOffset,
+            targetState.assistMotionProgress);
         ImGui::Text("Magnet: %s / Dist %.1f", targetState.magnetEngaged ? "engaged" : "idle",
             targetState.debugMagnetDistance);
         ImGui::Separator();
@@ -1544,6 +1630,9 @@ void AutoAimController::Update(float deltaTime) {
         // l) 前馈 + PD 控制器
         Vec2 gyroAdjust(0, 0);
         if (config.aimMode == AUTO_AIM_MODE_MAGNET) {
+            targetState.debugAssistMotionAim = aimPos;
+            targetState.debugAssistSpeedScale = 1.0f;
+            targetState.debugAssistCurveOffset = 0.0f;
             const bool sameTarget = targetState.valid && targetState.actorAddr == targetActor;
             if (targetState.magnetEngaged) {
                 if (!sameTarget || magnetDistance > magnetReleasePixels) {
@@ -1559,7 +1648,12 @@ void AutoAimController::Update(float deltaTime) {
             }
         } else {
             targetState.magnetEngaged = false;
-            gyroAdjust = ComputePDOutput(aimPos, screenCenter, feedforward, deltaTime, fovScale);
+            float assistSpeedScale = 1.0f;
+            const Vec2 assistAimPos = ApplyAssistMotionCurve(
+                config, targetState, targetActor, targetBone, aimPos, screenCenter,
+                shortSide, assistSpeedScale);
+            gyroAdjust = ComputePDOutput(assistAimPos, screenCenter, feedforward, deltaTime, fovScale);
+            gyroAdjust *= assistSpeedScale;
         }
 
         // 灵敏度补偿：灵敏度越高，同样陀螺仪值转角越大，需要缩小输出
