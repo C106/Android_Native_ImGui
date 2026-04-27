@@ -436,3 +436,8 @@ int get_active_touch_points(TouchPoint* out_points, int max_points) {
 bool has_active_touch_points() {
     return g_active_touch_count > 0;
 }
+
+bool IsTouchSlotActive(int slot) {
+    if (slot < 0 || slot >= kMaxTouchSlots) return false;
+    return g_touch_slots[slot].active;
+}

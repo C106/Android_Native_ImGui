@@ -265,7 +265,7 @@ int main() {
     {
         ImGuiToast toast(ImGuiToastType::Info, 3500);
         toast.setTitle("%s", "程序启动");
-        toast.setContent("%s", "Android_Native_ImGui 已加载");
+        toast.setContent("%s", "Azure核心 已加载");
         ImGui::InsertNotification(toast);
     }
     gRunning = true;

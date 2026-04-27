@@ -26,8 +26,6 @@ constexpr float kHorizontalNearCenterThreshold = 0.012f;
 constexpr float kVerticalNearCenterThreshold = 0.012f;
 constexpr float kHorizontalNearCenterMinScale = 0.50f;
 constexpr float kVerticalNearCenterMinScale = 0.50f;
-constexpr int kTriggerBotTouchSlot = 8;
-
 // 默认值
 constexpr float kDefaultBulletSpeed = 80000.0f;  // 默认子弹速度 cm/s (800 m/s)
 constexpr float kMaxLeadTime = 1.5f;             // 最大预判时间（秒）
@@ -974,27 +972,30 @@ bool AutoAimController::SelectTarget(const Vec2& screenCenter, bool requireVisib
     return false;
 }
 
-void AutoAimController::ReleaseTriggerTouch() {
-    if (triggerTouchDown_ && HasTouchOutputChannel()) {
-        GetDriverManager().touch_up(kTriggerBotTouchSlot);
+void AutoAimController::ReleaseTriggerTouch(bool destroySession) {
+    if (triggerTouchDown_ && triggerTouchSlot_ >= 0 && HasTouchOutputChannel()) {
+        GetDriverManager().touch_up(triggerTouchSlot_);
     }
     triggerTouchDown_ = false;
-    if (triggerTouchReady_ && HasTouchOutputChannel()) {
+    triggerTouchSlot_ = -1;
+    if (destroySession && triggerTouchReady_ && HasTouchOutputChannel()) {
         GetDriverManager().touch_destroy();
     }
-    triggerTouchReady_ = false;
-    triggerTouchMaxX_ = 0;
-    triggerTouchMaxY_ = 0;
+    if (destroySession) {
+        triggerTouchReady_ = false;
+        triggerTouchMaxX_ = 0;
+        triggerTouchMaxY_ = 0;
+    }
 }
 
 void AutoAimController::UpdateTriggerBot(const Vec2& rawScreenCenter) {
     if (!config.triggerBotEnabled) {
-        ReleaseTriggerTouch();
+        ReleaseTriggerTouch(true);
         return;
     }
 
     if (!HasTouchOutputChannel()) {
-        ReleaseTriggerTouch();
+        ReleaseTriggerTouch(true);
         return;
     }
 
@@ -1002,7 +1003,7 @@ void AutoAimController::UpdateTriggerBot(const Vec2& rawScreenCenter) {
     int targetBone = -1;
     Vec2 targetScreenPos;
     if (!SelectTarget(rawScreenCenter, true, targetActor, targetBone, targetScreenPos)) {
-        ReleaseTriggerTouch();
+        ReleaseTriggerTouch(false);
         return;
     }
 
@@ -1021,7 +1022,7 @@ void AutoAimController::UpdateTriggerBot(const Vec2& rawScreenCenter) {
         }
     }
     if (!foundBoneData) {
-        ReleaseTriggerTouch();
+        ReleaseTriggerTouch(false);
         return;
     }
     const BoneScreenData* targetBoneData = &targetBoneDataCopy;
@@ -1065,7 +1066,7 @@ void AutoAimController::UpdateTriggerBot(const Vec2& rawScreenCenter) {
     }
 
     if (!shouldTrigger) {
-        ReleaseTriggerTouch();
+        ReleaseTriggerTouch(false);
         return;
     }
 
@@ -1076,7 +1077,7 @@ void AutoAimController::UpdateTriggerBot(const Vec2& rawScreenCenter) {
     int touchX = 0;
     int touchY = 0;
     if (!MapScreenToTouch(fireButtonScreenX, fireButtonScreenY, touchX, touchY)) {
-        ReleaseTriggerTouch();
+        ReleaseTriggerTouch(false);
         return;
     }
 
@@ -1084,18 +1085,25 @@ void AutoAimController::UpdateTriggerBot(const Vec2& rawScreenCenter) {
         triggerTouchReady_ = GetDriverManager().touch_init(&triggerTouchMaxX_, &triggerTouchMaxY_) &&
                              triggerTouchMaxX_ > 0 && triggerTouchMaxY_ > 0;
         if (!triggerTouchReady_) {
-            ReleaseTriggerTouch();
+            ReleaseTriggerTouch(true);
             return;
         }
     }
 
-    const bool ok = triggerTouchDown_
-        ? GetDriverManager().touch_move(kTriggerBotTouchSlot, touchX, touchY)
-        : GetDriverManager().touch_down(kTriggerBotTouchSlot, touchX, touchY);
+    const int touchSlot = GetDriverManager().preferred_touch_slot();
+    if (!triggerTouchDown_ && IsTouchSlotActive(touchSlot)) {
+        ReleaseTriggerTouch(false);
+        return;
+    }
+
+    const bool ok = (triggerTouchDown_ && triggerTouchSlot_ == touchSlot)
+        ? GetDriverManager().touch_move(touchSlot, touchX, touchY)
+        : GetDriverManager().touch_down(touchSlot, touchX, touchY);
     if (ok) {
         triggerTouchDown_ = true;
+        triggerTouchSlot_ = touchSlot;
     } else {
-        ReleaseTriggerTouch();
+        ReleaseTriggerTouch(true);
     }
 }
 

@@ -1,6 +1,7 @@
 #include "draw_menu.h"
 #include "draw_objects.h"
 #include <banner.h>
+#include <float_png.h>
 #include <logo.h>
 #include "ImGuiLayer.h"
 #include "Gyro.h"
@@ -8,6 +9,7 @@
 #include "driver_manager.h"
 #include "ANativeWindowCreator.h"  // 用于 LayerStack 监控
 #include "game_fps_monitor.h"
+#include "game_frame_reader.h"
 #include "auto_aim.h"
 #include "HwBreakpointMgr4.h"
 #include "TouchScrollable.h"
@@ -44,6 +46,10 @@ static int gLogoHeight = 0;
 static ImTextureID gBannerTexture = (ImTextureID)0;
 static int gBannerWidth = 0;
 static int gBannerHeight = 0;
+static ImTextureID gFloatingBallTexture = (ImTextureID)0;
+static int gFloatingBallWidth = 0;
+static int gFloatingBallHeight = 0;
+static bool gFloatingBallTextureRequested = false;
 
 // 陀螺仪坐标
 float gyro_x = 0, gyro_y = 0;
@@ -71,6 +77,7 @@ static ImVec2 gLastMenuPos(-1.0f, -1.0f);  // 记录 menu 关闭时的位置
 static bool gShowExitConfirmDialog = false;
 static bool gShowDebugOptionsDialog = false;
 static ImVec2 gDebugOptionsWindowPos(-1.0f, -1.0f);
+static bool gEnableFullscreenBlur = false;
 
 static bool IsAnyActiveTouchInsideRect(const ImVec2& min, const ImVec2& max);
 static void DrawExitConfirmOverlay();
@@ -78,39 +85,23 @@ static void DrawDebugOptionsOverlay();
 static void PushMenuWindowStyle();
 static void PopMenuWindowStyle();
 
-static void SyncMenuBlurRegion(bool enabled, const ImVec2& pos = ImVec2(0.0f, 0.0f),
-                               const ImVec2& size = ImVec2(0.0f, 0.0f)) {
+static void EnsureFloatingBallTextureLoaded() {
+    if (gFloatingBallTexture || gFloatingBallTextureRequested) return;
+
+    ImGui_RequestTextureLoad(__float_png,
+                             static_cast<int>(__float_png_len),
+                             &gFloatingBallTexture,
+                             &gFloatingBallWidth,
+                             &gFloatingBallHeight);
+    gFloatingBallTextureRequested = true;
+}
+
+static void SyncFullscreenBlur(bool enabled) {
     static bool s_blur_enabled = false;
-    static int s_left = 0;
-    static int s_top = 0;
-    static int s_right = 0;
-    static int s_bottom = 0;
+    if (enabled == s_blur_enabled) return;
 
-    if (!enabled) {
-        if (s_blur_enabled) {
-            android::ANativeWindowCreator::ClearBlurRegionsForAll();
-            s_blur_enabled = false;
-        }
-        return;
-    }
-
-    const int left = static_cast<int>(std::floor(pos.x));
-    const int top = static_cast<int>(std::floor(pos.y));
-    const int right = static_cast<int>(std::ceil(pos.x + size.x));
-    const int bottom = static_cast<int>(std::ceil(pos.y + size.y));
-
-    if (s_blur_enabled && left == s_left && top == s_top &&
-        right == s_right && bottom == s_bottom) {
-        return;
-    }
-
-    if (android::ANativeWindowCreator::SetBlurRegionForAll(left, top, right, bottom, 36, 1.0f, 15.0f)) {
-        s_blur_enabled = true;
-        s_left = left;
-        s_top = top;
-        s_right = right;
-        s_bottom = bottom;
-    }
+    android::ANativeWindowCreator::SetBackgroundBlurRadiusForAll(enabled ? 36 : 0);
+    s_blur_enabled = enabled;
 }
 
 static bool DrawIconActionButton(const char* id, const char* icon, const ImVec2& pos, const ImVec2& size,
@@ -232,6 +223,9 @@ static void DrawFloatingMenuBall() {
 
     ImGuiIO& io = ImGui::GetIO();
     const ImVec2 ball_size(80.0f, 80.0f);
+    constexpr float kBallVisualPadding = 4.0f;
+    const ImVec2 window_size(ball_size.x + kBallVisualPadding * 2.0f,
+                             ball_size.y + kBallVisualPadding * 2.0f);
     static ImVec2 ball_pos(-1.0f, -1.0f);
     static bool pressing = false;
     static bool moved = false;
@@ -243,14 +237,15 @@ static void DrawFloatingMenuBall() {
         if (gLastMenuPos.x >= 0.0f && gLastMenuPos.y >= 0.0f) {
             ball_pos = gLastMenuPos;
         } else {
-            ball_pos = ImVec2(io.DisplaySize.x - ball_size.x - 26.0f, io.DisplaySize.y * 0.36f);
+            ball_pos = ImVec2(io.DisplaySize.x - window_size.x - 26.0f, io.DisplaySize.y * 0.36f);
         }
     }
-    ball_pos.x = std::clamp(ball_pos.x, 8.0f, std::max(8.0f, io.DisplaySize.x - ball_size.x - 8.0f));
-    ball_pos.y = std::clamp(ball_pos.y, 8.0f, std::max(8.0f, io.DisplaySize.y - ball_size.y - 8.0f));
+    ball_pos.x = std::clamp(ball_pos.x, 8.0f, std::max(8.0f, io.DisplaySize.x - window_size.x - 8.0f));
+    ball_pos.y = std::clamp(ball_pos.y, 8.0f, std::max(8.0f, io.DisplaySize.y - window_size.y - 8.0f));
 
     ImGui::SetNextWindowPos(ball_pos, ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ball_size, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(window_size, ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGuiWindowFlags flags =
         ImGuiWindowFlags_NoDecoration |
         ImGuiWindowFlags_NoSavedSettings |
@@ -262,14 +257,17 @@ static void DrawFloatingMenuBall() {
 
     if (!ImGui::Begin("##FloatingMenuBall", nullptr, flags)) {
         ImGui::End();
+        ImGui::PopStyleVar();
         return;
     }
 
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
-    const ImVec2 min = ImGui::GetCursorScreenPos();
-    const ImVec2 max(min.x + ball_size.x, min.y + ball_size.y);
-    const ImVec2 center((min.x + max.x) * 0.5f, (min.y + max.y) * 0.5f);
+    const ImVec2 min = ImGui::GetWindowPos();
+    const ImVec2 surface_min(min.x + kBallVisualPadding, min.y + kBallVisualPadding);
+    const ImVec2 surface_max(surface_min.x + ball_size.x, surface_min.y + ball_size.y);
+    const ImVec2 center((surface_min.x + surface_max.x) * 0.5f, (surface_min.y + surface_max.y) * 0.5f);
 
+    ImGui::SetCursorScreenPos(surface_min);
     ImGui::InvisibleButton("##floating_menu_ball_surface", ball_size);
     TouchPoint touches[10];
     const int touch_count = has_active_touch_points() ? get_active_touch_points(touches, 10) : 0;
@@ -282,8 +280,8 @@ static void DrawFloatingMenuBall() {
             tracked_touch_active = true;
             touch_pos = ImVec2(touches[i].x, touches[i].y);
         }
-        if (touches[i].x >= min.x && touches[i].x <= max.x &&
-            touches[i].y >= min.y && touches[i].y <= max.y) {
+        if (touches[i].x >= surface_min.x && touches[i].x <= surface_max.x &&
+            touches[i].y >= surface_min.y && touches[i].y <= surface_max.y) {
             touch_inside = true;
             if (active_touch_id < 0) {
                 touch_pos = ImVec2(touches[i].x, touches[i].y);
@@ -304,8 +302,8 @@ static void DrawFloatingMenuBall() {
         if (use_touch_logic) {
             for (int i = 0; i < touch_count; ++i) {
                 if (!touches[i].active) continue;
-                if (touches[i].x >= min.x && touches[i].x <= max.x &&
-                    touches[i].y >= min.y && touches[i].y <= max.y) {
+                if (touches[i].x >= surface_min.x && touches[i].x <= surface_max.x &&
+                    touches[i].y >= surface_min.y && touches[i].y <= surface_max.y) {
                     active_touch_id = touches[i].id;
                     new_touch_pos = ImVec2(touches[i].x, touches[i].y);
                     break;
@@ -342,14 +340,25 @@ static void DrawFloatingMenuBall() {
                                                    : ImVec4(0.12f, 0.32f, 0.68f, 0.84f));
     const ImU32 inner = ImGui::GetColorU32(hovered ? ImVec4(0.34f, 0.76f, 1.00f, 0.98f)
                                                    : ImVec4(0.24f, 0.64f, 0.98f, 0.94f));
-    draw_list->AddCircleFilled(center, 40.0f, outer, 48);
-    draw_list->AddCircleFilled(center, 32.0f, inner, 48);
-    draw_list->AddCircle(center, 40.0f, IM_COL32(180, 228, 255, 235), 48, 2.4f);
-    draw_list->AddCircleFilled(ImVec2(center.x - 8.0f, center.y - 8.0f), 4.0f, IM_COL32(245, 250, 255, 255), 16);
-    draw_list->AddCircleFilled(ImVec2(center.x + 8.0f, center.y - 8.0f), 4.0f, IM_COL32(245, 250, 255, 255), 16);
-    draw_list->AddCircleFilled(ImVec2(center.x, center.y + 8.0f), 4.0f, IM_COL32(245, 250, 255, 255), 16);
+    EnsureFloatingBallTextureLoaded();
+    if (gFloatingBallTexture) {
+        const float padding = hovered ? 2.0f : 4.0f;
+        draw_list->AddCircleFilled(center, 40.0f, outer, 48);
+        draw_list->AddCircle(center, 40.0f, IM_COL32(180, 228, 255, 235), 48, hovered ? 2.8f : 2.2f);
+        draw_list->AddImage(gFloatingBallTexture,
+                            ImVec2(surface_min.x + padding, surface_min.y + padding),
+                            ImVec2(surface_max.x - padding, surface_max.y - padding));
+    } else {
+        draw_list->AddCircleFilled(center, 40.0f, outer, 48);
+        draw_list->AddCircleFilled(center, 32.0f, inner, 48);
+        draw_list->AddCircle(center, 40.0f, IM_COL32(180, 228, 255, 235), 48, 2.4f);
+        draw_list->AddCircleFilled(ImVec2(center.x - 8.0f, center.y - 8.0f), 4.0f, IM_COL32(245, 250, 255, 255), 16);
+        draw_list->AddCircleFilled(ImVec2(center.x + 8.0f, center.y - 8.0f), 4.0f, IM_COL32(245, 250, 255, 255), 16);
+        draw_list->AddCircleFilled(ImVec2(center.x, center.y + 8.0f), 4.0f, IM_COL32(245, 250, 255, 255), 16);
+    }
 
     ImGui::End();
+    ImGui::PopStyleVar();
 }
 
 static bool IsAnyActiveTouchInsideRect(const ImVec2& min, const ImVec2& max) {
@@ -431,6 +440,24 @@ static void ShowConfigToast(const MenuConfigResult& result) {
     ImGuiToastType type = result.success ? ImGuiToastType::Success : ImGuiToastType::Error;
     ShowToast(type, "配置", result.message.empty() ? std::string("操作完成") : result.message,
               result.success ? 2500 : 4000);
+}
+
+static bool TryWaitForFrametimeAfterInit(float& out_frametime_ms) {
+    constexpr int kMaxWaitMs = 1200;
+    constexpr int kPollIntervalMs = 50;
+
+    for (int waited = 0; waited <= kMaxWaitMs; waited += kPollIntervalMs) {
+        const GameFrameData gameData = ReadGameData();
+        if (gameData.gameDeltaTime > 0.0f && gameData.gameDeltaTime < 1.0f &&
+            std::isfinite(gameData.gameDeltaTime)) {
+            out_frametime_ms = gameData.gameDeltaTime * 1000.0f;
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(kPollIntervalMs));
+    }
+
+    out_frametime_ms = 0.0f;
+    return false;
 }
 
 static std::string GetScreenOrientationText() {
@@ -777,7 +804,7 @@ static void RunTouchTest() {
                                                -static_cast<int>(io.DisplaySize.y / 18.0f),
                                                static_cast<int>(io.DisplaySize.y / 18.0f))),
                                           0.0f, io.DisplaySize.y);
-    const int slot = 8;
+    const int slot = GetDriverManager().preferred_touch_slot();
     int start_x = 0;
     int start_y = 0;
     int end_x = 0;
@@ -1083,6 +1110,9 @@ static void RegisterConfigPage(MenuRegistry& registry) {
     display.AddBool("use_batch_bone_read", "批量读取（优化）", &gUseBatchBoneRead)
         .Tooltip("批量读取: 1次ioctl读取整个骨骼数组（推荐）\n逐个读取: 每个骨骼1次ioctl（调试用）")
         .DebugOnly();
+    display.AddBool("enable_fullscreen_blur", "全屏模糊", &gEnableFullscreenBlur)
+        .Persisted(false)
+        .DebugOnly();
     display.AddFloat("max_skeleton_distance", "最大距离 (米)", &gMaxSkeletonDistance, 50.0f, 500.0f, "%.0f")
         .Tooltip("超过此距离的角色不绘制骨骼，减少性能开销");
 
@@ -1098,6 +1128,19 @@ static void RegisterConfigPage(MenuRegistry& registry) {
         .DebugOnly();
     driver.AddButton("init_mem", "初始化", [] {
         InitDriver("com.tencent.tmgp.pubgmhd", libUE4);
+        if (driver_stat.load(std::memory_order_acquire) <= 0 || libUE4 == 0 || address.libUE4 == 0) {
+            ShowToast(ImGuiToastType::Error, "初始化", "初始化失败❌", 3500);
+            return;
+        }
+
+        float frametime_ms = 0.0f;
+        if (TryWaitForFrametimeAfterInit(frametime_ms)) {
+            char buffer[96];
+            std::snprintf(buffer, sizeof(buffer), "成功🟢 FrameTime: %.2f ms", frametime_ms);
+            ShowToast(ImGuiToastType::Success, "初始化", buffer, 3000);
+        } else {
+            ShowToast(ImGuiToastType::Warning, "初始化", "请在正确时机加载", 3500);
+        }
     }).Persisted(false);
     driver.AddButton("dump_tarray", "Dump TArray", [] {
         DumpTArray();
@@ -1409,6 +1452,10 @@ void Draw_Menu_ResetTextures() {
     gBannerTexture = (ImTextureID)0;
     gBannerWidth = 0;
     gBannerHeight = 0;
+    gFloatingBallTexture = (ImTextureID)0;
+    gFloatingBallWidth = 0;
+    gFloatingBallHeight = 0;
+    gFloatingBallTextureRequested = false;
 }
 
 void Draw_Menu_Overlay() {
@@ -1416,7 +1463,7 @@ void Draw_Menu_Overlay() {
     MenuRegistry::Instance().RenderShortcutWidgets();
     DrawFloatingMenuBall();
     if (!IsMenuOpen.load(std::memory_order_relaxed)) {
-        SyncMenuBlurRegion(false);
+        SyncFullscreenBlur(false);
     }
 }
 
@@ -1494,7 +1541,7 @@ void Draw_Menu() {
 
     was_mouse_down = original_mouse_down;
     window_pos = ImGui::GetWindowPos();
-    SyncMenuBlurRegion(true, window_pos, ImVec2(windowWidth, windowHeight));
+    SyncFullscreenBlur(gEnableFullscreenBlur);
 
     // Logo
     const ImVec2 logoPos(28.0f, 12.0f);

@@ -1176,7 +1176,7 @@
 #define ICON_FA_SQUARE_ENVELOPE "\xef\x86\x99"	// U+f199
 #define ICON_FA_SQUARE_FULL "\xef\x91\x9c"	// U+f45c
 #define ICON_FA_SQUARE_H "\xef\x83\xbd"	// U+f0fd
-#define ICON_FA_SQUARE_MINUS "\xef\x85\x86"	// U+f146
+#define ICON_FA_SQUARE_MINUS "\xef\x85\x87"	// U+f146
 #define ICON_FA_SQUARE_NFI "\xee\x95\xb6"	// U+e576
 #define ICON_FA_SQUARE_PARKING "\xef\x95\x80"	// U+f540
 #define ICON_FA_SQUARE_PEN "\xef\x85\x8b"	// U+f14b

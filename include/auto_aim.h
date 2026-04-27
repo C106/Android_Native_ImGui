@@ -234,6 +234,7 @@ private:
     TargetState targetState;
     bool triggerTouchReady_ = false;
     bool triggerTouchDown_ = false;
+    int triggerTouchSlot_ = -1;
     int triggerTouchMaxX_ = 0;
     int triggerTouchMaxY_ = 0;
 
@@ -255,7 +256,7 @@ private:
     void DrawDebugVisuals(const Vec2& targetPos, const Vec2& screenCenter);
     void DrawRecoilSpeedDebugWindow();
     void DrawFireStateDebugWindow();
-    void ReleaseTriggerTouch();
+    void ReleaseTriggerTouch(bool destroySession = true);
     void UpdateTriggerBot(const Vec2& rawScreenCenter);
     bool IsLocalPlayerFiring();
 };

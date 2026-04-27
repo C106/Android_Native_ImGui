@@ -6,12 +6,12 @@
 #include <dlfcn.h>
 #include <sys/system_properties.h>
 #include <cstddef>
-#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <unordered_map>
 #include <string>
 #include <vector>
+#include <utility>
 #include <thread>
 #include <atomic>
 #include <chrono>
@@ -34,17 +34,6 @@ namespace android
         int32_t top = 0;
         int32_t right = 0;
         int32_t bottom = 0;
-    };
-
-    struct BlurRegion
-    {
-        uint32_t blurRadius = 0;
-        float cornerRadiusTL = 0.0f;
-        float cornerRadiusTR = 0.0f;
-        float cornerRadiusBL = 0.0f;
-        float cornerRadiusBR = 0.0f;
-        float alpha = 1.0f;
-        Rect rect;
     };
 
     namespace detail
@@ -152,7 +141,6 @@ namespace android
             };
 
             size_t systemVersion = 13;
-            bool SurfaceBlurRegionsAllowed = false;
 
             void (*RefBase__IncStrong)(void *thiz, void *id) = nullptr;
             void (*RefBase__DecStrong)(void *thiz, void *id) = nullptr;
@@ -187,7 +175,6 @@ namespace android
             void *(*SurfaceComposerClient__Transaction__Reparent)(void *thiz, StrongPointer<void> &surfaceControl, StrongPointer<void> &newParent) = nullptr;
             void *(*SurfaceComposerClient__Transaction__SetTrustedOverlay)(void *thiz, StrongPointer<void> &surfaceControl, bool isTrustedOverlay) = nullptr;
             void *(*SurfaceComposerClient__Transaction__SetBackgroundBlurRadius)(void *thiz, StrongPointer<void> &surfaceControl, int32_t radius) = nullptr;
-            void *(*SurfaceComposerClient__Transaction__SetBlurRegions)(void *thiz, StrongPointer<void> &surfaceControl, const std::vector<android::BlurRegion> &regions) = nullptr;
             int32_t (*SurfaceComposerClient__Transaction__Apply)(void *thiz, bool synchronous, bool oneWay) = nullptr;
 
             int32_t (*SurfaceControl__Validate)(void *thiz) = nullptr;
@@ -199,69 +186,6 @@ namespace android
                 char value[PROP_VALUE_MAX] = {};
                 const int length = __system_property_get(name, value);
                 return length > 0 ? std::string(value, static_cast<size_t>(length)) : std::string();
-            }
-
-            static std::string ToLower(std::string value)
-            {
-                std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
-                    return static_cast<char>(std::tolower(ch));
-                });
-                return value;
-            }
-
-            static bool PropertyEquals(const char *name, const char *expected)
-            {
-                return ToLower(ReadSystemProperty(name)) == expected;
-            }
-
-            static bool PropertyContainsAny(const char *name, const std::initializer_list<const char *> &needles)
-            {
-                const std::string value = ToLower(ReadSystemProperty(name));
-                if (value.empty()) return false;
-
-                for (const char *needle : needles) {
-                    if (value.find(needle) != std::string::npos) return true;
-                }
-                return false;
-            }
-
-            bool IsBlurRegionsDeviceSupported(const SymbolMethod &symbolMethod, void *libgui) const
-            {
-                if (PropertyEquals("persist.hpjy.force_blur_regions", "1") ||
-                    PropertyEquals("debug.hpjy.force_blur_regions", "1")) {
-                    __android_log_print(ANDROID_LOG_WARN, "ImGui",
-                                        "[*] Surface blur regions force-enabled by property");
-                    return true;
-                }
-
-                if (PropertyEquals("persist.hpjy.disable_blur_regions", "1") ||
-                    PropertyEquals("debug.hpjy.disable_blur_regions", "1")) {
-                    __android_log_print(ANDROID_LOG_WARN, "ImGui",
-                                        "[-] Surface blur regions disabled by property");
-                    return false;
-                }
-
-                if (systemVersion < 12) {
-                    __android_log_print(ANDROID_LOG_WARN, "ImGui",
-                                        "[-] Surface blur regions disabled: Android %zu is unsupported",
-                                        systemVersion);
-                    return false;
-                }
-
-                const bool hasMiuiLibgui =
-                    symbolMethod.Find(libgui, "_ZN7android15MiuiTransaction19getMiuiDisplayStateERKNS_2spINS_7IBinderEEE") ||
-                    symbolMethod.Find(libgui, "_ZN7android21MiSurfaceComposerStub23setMiuiTransactionStateERKNS_6VectorINS_16MiuiDisplayStateEEEjlRKNS_2spINS_7IBinderEEERKNS_8String16Ej");
-                if (hasMiuiLibgui ||
-                    !ReadSystemProperty("ro.miui.ui.version.name").empty() ||
-                    !ReadSystemProperty("ro.mi.os.version.name").empty() ||
-                    PropertyContainsAny("ro.product.manufacturer", {"xiaomi", "redmi", "poco", "blackshark"}) ||
-                    PropertyContainsAny("ro.product.brand", {"xiaomi", "redmi", "poco", "blackshark"})) {
-                    __android_log_print(ANDROID_LOG_WARN, "ImGui",
-                                        "[-] Surface blur regions disabled: non-standard MIUI/libgui vector ABI");
-                    return false;
-                }
-
-                return true;
             }
 
             Functionals(const SymbolMethod &symbolMethod)
@@ -410,18 +334,6 @@ namespace android
                 } else {
                     __android_log_print(ANDROID_LOG_WARN, "ImGui", "[-] Surface background blur unavailable on this build");
                 }
-                SurfaceComposerClient__Transaction__SetBlurRegions = reinterpret_cast<decltype(SurfaceComposerClient__Transaction__SetBlurRegions)>(
-                    symbolMethod.Find(libgui, "_ZN7android21SurfaceComposerClient11Transaction14setBlurRegionsERKNS_2spINS_14SurfaceControlEEERKNSt3__16vectorINS_10BlurRegionENS7_9allocatorIS9_EEEE"));
-                if (SurfaceComposerClient__Transaction__SetBlurRegions) {
-                    __android_log_print(ANDROID_LOG_INFO, "ImGui", "[+] Loaded SurfaceComposerClient::Transaction::setBlurRegions");
-                } else {
-                    __android_log_print(ANDROID_LOG_WARN, "ImGui", "[-] Surface blur regions unavailable on this build");
-                }
-                SurfaceBlurRegionsAllowed = SurfaceComposerClient__Transaction__SetBlurRegions &&
-                                            IsBlurRegionsDeviceSupported(symbolMethod, libgui);
-                if (!SurfaceBlurRegionsAllowed) {
-                    SurfaceComposerClient__Transaction__SetBlurRegions = nullptr;
-                }
                 ResolveMethod(SurfaceComposerClient__Transaction, Apply, libgui, "_ZN7android21SurfaceComposerClient11Transaction5applyEbb");
 
                 ResolveMethod(SurfaceControl, Validate, libgui, "_ZNK7android14SurfaceControl8validateEv");
@@ -552,6 +464,22 @@ namespace android
                 // teardown.
                 DisConnect();
                 Functionals::GetInstance().RefBase__DecStrong(data, data);
+                data = nullptr;
+            }
+
+            void ReleaseControl()
+            {
+                if (nullptr == data)
+                    return;
+
+                if (mirrorData != nullptr) {
+                    Functionals::GetInstance().RefBase__DecStrong(mirrorData, mirrorData);
+                    mirrorData = nullptr;
+                }
+
+                DisConnect();
+                Functionals::GetInstance().RefBase__DecStrong(data, data);
+                data = nullptr;
             }
         };
 
@@ -589,13 +517,6 @@ namespace android
                 auto fn = Functionals::GetInstance().SurfaceComposerClient__Transaction__SetBackgroundBlurRadius;
                 if (!fn) return nullptr;
                 return fn(data, surfaceControl, radius);
-            }
-
-            void *SetBlurRegions(StrongPointer<void> &surfaceControl, const std::vector<android::BlurRegion> &regions)
-            {
-                auto fn = Functionals::GetInstance().SurfaceComposerClient__Transaction__SetBlurRegions;
-                if (!fn) return nullptr;
-                return fn(data, surfaceControl, regions);
             }
 
             int32_t Apply(bool synchronous, bool oneWay)
@@ -1136,6 +1057,8 @@ namespace android
 
     private:
         inline static std::unordered_map<ANativeWindow *, detail::SurfaceControl> m_cachedSurfaceControl;
+        inline static std::vector<detail::SurfaceControl> m_virtualMirrorHosts;
+        inline static int32_t m_currentBackgroundBlurRadius = 0;
 
     public:
         static detail::SurfaceComposerClient &GetComposerInstance()
@@ -1208,28 +1131,12 @@ namespace android
             return nativeWindow;
         }
 
-        static bool SetBlurRegionForAll(int32_t left, int32_t top, int32_t right, int32_t bottom,
-                                        uint32_t blurRadius, float alpha = 1.0f, float cornerRadius = 15.0f)
+        static bool SetBackgroundBlurRadiusForAll(int32_t radius)
         {
-            auto blurFn = detail::Functionals::GetInstance().SurfaceComposerClient__Transaction__SetBlurRegions;
+            const auto blurFn = detail::Functionals::GetInstance().SurfaceComposerClient__Transaction__SetBackgroundBlurRadius;
             if (!blurFn) return false;
 
-            std::vector<BlurRegion> regions;
-            if (blurRadius > 0 && right > left && bottom > top) {
-                BlurRegion region{};
-                region.blurRadius = blurRadius;
-                region.cornerRadiusTL = cornerRadius;
-                region.cornerRadiusTR = cornerRadius;
-                region.cornerRadiusBL = cornerRadius;
-                region.cornerRadiusBR = cornerRadius;
-                region.alpha = alpha;
-                region.rect.left = left;
-                region.rect.top = top;
-                region.rect.right = right;
-                region.rect.bottom = bottom;
-                regions.push_back(region);
-            }
-
+            m_currentBackgroundBlurRadius = radius;
             bool applied = false;
             for (auto& entry : m_cachedSurfaceControl) {
                 if (!entry.second.data) continue;
@@ -1238,17 +1145,26 @@ namespace android
                 surfaceSP.pointer = entry.second.data;
 
                 detail::SurfaceComposerClientTransaction transaction;
-                transaction.SetBlurRegions(surfaceSP, regions);
-                transaction.Apply(false, true);
-                applied = true;
+                if (!transaction.SetBackgroundBlurRadius(surfaceSP, radius)) {
+                    continue;
+                }
+                applied = (transaction.Apply(false, true) == 0) || applied;
+            }
+
+            for (auto& hostSurface : m_virtualMirrorHosts) {
+                if (!hostSurface.data) continue;
+
+                detail::StrongPointer<void> surfaceSP;
+                surfaceSP.pointer = hostSurface.data;
+
+                detail::SurfaceComposerClientTransaction transaction;
+                if (!transaction.SetBackgroundBlurRadius(surfaceSP, radius)) {
+                    continue;
+                }
+                applied = (transaction.Apply(false, true) == 0) || applied;
             }
 
             return applied;
-        }
-
-        static bool ClearBlurRegionsForAll()
-        {
-            return SetBlurRegionForAll(0, 0, 0, 0, 0, 0.0f, 0.0f);
         }
 
         static void Destroy(ANativeWindow *nativeWindow)
@@ -1269,6 +1185,10 @@ namespace android
 
             __android_log_print(ANDROID_LOG_INFO, "ImGui", "[*] Resetting mirror state (clearing processed LayerStacks and stale SurfaceControls)");
             detail::g_processedLayerStacks.clear();
+            for (auto& hostSurface : m_virtualMirrorHosts) {
+                hostSurface.ReleaseControl();
+            }
+            m_virtualMirrorHosts.clear();
 
             it->second.DestroySurface(reinterpret_cast<detail::Surface *>(nativeWindow));
             m_cachedSurfaceControl.erase(it);
@@ -1344,6 +1264,14 @@ namespace android
                 transaction.Reparent(newMirrorSP, hostSP);
                 transaction.SetLayer(newMirrorSP, INT32_MAX - 1);
                 transaction.Apply(false, true);
+
+                if (m_currentBackgroundBlurRadius > 0) {
+                    detail::SurfaceComposerClientTransaction blurTransaction;
+                    blurTransaction.SetBackgroundBlurRadius(hostSP, m_currentBackgroundBlurRadius);
+                    blurTransaction.Apply(false, true);
+                }
+
+                m_virtualMirrorHosts.push_back(std::move(hostSurface));
 
                 detail::g_processedLayerStacks[layerStackId] = true;
                 newCount++;

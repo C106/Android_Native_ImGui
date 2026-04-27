@@ -291,11 +291,11 @@ public:
         case ImGuiToastType::Success:
             return ICON_FA_CIRCLE_CHECK; // Font Awesome 6
         case ImGuiToastType::Warning:
-            return ICON_FA_TRIANGLE_EXCLAMATION; // Font Awesome 6
+            return ICON_FA_FACE_SURPRISE; // Font Awesome 6
         case ImGuiToastType::Error:
-            return ICON_FA_CIRCLE_EXCLAMATION; // Font Awesome 6
+            return ICON_FA_CALENDAR_XMARK; // Font Awesome 6
         case ImGuiToastType::Info:
-            return ICON_FA_CIRCLE_INFO; // Font Awesome 6
+            return ICON_FA_SQUARE_MINUS; // Font Awesome 6
         default:
             return nullptr;
         }

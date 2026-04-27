@@ -266,6 +266,11 @@ public:
         return currentType_ == DRIVER_PARADISE;
     }
 
+    int preferred_touch_slot() {
+        ensureSynchronized();
+        return 8;
+    }
+
     int add_breakpoint(uintptr_t addr, int type, int len) {
         ensureSynchronized();
         if (currentType_ != DRIVER_RT_HOOK) {

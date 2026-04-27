@@ -449,6 +449,10 @@ void DumpObjects(uint64_t libUE4, int count) {
 //  Driver 初始化（UI 线程调用一次）
 // ═══════════════════════════════════════════
 void InitDriver(const char* packageName, uint64_t& libUE4Out) {
+    libUE4Out = 0;
+    sLibUE4 = 0;
+    address.libUE4 = 0;
+
     int pid = GetDriverManager().get_pid(packageName);
     if (pid > 0) {
         printf("[+] pid = %d\n", pid);
@@ -457,6 +461,10 @@ void InitDriver(const char* packageName, uint64_t& libUE4Out) {
         address.libUE4 = libUE4Out;  // 保存到 address 结构体
         if(libUE4Out){
             printf("libUE4: %lx\n",libUE4Out);
+        } else {
+            printf("[-] libUE4.so base not found\n");
+            driver_stat.store(0, std::memory_order_release);
+            return;
         }
 
         StartGameFPSMonitor(packageName);
