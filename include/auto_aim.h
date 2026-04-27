@@ -26,6 +26,15 @@ struct AutoAimConfig {
     float KdY = 0.1f;                // Y 轴微分增益
     float outputScaleX = 1.0f;       // X 轴输出倍率
     float outputScaleY = 1.0f;       // Y 轴输出倍率
+    float assistHumanizeStrength = 0.65f;    // Assist 拟人化总强度
+    float assistReactionDelayMinMs = 60.0f;  // Assist 新目标最小反应延迟
+    float assistReactionDelayMaxMs = 140.0f; // Assist 新目标最大反应延迟
+    float assistAimSmoothing = 10.0f;        // Assist 虚拟瞄准点平滑速度
+    bool assistHumanizedMotion = true;       // Assist 模式启用人手移动曲线
+    float assistSpeedCurveStrength = 0.40f;  // 起步/收尾减速强度
+    float assistTrajectoryCurveStrength = 0.10f; // 轨迹弯曲强度，占移动距离比例
+    float assistOvershootStrength = 0.12f;   // Assist 收尾过冲/回拉强度
+    float assistSpeedVariance = 0.16f;       // Assist 低频速度波动强度
     bool humanizeNoise = false;      // 添加人手微抖噪声
     float noiseStrengthX = 0.18f;    // X 轴平滑随机漂移幅度
     float noiseStrengthY = 0.12f;    // Y 轴平滑随机漂移幅度
@@ -175,6 +184,24 @@ struct TargetState {
     Vec2 noiseCurrent;
     Vec2 noiseTarget;
     Vec2 debugNoise;
+    uint64_t assistMotionActor = 0;
+    int assistMotionBone = -1;
+    float assistMotionInitialDistance = 0.0f;
+    float assistMotionProgress = 0.0f;
+    float assistMotionCurveSign = 1.0f;
+    float assistReactionDelayRemaining = 0.0f;
+    bool assistVirtualAimInitialized = false;
+    Vec2 assistVirtualAim;
+    Vec2 assistOvershootVector;
+    float assistSpeedVarianceTimer = 0.0f;
+    float assistSpeedVarianceCurrent = 1.0f;
+    float assistSpeedVarianceTarget = 1.0f;
+    Vec2 debugAssistMotionAim;
+    float debugAssistSpeedScale = 1.0f;
+    float debugAssistCurveOffset = 0.0f;
+    float debugAssistReactionDelay = 0.0f;
+    Vec2 debugAssistOvershoot;
+    float debugAssistVelocityScale = 1.0f;
     bool magnetEngaged = false;
     float debugMagnetDistance = 0.0f;
     uint32_t noiseSeed = 0x13572468u;

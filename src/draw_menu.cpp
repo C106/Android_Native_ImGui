@@ -983,17 +983,35 @@ static void RegisterCameraPage(MenuRegistry& registry) {
         return std::string("当前驱动不支持 touch 注入，Trigger Bot 已禁用。");
     }).Persisted(false);
 
-    MenuSectionSpec& pd = page.AddSection("pd_controller", "PD 控制器", MenuColumn::Right);
-    pd.AddFloat("kp_x", "X Kp", &cfg.KpX, 0.0f, 1.0f, "%.2f");
-    pd.AddFloat("kd_x", "X Kd", &cfg.KdX, 0.0f, 0.2f, "%.2f");
-    pd.AddFloat("kp_y", "Y Kp", &cfg.KpY, 0.0f, 1.0f, "%.2f");
-    pd.AddFloat("kd_y", "Y Kd", &cfg.KdY, 0.0f, 0.5f, "%.2f");
-    pd.AddFloat("output_scale_x", "X 输出倍率", &cfg.outputScaleX, 0.5f, 1.8f, "%.2f");
-    pd.AddFloat("output_scale_y", "Y 输出倍率", &cfg.outputScaleY, 0.5f, 1.8f, "%.2f");
+    MenuSectionSpec& assistMotion = page.AddSection("assist_motion", "Assist 参数", MenuColumn::Right);
+    assistMotion.VisibleIf([&cfg] { return cfg.aimMode == AUTO_AIM_MODE_ASSIST; });
+    assistMotion.AddFloat("kp_x", "X Kp", &cfg.KpX, 0.0f, 1.0f, "%.2f");
+    assistMotion.AddFloat("kd_x", "X Kd", &cfg.KdX, 0.0f, 0.2f, "%.2f");
+    assistMotion.AddFloat("kp_y", "Y Kp", &cfg.KpY, 0.0f, 1.0f, "%.2f");
+    assistMotion.AddFloat("kd_y", "Y Kd", &cfg.KdY, 0.0f, 0.5f, "%.2f");
+    assistMotion.AddFloat("output_scale_x", "X 输出倍率", &cfg.outputScaleX, 0.5f, 1.8f, "%.2f");
+    assistMotion.AddFloat("output_scale_y", "Y 输出倍率", &cfg.outputScaleY, 0.5f, 1.8f, "%.2f");
+    assistMotion.AddFloat("assist_humanize_strength", "拟人化强度", &cfg.assistHumanizeStrength, 0.0f, 1.0f, "%.2f")
+        .Tooltip("统一控制 Assist 的反应延迟、平滑、弧线、过冲、速度波动和噪声强度");
+    assistMotion.AddBool("assist_humanized_motion", "启用移动曲线", &cfg.assistHumanizedMotion)
+        .Tooltip("Assist 模式下对靠近目标的过程加入起步/收尾减速和轻微弧线，模拟真实手动拉枪");
+    assistMotion.AddFloat("assist_reaction_delay_min", "最小反应延迟 (ms)", &cfg.assistReactionDelayMinMs, 0.0f, 240.0f, "%.0f");
+    assistMotion.AddFloat("assist_reaction_delay_max", "最大反应延迟 (ms)", &cfg.assistReactionDelayMaxMs, 0.0f, 300.0f, "%.0f");
+    assistMotion.AddFloat("assist_aim_smoothing", "瞄准点平滑", &cfg.assistAimSmoothing, 1.0f, 30.0f, "%.1f")
+        .Tooltip("越低虚拟瞄准点越滞后，越高越贴近原始预测点");
+    assistMotion.AddFloat("assist_speed_curve", "速度曲线强度", &cfg.assistSpeedCurveStrength, 0.0f, 1.0f, "%.2f")
+        .Tooltip("越高起步和接近目标时越慢，中段移动速度保持更高");
+    assistMotion.AddFloat("assist_trajectory_curve", "轨迹弯曲强度", &cfg.assistTrajectoryCurveStrength, 0.0f, 0.35f, "%.2f")
+        .Tooltip("越高路径中段越偏离直线，收尾会回到真实目标点");
+    assistMotion.AddFloat("assist_overshoot", "收尾过冲强度", &cfg.assistOvershootStrength, 0.0f, 0.50f, "%.2f")
+        .Tooltip("接近目标时轻微越过再回拉，过高会影响稳定性");
+    assistMotion.AddFloat("assist_speed_variance", "速度波动强度", &cfg.assistSpeedVariance, 0.0f, 0.50f, "%.2f")
+        .Tooltip("低频改变 Assist 输出速度，减少恒定速度特征");
 
-    MenuSectionSpec& humanize = page.AddSection("humanize", "人手噪声", MenuColumn::Right);
+    MenuSectionSpec& humanize = page.AddSection("humanize", "Assist 噪声", MenuColumn::Right);
+    humanize.VisibleIf([&cfg] { return cfg.aimMode == AUTO_AIM_MODE_ASSIST; });
     humanize.AddBool("humanize_noise", "启用人手噪声", &cfg.humanizeNoise)
-        .Tooltip("为最终陀螺仪输出增加平滑随机漂移和轻微颤动，模拟真实手搓微调");
+        .Tooltip("只在 Assist 模式为最终陀螺仪输出增加平滑随机漂移和轻微颤动");
     humanize.AddFloat("noise_strength_x", "X 漂移幅度", &cfg.noiseStrengthX, 0.0f, 0.80f, "%.2f");
     humanize.AddFloat("noise_strength_y", "Y 漂移幅度", &cfg.noiseStrengthY, 0.0f, 0.80f, "%.2f");
     humanize.AddFloat("noise_change_rate", "换向频率", &cfg.noiseChangeRate, 0.5f, 12.0f, "%.1f");
