@@ -93,7 +93,8 @@ static float NextNoiseUnit(uint32_t& seed) {
 
 static Vec2 ApplyHumanizeNoise(const AutoAimConfig& config, TargetState& state,
                                const Vec2& baseAdjust, float deltaTime) {
-    if (!config.humanizeNoise || deltaTime <= 0.0f) {
+    const float humanizeStrength = std::clamp(config.assistHumanizeStrength, 0.0f, 1.0f);
+    if (!config.humanizeNoise || humanizeStrength <= 0.001f || deltaTime <= 0.0f) {
         state.noiseCurrent = Vec2(0, 0);
         state.noiseTarget = Vec2(0, 0);
         state.noiseRetargetTimer = 0.0f;
@@ -110,8 +111,8 @@ static Vec2 ApplyHumanizeNoise(const AutoAimConfig& config, TargetState& state,
 
     if (state.noiseRetargetTimer <= 0.0f) {
         state.noiseRetargetTimer += retargetInterval;
-        state.noiseTarget.x = NextNoiseUnit(state.noiseSeed) * config.noiseStrengthX * driveScale;
-        state.noiseTarget.y = NextNoiseUnit(state.noiseSeed) * config.noiseStrengthY * driveScale;
+        state.noiseTarget.x = NextNoiseUnit(state.noiseSeed) * config.noiseStrengthX * driveScale * humanizeStrength;
+        state.noiseTarget.y = NextNoiseUnit(state.noiseSeed) * config.noiseStrengthY * driveScale * humanizeStrength;
     }
 
     const float follow = std::clamp(config.noiseSmoothing * deltaTime, 0.0f, 1.0f);
@@ -119,8 +120,8 @@ static Vec2 ApplyHumanizeNoise(const AutoAimConfig& config, TargetState& state,
     state.noiseCurrent.y += (state.noiseTarget.y - state.noiseCurrent.y) * follow;
 
     const Vec2 microNoise(
-        std::sin(state.noiseTime * 7.1f) * config.noiseMicroJitter * driveScale,
-        std::cos(state.noiseTime * 9.7f) * config.noiseMicroJitter * 0.85f * driveScale);
+        std::sin(state.noiseTime * 7.1f) * config.noiseMicroJitter * driveScale * humanizeStrength,
+        std::cos(state.noiseTime * 9.7f) * config.noiseMicroJitter * 0.85f * driveScale * humanizeStrength);
 
     state.debugNoise = state.noiseCurrent + microNoise;
     return state.debugNoise;
@@ -129,17 +130,25 @@ static Vec2 ApplyHumanizeNoise(const AutoAimConfig& config, TargetState& state,
 static Vec2 ApplyAssistMotionCurve(const AutoAimConfig& config, TargetState& state,
                                    uint64_t targetActor, int targetBone,
                                    const Vec2& aimPos, const Vec2& screenCenter,
-                                   float shortSide, float& outSpeedScale) {
+                                   float shortSide, float deltaTime, float& outSpeedScale) {
     outSpeedScale = 1.0f;
     state.debugAssistMotionAim = aimPos;
     state.debugAssistSpeedScale = 1.0f;
     state.debugAssistCurveOffset = 0.0f;
+    state.debugAssistReactionDelay = 0.0f;
+    state.debugAssistOvershoot = Vec2(0, 0);
+    state.debugAssistVelocityScale = 1.0f;
 
-    if (!config.assistHumanizedMotion) {
+    const float humanizeStrength = std::clamp(config.assistHumanizeStrength, 0.0f, 1.0f);
+    if (!config.assistHumanizedMotion || humanizeStrength <= 0.001f) {
         state.assistMotionActor = 0;
         state.assistMotionBone = -1;
         state.assistMotionInitialDistance = 0.0f;
         state.assistMotionProgress = 0.0f;
+        state.assistReactionDelayRemaining = 0.0f;
+        state.assistVirtualAimInitialized = false;
+        state.assistSpeedVarianceCurrent = 1.0f;
+        state.assistSpeedVarianceTarget = 1.0f;
         return aimPos;
     }
 
@@ -161,6 +170,24 @@ static Vec2 ApplyAssistMotionCurve(const AutoAimConfig& config, TargetState& sta
         state.assistMotionInitialDistance = std::max(distance, 1.0f);
         state.assistMotionProgress = 0.0f;
         state.assistMotionCurveSign = NextNoiseUnit(state.noiseSeed) >= 0.0f ? 1.0f : -1.0f;
+        const float minDelay = std::max(0.0f, config.assistReactionDelayMinMs);
+        const float maxDelay = std::max(minDelay, config.assistReactionDelayMaxMs);
+        const float delayMs = minDelay + (NextNoiseUnit(state.noiseSeed) * 0.5f + 0.5f) * (maxDelay - minDelay);
+        state.assistReactionDelayRemaining = delayMs * 0.001f * humanizeStrength;
+        state.assistVirtualAimInitialized = false;
+        state.assistOvershootVector = Vec2(0, 0);
+        state.assistSpeedVarianceTimer = 0.0f;
+        state.assistSpeedVarianceCurrent = 1.0f;
+        state.assistSpeedVarianceTarget = 1.0f;
+    }
+
+    if (state.assistReactionDelayRemaining > 0.0f) {
+        state.assistReactionDelayRemaining = std::max(0.0f, state.assistReactionDelayRemaining - deltaTime);
+        state.debugAssistReactionDelay = state.assistReactionDelayRemaining;
+        outSpeedScale = 0.0f;
+        state.debugAssistSpeedScale = 0.0f;
+        state.debugAssistMotionAim = screenCenter;
+        return screenCenter;
     }
 
     const float initialDistance = std::max(state.assistMotionInitialDistance, distance);
@@ -169,20 +196,54 @@ static Vec2 ApplyAssistMotionCurve(const AutoAimConfig& config, TargetState& sta
     const float t = std::clamp(state.assistMotionProgress, 0.0f, 1.0f);
     const float midEnvelope = std::sin(t * static_cast<float>(M_PI));
 
-    const float speedStrength = std::clamp(config.assistSpeedCurveStrength, 0.0f, 1.0f);
+    const float speedStrength = std::clamp(config.assistSpeedCurveStrength, 0.0f, 1.0f) * humanizeStrength;
     const float curvedSpeed = 0.55f + 0.45f * std::pow(std::max(midEnvelope, 0.0f), 0.70f);
     outSpeedScale = 1.0f + (curvedSpeed - 1.0f) * speedStrength;
 
-    const float curveStrength = std::clamp(config.assistTrajectoryCurveStrength, 0.0f, 0.35f);
+    state.assistSpeedVarianceTimer -= std::max(deltaTime, 0.0f);
+    if (state.assistSpeedVarianceTimer <= 0.0f) {
+        state.assistSpeedVarianceTimer += 0.18f + (NextNoiseUnit(state.noiseSeed) * 0.5f + 0.5f) * 0.24f;
+        const float variance = std::clamp(config.assistSpeedVariance, 0.0f, 0.5f) * humanizeStrength;
+        state.assistSpeedVarianceTarget = 1.0f + NextNoiseUnit(state.noiseSeed) * variance;
+    }
+    const float varianceFollow = std::clamp(8.0f * deltaTime, 0.0f, 1.0f);
+    state.assistSpeedVarianceCurrent +=
+        (state.assistSpeedVarianceTarget - state.assistSpeedVarianceCurrent) * varianceFollow;
+    outSpeedScale *= std::clamp(state.assistSpeedVarianceCurrent, 0.55f, 1.25f);
+
+    const float curveStrength = std::clamp(config.assistTrajectoryCurveStrength, 0.0f, 0.35f) * humanizeStrength;
     const float curveBase = std::min(initialDistance, shortSide * 0.35f);
     const float curveOffset = curveBase * curveStrength * (4.0f * t * (1.0f - t));
     const Vec2 perpendicular(-toTarget.y / distance, toTarget.x / distance);
-    const Vec2 curvedAim = aimPos + perpendicular * (curveOffset * state.assistMotionCurveSign);
+    Vec2 curvedAim = aimPos + perpendicular * (curveOffset * state.assistMotionCurveSign);
 
-    state.debugAssistMotionAim = curvedAim;
+    if (distance > 0.001f) {
+        const float overshootStrength = std::clamp(config.assistOvershootStrength, 0.0f, 0.5f) * humanizeStrength;
+        const float overshootWindow = std::clamp((t - 0.62f) / 0.38f, 0.0f, 1.0f);
+        const float overshootEnvelope = std::sin(overshootWindow * static_cast<float>(M_PI));
+        const float overshootPixels = std::min(initialDistance * 0.08f, shortSide * 0.018f) *
+            overshootStrength * overshootEnvelope;
+        const Vec2 unitToTarget(toTarget.x / distance, toTarget.y / distance);
+        state.assistOvershootVector = unitToTarget * overshootPixels;
+        curvedAim += state.assistOvershootVector;
+    }
+
+    if (!state.assistVirtualAimInitialized) {
+        state.assistVirtualAim = screenCenter + (curvedAim - screenCenter) * 0.35f;
+        state.assistVirtualAimInitialized = true;
+    }
+    const float smoothSpeed = std::clamp(config.assistAimSmoothing, 1.0f, 30.0f) *
+        (0.45f + humanizeStrength * 0.55f);
+    const float follow = std::clamp(smoothSpeed * deltaTime, 0.0f, 1.0f);
+    state.assistVirtualAim += (curvedAim - state.assistVirtualAim) * follow;
+
+    state.debugAssistMotionAim = state.assistVirtualAim;
     state.debugAssistSpeedScale = outSpeedScale;
     state.debugAssistCurveOffset = curveOffset * state.assistMotionCurveSign;
-    return curvedAim;
+    state.debugAssistReactionDelay = state.assistReactionDelayRemaining;
+    state.debugAssistOvershoot = state.assistOvershootVector;
+    state.debugAssistVelocityScale = state.assistSpeedVarianceCurrent;
+    return state.assistVirtualAim;
 }
 
 struct RecoilArrayHeader {
@@ -829,10 +890,16 @@ AutoAimController::AutoAimController() {
     config.KdY = 0.01f;
     config.outputScaleX = 1.00f;
     config.outputScaleY = 1.00f;
+    config.assistHumanizeStrength = 0.65f;
+    config.assistReactionDelayMinMs = 60.0f;
+    config.assistReactionDelayMaxMs = 140.0f;
+    config.assistAimSmoothing = 10.0f;
     config.assistHumanizedMotion = true;
     config.assistSpeedCurveStrength = 0.40f;
     config.assistTrajectoryCurveStrength = 0.10f;
-    config.humanizeNoise = false;
+    config.assistOvershootStrength = 0.12f;
+    config.assistSpeedVariance = 0.16f;
+    config.humanizeNoise = true;
     config.noiseStrengthX = 0.18f;
     config.noiseStrengthY = 0.12f;
     config.noiseChangeRate = 5.0f;
@@ -881,9 +948,19 @@ void AutoAimController::ResetTarget() {
     targetState.assistMotionInitialDistance = 0.0f;
     targetState.assistMotionProgress = 0.0f;
     targetState.assistMotionCurveSign = 1.0f;
+    targetState.assistReactionDelayRemaining = 0.0f;
+    targetState.assistVirtualAimInitialized = false;
+    targetState.assistVirtualAim = Vec2(0, 0);
+    targetState.assistOvershootVector = Vec2(0, 0);
+    targetState.assistSpeedVarianceTimer = 0.0f;
+    targetState.assistSpeedVarianceCurrent = 1.0f;
+    targetState.assistSpeedVarianceTarget = 1.0f;
     targetState.debugAssistMotionAim = Vec2(0, 0);
     targetState.debugAssistSpeedScale = 1.0f;
     targetState.debugAssistCurveOffset = 0.0f;
+    targetState.debugAssistReactionDelay = 0.0f;
+    targetState.debugAssistOvershoot = Vec2(0, 0);
+    targetState.debugAssistVelocityScale = 1.0f;
     targetState.magnetEngaged = false;
     targetState.debugMagnetDistance = 0.0f;
     targetState.valid = false;
@@ -1356,10 +1433,17 @@ void AutoAimController::DrawDebugVisuals(const Vec2& targetPos, const Vec2& scre
         ImGui::Text("Gyro Sens: %.2f", targetState.debugGyroScale);
         ImGui::Text("Sens Compensate: %.2f", targetState.debugSensCompensate);
         ImGui::Text("Humanize Noise: %.2f, %.2f", targetState.debugNoise.x, targetState.debugNoise.y);
-        ImGui::Text("Assist Curve: speed %.2f / offset %.1f / progress %.2f",
+        ImGui::Text("Assist Humanize: strength %.2f / delay %.0f ms",
+            config.assistHumanizeStrength,
+            targetState.debugAssistReactionDelay * 1000.0f);
+        ImGui::Text("Assist Curve: speed %.2f / variance %.2f / offset %.1f / progress %.2f",
             targetState.debugAssistSpeedScale,
+            targetState.debugAssistVelocityScale,
             targetState.debugAssistCurveOffset,
             targetState.assistMotionProgress);
+        ImGui::Text("Assist Overshoot: %.1f, %.1f",
+            targetState.debugAssistOvershoot.x,
+            targetState.debugAssistOvershoot.y);
         ImGui::Text("Magnet: %s / Dist %.1f", targetState.magnetEngaged ? "engaged" : "idle",
             targetState.debugMagnetDistance);
         ImGui::Separator();
@@ -1633,6 +1717,9 @@ void AutoAimController::Update(float deltaTime) {
             targetState.debugAssistMotionAim = aimPos;
             targetState.debugAssistSpeedScale = 1.0f;
             targetState.debugAssistCurveOffset = 0.0f;
+            targetState.debugAssistReactionDelay = 0.0f;
+            targetState.debugAssistOvershoot = Vec2(0, 0);
+            targetState.debugAssistVelocityScale = 1.0f;
             const bool sameTarget = targetState.valid && targetState.actorAddr == targetActor;
             if (targetState.magnetEngaged) {
                 if (!sameTarget || magnetDistance > magnetReleasePixels) {
@@ -1651,7 +1738,7 @@ void AutoAimController::Update(float deltaTime) {
             float assistSpeedScale = 1.0f;
             const Vec2 assistAimPos = ApplyAssistMotionCurve(
                 config, targetState, targetActor, targetBone, aimPos, screenCenter,
-                shortSide, assistSpeedScale);
+                shortSide, deltaTime, assistSpeedScale);
             gyroAdjust = ComputePDOutput(assistAimPos, screenCenter, feedforward, deltaTime, fovScale);
             gyroAdjust *= assistSpeedScale;
         }
@@ -1661,7 +1748,14 @@ void AutoAimController::Update(float deltaTime) {
         Vec2 finalAdjust = ClampGyroStrength(gyroAdjust * sensCompensate * kAutoAimBoost);
         finalAdjust.x *= config.outputScaleX;
         finalAdjust.y *= config.outputScaleY;
-        finalAdjust += ApplyHumanizeNoise(config, targetState, finalAdjust, deltaTime);
+        if (config.aimMode == AUTO_AIM_MODE_ASSIST) {
+            finalAdjust += ApplyHumanizeNoise(config, targetState, finalAdjust, deltaTime);
+        } else {
+            targetState.noiseCurrent = Vec2(0, 0);
+            targetState.noiseTarget = Vec2(0, 0);
+            targetState.noiseRetargetTimer = 0.0f;
+            targetState.debugNoise = Vec2(0, 0);
+        }
         finalAdjust.x = ApplyGyroFloor(finalAdjust.x);
         finalAdjust.y = ApplyVerticalGyroFloor(finalAdjust.y);
         if (!isFiring && targetState.debugRecoilCenterOffset.y == 0.0f && std::fabs(finalAdjust.y) < 0.08f) {
