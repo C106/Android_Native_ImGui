@@ -20,7 +20,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <thread>
 #include <chrono>
 #include <random>
@@ -78,10 +82,12 @@ static bool gShowExitConfirmDialog = false;
 static bool gShowDebugOptionsDialog = false;
 static ImVec2 gDebugOptionsWindowPos(-1.0f, -1.0f);
 static bool gEnableFullscreenBlur = false;
+static bool gHardwareMonitorEnabled = false;
 
 static bool IsAnyActiveTouchInsideRect(const ImVec2& min, const ImVec2& max);
 static void DrawExitConfirmOverlay();
 static void DrawDebugOptionsOverlay();
+static void DrawHardwareMonitorWindow();
 static void PushMenuWindowStyle();
 static void PopMenuWindowStyle();
 
@@ -216,6 +222,531 @@ static void PushMenuWindowStyle() {
 static void PopMenuWindowStyle() {
     ImGui::PopStyleColor(18);
     ImGui::PopStyleVar(4);
+}
+
+struct HardwareMonitorStats {
+    float cpuUsagePercent = -1.0f;
+    float cpuFreqMhz = -1.0f;
+    float gpuUsagePercent = -1.0f;
+    float gpuFreqMhz = -1.0f;
+    float memoryUsagePercent = -1.0f;
+    uint64_t memoryUsedKb = 0;
+    uint64_t memoryTotalKb = 0;
+    float batteryPercent = -1.0f;
+    float powerWatts = -1.0f;
+};
+
+static bool ReadTextFile(const std::filesystem::path& path, std::string& out) {
+    std::ifstream file(path);
+    if (!file.is_open()) return false;
+    std::ostringstream ss;
+    ss << file.rdbuf();
+    out = ss.str();
+    return true;
+}
+
+static bool ReadFirstNumber(const std::filesystem::path& path, double& out) {
+    std::string text;
+    if (!ReadTextFile(path, text)) return false;
+
+    const char* begin = text.c_str();
+    char* end = nullptr;
+    while (*begin != '\0' && !std::isdigit(*begin) && *begin != '-' && *begin != '+') {
+        ++begin;
+    }
+    if (*begin == '\0') return false;
+
+    out = std::strtod(begin, &end);
+    return end != begin;
+}
+
+static bool ReadProcStatCpu(uint64_t& idle, uint64_t& total) {
+    std::ifstream file("/proc/stat");
+    std::string cpu;
+    uint64_t user = 0, nice = 0, system = 0, idle_time = 0, iowait = 0;
+    uint64_t irq = 0, softirq = 0, steal = 0, guest = 0, guest_nice = 0;
+    if (!(file >> cpu >> user >> nice >> system >> idle_time >> iowait >> irq >> softirq >> steal >> guest >> guest_nice)) {
+        return false;
+    }
+    if (cpu != "cpu") return false;
+
+    idle = idle_time + iowait;
+    total = user + nice + system + idle_time + iowait + irq + softirq + steal + guest + guest_nice;
+    return true;
+}
+
+static float ReadCpuUsagePercent() {
+    static uint64_t s_last_idle = 0;
+    static uint64_t s_last_total = 0;
+
+    uint64_t idle = 0;
+    uint64_t total = 0;
+    if (!ReadProcStatCpu(idle, total)) return -1.0f;
+    if (s_last_total == 0 || total <= s_last_total) {
+        s_last_idle = idle;
+        s_last_total = total;
+        return -1.0f;
+    }
+
+    const uint64_t idle_delta = idle - s_last_idle;
+    const uint64_t total_delta = total - s_last_total;
+    s_last_idle = idle;
+    s_last_total = total;
+    if (total_delta == 0) return -1.0f;
+    return std::clamp((1.0f - static_cast<float>(idle_delta) / static_cast<float>(total_delta)) * 100.0f,
+                      0.0f, 100.0f);
+}
+
+static float ReadCpuFreqMhz() {
+    double sum_khz = 0.0;
+    int count = 0;
+    for (int cpu = 0; cpu < 16; ++cpu) {
+        double khz = 0.0;
+        std::filesystem::path base = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/cpufreq";
+        if (!ReadFirstNumber(base / "scaling_cur_freq", khz) &&
+            !ReadFirstNumber(base / "cpuinfo_cur_freq", khz)) {
+            continue;
+        }
+        if (khz > 0.0) {
+            sum_khz += khz;
+            ++count;
+        }
+    }
+    if (count <= 0) return -1.0f;
+    return static_cast<float>((sum_khz / count) / 1000.0);
+}
+
+static bool ReadFirstExistingNumber(const std::vector<std::filesystem::path>& paths, double& value,
+                                    std::filesystem::path* matched_path = nullptr) {
+    for (const auto& path : paths) {
+        if (ReadFirstNumber(path, value)) {
+            if (matched_path) *matched_path = path;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void AppendDevfreqGpuPaths(std::vector<std::filesystem::path>& usage_paths,
+                                  std::vector<std::filesystem::path>& freq_paths) {
+    std::error_code ec;
+    const std::filesystem::path devfreq_dir("/sys/class/devfreq");
+    if (!std::filesystem::exists(devfreq_dir, ec)) return;
+
+    for (const auto& entry : std::filesystem::directory_iterator(devfreq_dir, ec)) {
+        if (ec) break;
+        const std::string name = entry.path().filename().string();
+        std::string lower = name;
+        std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        if (lower.find("gpu") == std::string::npos &&
+            lower.find("kgsl") == std::string::npos &&
+            lower.find("mali") == std::string::npos) {
+            continue;
+        }
+        usage_paths.push_back(entry.path() / "load");
+        usage_paths.push_back(entry.path() / "gpu_load");
+        usage_paths.push_back(entry.path() / "utilization");
+        usage_paths.push_back(entry.path() / "busy_time");
+        freq_paths.push_back(entry.path() / "cur_freq");
+    }
+}
+
+static void AppendMaliGpuPaths(std::vector<std::filesystem::path>& usage_paths,
+                               std::vector<std::filesystem::path>& freq_paths) {
+    usage_paths.insert(usage_paths.end(), {
+        "/sys/kernel/ged/hal/gpu_utilization",
+        "/sys/class/misc/mali0/device/utilization",
+        "/sys/class/misc/mali0/device/gpu_utilization",
+        "/sys/class/misc/mali0/device/load",
+        "/sys/class/misc/mali0/device/devfreq/load",
+        "/sys/class/misc/mali0/device/devfreq/utilization",
+        "/sys/devices/platform/mali.0/utilization",
+        "/sys/devices/platform/mali.0/load",
+        "/sys/devices/platform/mali.0/devfreq/mali.0/load",
+        "/sys/devices/platform/mali.0/devfreq/mali.0/utilization",
+        "/sys/devices/platform/13000000.mali/utilization",
+        "/sys/devices/platform/13000000.mali/load",
+        "/sys/devices/platform/13000000.mali/devfreq/13000000.mali/load",
+        "/sys/devices/platform/13000000.mali/devfreq/13000000.mali/utilization",
+    });
+    freq_paths.insert(freq_paths.end(), {
+        "/sys/class/misc/mali0/device/clock",
+        "/sys/class/misc/mali0/device/clk_rate",
+        "/sys/class/misc/mali0/device/devfreq/cur_freq",
+        "/sys/devices/platform/mali.0/clock",
+        "/sys/devices/platform/mali.0/clk_rate",
+        "/sys/devices/platform/mali.0/devfreq/mali.0/cur_freq",
+        "/sys/devices/platform/13000000.mali/clock",
+        "/sys/devices/platform/13000000.mali/clk_rate",
+        "/sys/devices/platform/13000000.mali/devfreq/13000000.mali/cur_freq",
+    });
+}
+
+static float NormalizeGpuUsage(double raw, const std::filesystem::path& path) {
+    if (raw < 0.0) return -1.0f;
+    const std::string filename = path.filename().string();
+    if (filename == "load" && raw > 100.0) {
+        raw /= 10.0;
+    }
+    if (raw > 100.0 && raw <= 1000.0) {
+        raw /= 10.0;
+    }
+    if (raw > 100.0 && raw <= 10000.0) {
+        raw /= 100.0;
+    }
+    return std::clamp(static_cast<float>(raw), 0.0f, 100.0f);
+}
+
+static float NormalizeFreqMhz(double raw) {
+    if (raw <= 0.0) return -1.0f;
+    if (raw > 10000000.0) return static_cast<float>(raw / 1000000.0);
+    if (raw > 10000.0) return static_cast<float>(raw / 1000.0);
+    return static_cast<float>(raw);
+}
+
+static bool ReadMemoryStats(uint64_t& total_kb, uint64_t& available_kb) {
+    std::ifstream file("/proc/meminfo");
+    std::string key;
+    uint64_t value = 0;
+    std::string unit;
+    total_kb = 0;
+    available_kb = 0;
+    while (file >> key >> value >> unit) {
+        if (key == "MemTotal:") total_kb = value;
+        if (key == "MemAvailable:") available_kb = value;
+        if (total_kb > 0 && available_kb > 0) return true;
+    }
+    return total_kb > 0;
+}
+
+static double NormalizeBatteryCurrentUa(double raw) {
+    if (std::abs(raw) < 10000.0) return raw * 1000.0;
+    return raw;
+}
+
+static double NormalizeBatteryVoltageUv(double raw) {
+    if (raw < 10000.0) return raw * 1000000.0;
+    if (raw < 100000.0) return raw * 1000.0;
+    return raw;
+}
+
+static double NormalizePowerUw(double raw) {
+    if (raw <= 0.0) return raw;
+    if (raw < 1000.0) return raw * 1000000.0;
+    if (raw < 1000000.0) return raw * 1000.0;
+    return raw;
+}
+
+static void AppendPowerSupplyMetricPaths(std::vector<std::filesystem::path>& current_paths,
+                                         std::vector<std::filesystem::path>& voltage_paths,
+                                         std::vector<std::filesystem::path>& power_paths,
+                                         std::vector<std::filesystem::path>* capacity_paths = nullptr) {
+    std::error_code ec;
+    const std::filesystem::path power_supply_dir("/sys/class/power_supply");
+    if (!std::filesystem::exists(power_supply_dir, ec)) return;
+
+    for (const auto& entry : std::filesystem::directory_iterator(power_supply_dir, ec)) {
+        if (ec) break;
+        const std::filesystem::path base = entry.path();
+        current_paths.push_back(base / "current_now");
+        current_paths.push_back(base / "current_avg");
+        voltage_paths.push_back(base / "voltage_now");
+        voltage_paths.push_back(base / "voltage_avg");
+        power_paths.push_back(base / "power_now");
+        power_paths.push_back(base / "power_avg");
+        if (capacity_paths) {
+            capacity_paths->push_back(base / "capacity");
+        }
+    }
+}
+
+static float ReadBatteryCapacityPercent() {
+    double capacity = 0.0;
+    std::vector<std::filesystem::path> unused_current_paths;
+    std::vector<std::filesystem::path> unused_voltage_paths;
+    std::vector<std::filesystem::path> unused_power_paths;
+    std::vector<std::filesystem::path> capacity_paths = {
+        "/sys/class/power_supply/battery/capacity",
+        "/sys/class/power_supply/bms/capacity",
+        "/sys/class/power_supply/main/capacity",
+        "/sys/class/power_supply/qcom-battery/capacity",
+    };
+    AppendPowerSupplyMetricPaths(unused_current_paths, unused_voltage_paths, unused_power_paths, &capacity_paths);
+    if (!ReadFirstExistingNumber(capacity_paths, capacity)) {
+        return -1.0f;
+    }
+    return std::clamp(static_cast<float>(capacity), 0.0f, 100.0f);
+}
+
+static float ReadBatteryPowerWatts() {
+    double current = 0.0;
+    double voltage = 0.0;
+    double power = 0.0;
+    std::vector<std::filesystem::path> current_paths = {
+            "/sys/class/power_supply/battery/current_now",
+            "/sys/class/power_supply/battery/current_avg",
+            "/sys/class/power_supply/bms/current_now",
+            "/sys/class/power_supply/bms/current_avg",
+            "/sys/class/power_supply/main/current_now",
+            "/sys/class/power_supply/main/current_avg",
+            "/sys/class/power_supply/qcom-battery/current_now",
+            "/sys/class/power_supply/qcom-battery/current_avg",
+    };
+    std::vector<std::filesystem::path> voltage_paths = {
+            "/sys/class/power_supply/battery/voltage_now",
+            "/sys/class/power_supply/bms/voltage_now",
+            "/sys/class/power_supply/main/voltage_now",
+            "/sys/class/power_supply/qcom-battery/voltage_now",
+    };
+    std::vector<std::filesystem::path> power_paths = {
+            "/sys/class/power_supply/battery/power_now",
+            "/sys/class/power_supply/battery/power_avg",
+            "/sys/class/power_supply/bms/power_now",
+            "/sys/class/power_supply/bms/power_avg",
+            "/sys/class/power_supply/main/power_now",
+            "/sys/class/power_supply/main/power_avg",
+            "/sys/class/power_supply/qcom-battery/power_now",
+            "/sys/class/power_supply/qcom-battery/power_avg",
+    };
+    AppendPowerSupplyMetricPaths(current_paths, voltage_paths, power_paths);
+
+    if (ReadFirstExistingNumber(power_paths, power)) {
+        const double power_uw = std::abs(NormalizePowerUw(power));
+        if (power_uw > 0.0) return static_cast<float>(power_uw / 1000000.0);
+    }
+
+    if (!ReadFirstExistingNumber(current_paths, current)) {
+        return -1.0f;
+    }
+    if (!ReadFirstExistingNumber(voltage_paths, voltage)) {
+        return -1.0f;
+    }
+
+    const double current_ua = std::abs(NormalizeBatteryCurrentUa(current));
+    const double voltage_uv = NormalizeBatteryVoltageUv(voltage);
+    if (current_ua <= 0.0 || voltage_uv <= 0.0) return -1.0f;
+    return static_cast<float>((current_ua * voltage_uv) / 1000000000000.0);
+}
+
+static HardwareMonitorStats ReadHardwareMonitorStats() {
+    HardwareMonitorStats stats;
+    stats.cpuUsagePercent = ReadCpuUsagePercent();
+    stats.cpuFreqMhz = ReadCpuFreqMhz();
+
+    std::vector<std::filesystem::path> gpu_usage_paths = {
+        "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage",
+        "/sys/class/kgsl/kgsl-3d0/load",
+        "/sys/kernel/gpu/gpu_busy",
+        "/sys/kernel/gpu/gpu_utilization",
+        "/sys/kernel/ged/hal/gpu_utilization",
+    };
+    std::vector<std::filesystem::path> gpu_freq_paths = {
+        "/sys/class/kgsl/kgsl-3d0/gpuclk",
+        "/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq",
+        "/sys/kernel/gpu/gpu_clock",
+    };
+    AppendMaliGpuPaths(gpu_usage_paths, gpu_freq_paths);
+    AppendDevfreqGpuPaths(gpu_usage_paths, gpu_freq_paths);
+
+    double gpu_usage = 0.0;
+    std::filesystem::path gpu_usage_path;
+    if (ReadFirstExistingNumber(gpu_usage_paths, gpu_usage, &gpu_usage_path)) {
+        stats.gpuUsagePercent = NormalizeGpuUsage(gpu_usage, gpu_usage_path);
+    }
+
+    double gpu_freq = 0.0;
+    if (ReadFirstExistingNumber(gpu_freq_paths, gpu_freq)) {
+        stats.gpuFreqMhz = NormalizeFreqMhz(gpu_freq);
+    }
+
+    uint64_t total_kb = 0;
+    uint64_t available_kb = 0;
+    if (ReadMemoryStats(total_kb, available_kb) && total_kb > 0) {
+        stats.memoryTotalKb = total_kb;
+        stats.memoryUsedKb = total_kb > available_kb ? total_kb - available_kb : 0;
+        stats.memoryUsagePercent = std::clamp(static_cast<float>(stats.memoryUsedKb) * 100.0f /
+                                              static_cast<float>(total_kb), 0.0f, 100.0f);
+    }
+
+    stats.powerWatts = ReadBatteryPowerWatts();
+    stats.batteryPercent = ReadBatteryCapacityPercent();
+    return stats;
+}
+
+static const char* FormatPercent(char* buffer, size_t size, float value) {
+    if (value < 0.0f || !std::isfinite(value)) return "N/A";
+    std::snprintf(buffer, size, "%.0f%%", value);
+    return buffer;
+}
+
+static const char* FormatMhz(char* buffer, size_t size, float value) {
+    if (value < 0.0f || !std::isfinite(value)) return "N/A";
+    std::snprintf(buffer, size, "%.0f MHz", value);
+    return buffer;
+}
+
+static void DrawRingProgress(const char* center_label, const char* bottom_label, float value,
+                             const ImVec4& color, float radius) {
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+    const ImVec2 size(radius * 2.0f, radius * 2.0f + 30.0f);
+    const ImVec2 center(pos.x + radius, pos.y + radius);
+    const float thickness = 7.0f;
+    const float start_angle = -IM_PI * 0.5f;
+    const float end_angle = start_angle + IM_PI * 2.0f;
+    const bool valid = value >= 0.0f && std::isfinite(value);
+    const float clamped = valid ? std::clamp(value, 0.0f, 100.0f) : 0.0f;
+
+    ImGui::InvisibleButton(center_label, size);
+    draw_list->AddCircle(center, radius, IM_COL32(58, 74, 88, 210), 48, thickness);
+    if (valid) {
+        draw_list->PathArcTo(center, radius, start_angle, start_angle + (end_angle - start_angle) * (clamped / 100.0f), 48);
+        draw_list->PathStroke(ImGui::GetColorU32(color), false, thickness);
+    }
+
+    const ImVec2 center_label_size = ImGui::CalcTextSize(center_label);
+    draw_list->AddText(ImVec2(center.x - center_label_size.x * 0.5f,
+                              center.y - center_label_size.y * 0.5f),
+                       IM_COL32(236, 246, 255, 255), center_label);
+
+    const ImVec2 bottom_label_size = ImGui::CalcTextSize(bottom_label);
+    draw_list->AddText(ImVec2(center.x - bottom_label_size.x * 0.5f, pos.y + radius * 2.0f + 2.0f),
+                       IM_COL32(158, 188, 214, 255), bottom_label);
+}
+
+static void DrawHardwareMonitorWindow() {
+    if (!gHardwareMonitorEnabled) return;
+
+    static HardwareMonitorStats s_stats;
+    static auto s_last_update = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (s_last_update.time_since_epoch().count() == 0 ||
+        now - s_last_update >= std::chrono::milliseconds(1000)) {
+        s_stats = ReadHardwareMonitorStats();
+        s_last_update = now;
+    }
+
+    ImGuiIO& io = ImGui::GetIO();
+    const ImVec2 window_size(360.0f, 245.0f);
+    static ImVec2 window_pos(-1.0f, -1.0f);
+    static bool was_mouse_down = false;
+    static bool was_touch_down = false;
+    static bool is_dragging = false;
+    static bool is_touch_dragging = false;
+    static int active_touch_id = -1;
+    static ImVec2 drag_offset(0.0f, 0.0f);
+
+    if (window_pos.x < 0.0f || window_pos.y < 0.0f) {
+        window_pos = ImVec2(std::max(12.0f, io.DisplaySize.x - window_size.x - 24.0f), 120.0f);
+    }
+    window_pos.x = std::clamp(window_pos.x, 8.0f, std::max(8.0f, io.DisplaySize.x - window_size.x - 8.0f));
+    window_pos.y = std::clamp(window_pos.y, 8.0f, std::max(8.0f, io.DisplaySize.y - window_size.y - 8.0f));
+
+    ImGui::SetNextWindowPos(window_pos, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(window_size, ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 10.0f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.05f, 0.07f, 0.09f, 0.72f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.28f, 0.50f, 0.64f, 0.68f));
+
+    const ImGuiWindowFlags flags =
+        ImGuiWindowFlags_NoDecoration |
+        ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoScrollWithMouse |
+        ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoBringToFrontOnFocus;
+
+    if (ImGui::Begin("##HardwareMonitor", nullptr, flags)) {
+        const ImVec2 pos = ImGui::GetWindowPos();
+        const ImVec2 drag_min = pos;
+        const ImVec2 drag_max(pos.x + window_size.x, pos.y + 118.0f);
+        const bool mouse_down = io.MouseDown[0];
+        const bool in_drag_area = ImGui::IsMouseHoveringRect(drag_min, drag_max);
+
+        TouchPoint touches[10];
+        const int touch_count = has_active_touch_points() ? get_active_touch_points(touches, 10) : 0;
+        bool touch_down = false;
+        bool touch_in_drag_area = false;
+        ImVec2 touch_pos(0.0f, 0.0f);
+        for (int i = 0; i < touch_count; ++i) {
+            if (!touches[i].active) continue;
+            const ImVec2 current(touches[i].x, touches[i].y);
+            if (active_touch_id >= 0 && touches[i].id == active_touch_id) {
+                touch_down = true;
+                touch_pos = current;
+            }
+            if (current.x >= drag_min.x && current.x <= drag_max.x &&
+                current.y >= drag_min.y && current.y <= drag_max.y) {
+                touch_in_drag_area = true;
+                if (active_touch_id < 0) {
+                    touch_down = true;
+                    touch_pos = current;
+                    active_touch_id = touches[i].id;
+                }
+            }
+        }
+
+        if (touch_down && !was_touch_down && touch_in_drag_area) {
+            is_touch_dragging = true;
+            is_dragging = false;
+            drag_offset = ImVec2(touch_pos.x - window_pos.x, touch_pos.y - window_pos.y);
+        } else if (mouse_down && !was_mouse_down && in_drag_area && !is_touch_dragging) {
+            is_dragging = true;
+            drag_offset = ImVec2(io.MousePos.x - window_pos.x, io.MousePos.y - window_pos.y);
+        }
+        if (!touch_down) {
+            is_touch_dragging = false;
+            active_touch_id = -1;
+        }
+        if (!mouse_down) {
+            is_dragging = false;
+        }
+        if (is_touch_dragging) {
+            window_pos = ImVec2(touch_pos.x - drag_offset.x, touch_pos.y - drag_offset.y);
+        } else if (is_dragging) {
+            window_pos = ImVec2(io.MousePos.x - drag_offset.x, io.MousePos.y - drag_offset.y);
+        }
+        was_mouse_down = mouse_down;
+        was_touch_down = touch_down;
+
+        char cpu_freq[32], gpu_freq[32], mem_usage[32], power[32];
+        const float ring_radius = 38.0f;
+        const float ring_gap = 24.0f;
+        const ImVec2 rings_start = ImGui::GetCursorScreenPos();
+        char battery_percent[32];
+        DrawRingProgress("CPU", FormatMhz(cpu_freq, sizeof(cpu_freq), s_stats.cpuFreqMhz),
+                         s_stats.cpuUsagePercent, ImVec4(0.38f, 0.76f, 1.00f, 1.00f), ring_radius);
+        ImGui::SetCursorScreenPos(ImVec2(rings_start.x + ring_radius * 2.0f + ring_gap, rings_start.y));
+        DrawRingProgress("GPU", FormatMhz(gpu_freq, sizeof(gpu_freq), s_stats.gpuFreqMhz),
+                         s_stats.gpuUsagePercent, ImVec4(0.52f, 0.92f, 0.68f, 1.00f), ring_radius);
+        ImGui::SetCursorScreenPos(ImVec2(rings_start.x + (ring_radius * 2.0f + ring_gap) * 2.0f, rings_start.y));
+        DrawRingProgress("电量", FormatPercent(battery_percent, sizeof(battery_percent), s_stats.batteryPercent),
+                         s_stats.batteryPercent, ImVec4(1.00f, 0.78f, 0.32f, 1.00f), ring_radius);
+        ImGui::SetCursorScreenPos(ImVec2(rings_start.x, rings_start.y + ring_radius * 2.0f + 32.0f));
+
+        const float mem_mb = static_cast<float>(s_stats.memoryUsedKb) / 1024.0f;
+        const float total_mb = static_cast<float>(s_stats.memoryTotalKb) / 1024.0f;
+        const char* mem_percent = FormatPercent(mem_usage, sizeof(mem_usage), s_stats.memoryUsagePercent);
+        if (s_stats.memoryTotalKb > 0) {
+            ImGui::Text("内存: %s  %.0f/%.0f MB", mem_percent, mem_mb, total_mb);
+        } else {
+            ImGui::Text("内存: N/A");
+        }
+
+        if (s_stats.powerWatts >= 0.0f && std::isfinite(s_stats.powerWatts)) {
+            std::snprintf(power, sizeof(power), "%.2f W", s_stats.powerWatts);
+            ImGui::Text("整机功耗: %s", power);
+        } else {
+            ImGui::Text("整机功耗: N/A");
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(2);
 }
 
 static void DrawFloatingMenuBall() {
@@ -1131,6 +1662,9 @@ static void RegisterConfigPage(MenuRegistry& registry) {
     display.AddBool("enable_fullscreen_blur", "全屏模糊", &gEnableFullscreenBlur)
         .Persisted(false)
         .DebugOnly();
+    display.AddBool("hardware_monitor_enabled", "硬件监控悬浮窗", &gHardwareMonitorEnabled)
+        .Tooltip("显示 CPU/GPU 占用与频率、内存占用、整机功耗；刷新间隔 1000ms。")
+        .ShortcutSupported(false);
     display.AddFloat("max_skeleton_distance", "最大距离 (米)", &gMaxSkeletonDistance, 50.0f, 500.0f, "%.0f")
         .Tooltip("超过此距离的角色不绘制骨骼，减少性能开销");
 
@@ -1479,6 +2013,7 @@ void Draw_Menu_ResetTextures() {
 void Draw_Menu_Overlay() {
     EnsureMenuFrameworkRegistered();
     MenuRegistry::Instance().RenderShortcutWidgets();
+    DrawHardwareMonitorWindow();
     DrawFloatingMenuBall();
     if (!IsMenuOpen.load(std::memory_order_relaxed)) {
         SyncFullscreenBlur(false);
